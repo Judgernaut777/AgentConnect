@@ -123,12 +123,12 @@ def _spend_authorizer_from_env():
         base_url = os.environ.get("AGENTCONNECT_APPROVAL_URL", f"http://{host}:{port}")
         token = os.environ.get("AGENTCONNECT_APPROVAL_TOKEN")
         timeout = float(os.environ.get("AGENTCONNECT_APPROVAL_TIMEOUT", "300"))
+        from ..common.notifiers import notifier_from_env
+
         queue = ApprovalQueue()
         start_web_approval(queue, host=host, port=port, token=token)
         return WebApprovalAuthorizer(
-            queue, base_url=base_url,
-            webhook_url=os.environ.get("AGENTCONNECT_APPROVAL_WEBHOOK"),
-            timeout_seconds=timeout,
+            queue, base_url=base_url, notifier=notifier_from_env(), timeout_seconds=timeout,
         )
     from ..common.authorization import DenyingSpendAuthorizer
 

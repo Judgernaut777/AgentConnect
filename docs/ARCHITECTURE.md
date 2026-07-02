@@ -207,8 +207,11 @@ A **batteries-included web host** ships too: `common/approval.py` (`ApprovalQueu
 `WebApprovalAuthorizer`, stdlib-only, blocking-with-timeout) plus `router/approval_web.py`
 (a FastAPI approve/deny dashboard + `start_web_approval`, the `[web]` extra). Enable with
 `AGENTCONNECT_SPEND_AUTHORIZER=web`; the router blocks the `submit_task` call, logs an
-approval URL (+ optional webhook push), and the user clicks Approve/Deny in a browser —
-loopback + optional bearer token, fail-closed on timeout.
+approval URL, and the user clicks Approve/Deny in a browser — loopback + optional bearer
+token, fail-closed on timeout. **Push notifiers** (`common/notifiers.py`: ntfy/Slack/
+Discord/raw-webhook + `MultiNotifier`, selected via `AGENTCONNECT_NOTIFY`) send the pending
+charge to a phone/chat — ntfy renders true one-tap POST Approve/Deny actions; Slack/Discord
+deep-link to a per-item action page (`/a/{id}`) since incoming webhooks can't do callbacks.
 The charge gate runs *before* the `QUEUED` transition so a decline is a legal
 `ELIGIBLE_PROVIDERS_COMPUTED → REJECTED` (the same reorder fixed a latent illegal
 `QUEUED → REJECTED` on quota-reservation denial). `set_budget`/`get_budget_status` MCP
