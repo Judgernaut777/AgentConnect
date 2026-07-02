@@ -68,6 +68,36 @@ load(); setInterval(load,2000);
 </script></body></html>"""
 
 
+def _item_html(approval_id: str, kind: str, text: str) -> str:
+    esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if kind == "charge":
+        controls = (
+            f"<button class=ok onclick=\"go('/api/charges/{approval_id}/approve')\">Approve</button>"
+            f"<button class=no onclick=\"go('/api/charges/{approval_id}/deny')\">Deny</button>"
+        )
+    else:
+        controls = (
+            "$<input id=a size=6 placeholder=25> "
+            "<select id=p><option>monthly</option><option>weekly</option><option>daily</option></select> "
+            f"<button class=ok onclick=\"go('/api/budget/{approval_id}',{{amount_usd:parseFloat(a.value),period:p.value}})\">Save</button>"
+            f"<button class=no onclick=\"go('/api/budget/{approval_id}/decline')\">Decline</button>"
+        )
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Spend approval</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:2.5rem auto;padding:0 1rem}}
+button{{font:inherit;padding:.5rem 1rem;border-radius:8px;border:1px solid #ccc;margin:.3rem .4rem 0 0;cursor:pointer}}
+.ok{{background:#16a34a;color:#fff;border-color:#16a34a}}.no{{background:#dc2626;color:#fff;border-color:#dc2626}}
+input,select{{font:inherit;padding:.35rem;border:1px solid #ccc;border-radius:8px}}.muted{{color:#666}}</style></head>
+<body><p>{esc}</p><div class=tok class=muted>Token (if required): <input id=tok size=20 oninput="localStorage.tok=this.value"></div>
+<div id=c style=margin-top:1rem>{controls}</div><p id=done class=muted></p>
+<script>tok.value=localStorage.tok||'';
+async function go(u,b){{const h={{'Content-Type':'application/json'}};if(tok.value)h.Authorization='Bearer '+tok.value;
+const r=await fetch(u,{{method:'POST',headers:h,body:b?JSON.stringify(b):null}});
+document.getElementById('c').style.display='none';
+document.getElementById('done').textContent=r.ok?'Done — you can close this.':'Failed (already handled or unauthorized).';}}
+</script></body></html>"""
+
+
 def create_approval_app(queue: ApprovalQueue, token: Optional[str] = None):
     """Build the FastAPI app bound to an ApprovalQueue. `token` (optional) is a bearer
     required on all /api/* routes."""
@@ -85,6 +115,20 @@ def create_approval_app(queue: ApprovalQueue, token: Optional[str] = None):
     @app.get("/", response_class=HTMLResponse)
     def index():
         return _PAGE
+
+    @app.get("/a/{approval_id}", response_class=HTMLResponse)
+    def item_page(approval_id: str):
+        """Focused single-item action page — the deep-link target for push
+        notifications (Slack/Discord buttons, ntfy 'view'). Prefetch-safe: it only
+        renders controls; approving requires a click that POSTs."""
+        item = queue.get(approval_id)
+        if item is None or item._event.is_set():
+            return (
+                "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;"
+                "margin:3rem auto;max-width:32rem;padding:0 1rem'>"
+                "<p>This request is no longer pending.</p></body>"
+            )
+        return _item_html(approval_id, item.kind, item.text)
 
     @app.get("/api/pending")
     def pending(_: None = Depends(auth)):

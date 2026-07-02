@@ -119,6 +119,24 @@ def test_api_budget_submit():
     assert out["v"] == {"amount_usd": 15.0, "period": "daily"}
 
 
+def test_item_page_renders_controls_and_handles_gone():
+    q = ApprovalQueue()
+    auth = WebApprovalAuthorizer(q, timeout_seconds=5)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("v", auth.confirm_charge(_charge())))
+    t.start()
+    while not q.pending():
+        time.sleep(0.01)
+    aid = q.pending()[0]["id"]
+    c = _client(q)
+    page = c.get(f"/a/{aid}")
+    assert page.status_code == 200 and "Approve" in page.text and aid in page.text
+    # Resolve, then the page reports it's no longer pending.
+    q.resolve(aid, True)
+    t.join(timeout=5)
+    assert "no longer pending" in c.get(f"/a/{aid}").text
+
+
 def test_api_token_enforced():
     q = ApprovalQueue()
     c = _client(q, token="s3cret")

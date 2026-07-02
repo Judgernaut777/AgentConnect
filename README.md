@@ -186,11 +186,19 @@ agentconnect-router
 
 The router serves a tiny approvals page (default `http://127.0.0.1:8770/`). When a paid/
 rented charge (or a budget request) arrives, the `submit_task` call **blocks**, a line is
-logged with the approval URL (and, if `AGENTCONNECT_APPROVAL_WEBHOOK` is set, a JSON push
-is POSTed there), and the user clicks **Approve / Deny** (or enters an amount) in the
-browser or on their phone. No response within `AGENTCONNECT_APPROVAL_TIMEOUT` (default
-300s) fails closed. The endpoint binds loopback and takes an optional bearer token — put
-it behind TLS + a token before any remote exposure.
+logged with the approval URL, and the user clicks **Approve / Deny** (or enters an amount)
+in the browser or on their phone. No response within `AGENTCONNECT_APPROVAL_TIMEOUT`
+(default 300s) fails closed. The endpoint binds loopback and takes an optional bearer
+token — put it behind TLS + a token before any remote exposure.
+
+**Phone push (ntfy / Slack / Discord).** Set `AGENTCONNECT_NOTIFY` to any comma-separated
+mix of `ntfy,slack,discord,webhook` (each with its URL env: `AGENTCONNECT_NTFY_URL`,
+`AGENTCONNECT_SLACK_WEBHOOK`, `AGENTCONNECT_DISCORD_WEBHOOK`, `AGENTCONNECT_APPROVAL_WEBHOOK`)
+and pending charges are pushed to your phone/chat. **ntfy gives true one-tap Approve/Deny**
+(its app POSTs straight to the approve/deny endpoints — point `AGENTCONNECT_APPROVAL_URL`
+at a reachable/tunnel URL so the phone can hit it). Slack/Discord get a rich message with a
+one-tap link to a per-item action page (`/a/{id}`) where the user confirms — incoming
+webhooks can't do interactive callbacks, so that's the safe equivalent.
 
 ## Privacy & secrets (fail-closed)
 

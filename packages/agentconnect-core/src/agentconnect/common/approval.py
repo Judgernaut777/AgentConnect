@@ -13,15 +13,14 @@ frameworks — any transport can drive the same queue; the shipped one is HTTP.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
-import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .authorization import ChargeRequest, SpendAuthorizer
+from .notifiers import Notifier, RawWebhookNotifier
 
 _log = logging.getLogger(__name__)
 
@@ -86,13 +85,15 @@ class WebApprovalAuthorizer(SpendAuthorizer):
         self,
         queue: ApprovalQueue,
         base_url: str = "http://127.0.0.1:8770",
+        notifier: Optional[Notifier] = None,
         webhook_url: Optional[str] = None,
         timeout_seconds: float = 300.0,
         clock=None,
     ):
         self._q = queue
         self._base = base_url.rstrip("/")
-        self._webhook = webhook_url
+        # Back-compat: a bare webhook_url wraps into a RawWebhookNotifier.
+        self._notifier = notifier or (RawWebhookNotifier(webhook_url) if webhook_url else None)
         self._timeout = timeout_seconds
         # Injectable clock keeps created_at deterministic in tests if desired.
         import time as _time
@@ -100,30 +101,27 @@ class WebApprovalAuthorizer(SpendAuthorizer):
         self._now = clock or _time.time
 
     # ----------------------------------------------------------- notify
+    def _links(self, item: PendingApproval) -> dict:
+        return {
+            "dashboard": f"{self._base}/",
+            "item_page": f"{self._base}/a/{item.id}",
+            "approve": f"{self._base}/api/charges/{item.id}/approve",
+            "deny": f"{self._base}/api/charges/{item.id}/deny",
+        }
+
     def _notify(self, item: PendingApproval) -> None:
-        approve_url = f"{self._base}/#/{item.id}"
-        _log.warning("SPEND APPROVAL NEEDED [%s] %s — approve at %s", item.kind, item.text, approve_url)
-        if not self._webhook:
+        links = self._links(item)
+        _log.warning("SPEND APPROVAL NEEDED [%s] %s — %s", item.kind, item.text, links["item_page"])
+        if self._notifier is None:
             return
 
-        def _post() -> None:
-            body = json.dumps(
-                {
-                    "id": item.id, "kind": item.kind, "text": item.text,
-                    "dashboard_url": f"{self._base}/",
-                    "approve_url": f"{self._base}/api/charges/{item.id}/approve",
-                    "deny_url": f"{self._base}/api/charges/{item.id}/deny",
-                }
-            ).encode()
+        def _run() -> None:
             try:
-                req = urllib.request.Request(
-                    self._webhook, data=body, headers={"Content-Type": "application/json"}
-                )
-                urllib.request.urlopen(req, timeout=10)  # best effort
+                self._notifier.send(item.to_public(), links)
             except Exception as exc:  # noqa: BLE001 — notification must never break routing
-                _log.info("approval webhook POST failed: %s", exc)
+                _log.info("approval notifier failed: %s", exc)
 
-        threading.Thread(target=_post, daemon=True).start()
+        threading.Thread(target=_run, daemon=True).start()
 
     # ----------------------------------------------------- SpendAuthorizer
     def confirm_charge(self, request: ChargeRequest) -> bool:
