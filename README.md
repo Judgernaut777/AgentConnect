@@ -176,29 +176,68 @@ Two deliberate safety properties:
 
 ### Batteries-included web approval host
 
-Don't want to build a confirmation channel? Ship the reference one:
+Don't want to build a confirmation channel? Turn on the reference one and you get a
+browser approvals page plus (optionally) phone push. There are three levels — pick one.
+
+**Level 1 — browser only (local machine):**
 
 ```bash
 pip install "agentconnect-router[web]"
-export AGENTCONNECT_SPEND_AUTHORIZER=web         # + optional APPROVAL_HOST/PORT/TOKEN/WEBHOOK
+export AGENTCONNECT_SPEND_AUTHORIZER=web
 agentconnect-router
 ```
 
-The router serves a tiny approvals page (default `http://127.0.0.1:8770/`). When a paid/
-rented charge (or a budget request) arrives, the `submit_task` call **blocks**, a line is
-logged with the approval URL, and the user clicks **Approve / Deny** (or enters an amount)
-in the browser or on their phone. No response within `AGENTCONNECT_APPROVAL_TIMEOUT`
-(default 300s) fails closed. The endpoint binds loopback and takes an optional bearer
-token — put it behind TLS + a token before any remote exposure.
+Open `http://127.0.0.1:8770/`. When the agent tries a paid/rented task, the call blocks,
+a `SPEND APPROVAL NEEDED …` line is logged with a link, and the page shows **Approve /
+Deny** buttons (or, if no budget is set yet, an amount box). Click it and the task
+proceeds. No response within 5 minutes = denied.
 
-**Phone push (ntfy / Slack / Discord).** Set `AGENTCONNECT_NOTIFY` to any comma-separated
-mix of `ntfy,slack,discord,webhook` (each with its URL env: `AGENTCONNECT_NTFY_URL`,
-`AGENTCONNECT_SLACK_WEBHOOK`, `AGENTCONNECT_DISCORD_WEBHOOK`, `AGENTCONNECT_APPROVAL_WEBHOOK`)
-and pending charges are pushed to your phone/chat. **ntfy gives true one-tap Approve/Deny**
-(its app POSTs straight to the approve/deny endpoints — point `AGENTCONNECT_APPROVAL_URL`
-at a reachable/tunnel URL so the phone can hit it). Slack/Discord get a rich message with a
-one-tap link to a per-item action page (`/a/{id}`) where the user confirms — incoming
-webhooks can't do interactive callbacks, so that's the safe equivalent.
+**Level 2 — phone push with one-tap approve (recommended): ntfy.** Three steps:
+
+1. Install the free **ntfy** app (iOS/Android) and subscribe to a topic name you choose,
+   e.g. `agentconnect-yourname` (any hard-to-guess string).
+2. Make the approval server reachable from your phone. On a laptop the quickest way is a
+   tunnel, e.g. `cloudflared tunnel --url http://localhost:8770` — copy the public
+   `https://…` URL it prints.
+3. Run the router pointed at both:
+
+   ```bash
+   pip install "agentconnect-router[web]"
+   export AGENTCONNECT_SPEND_AUTHORIZER=web
+   export AGENTCONNECT_APPROVAL_URL=https://YOUR-TUNNEL.trycloudflare.com  # from step 2
+   export AGENTCONNECT_NOTIFY=ntfy
+   export AGENTCONNECT_NTFY_URL=https://ntfy.sh/agentconnect-yourname      # your topic
+   agentconnect-router
+   ```
+
+   Now every paid/rented charge pushes a notification to your phone with **Approve** and
+   **Deny** buttons — tapping one POSTs straight to the server. (One-tap works because the
+   ntfy app makes the call; that's why the server must be reachable at
+   `AGENTCONNECT_APPROVAL_URL`.)
+
+**Level 3 — Slack / Discord.** Set `AGENTCONNECT_NOTIFY=slack` (or `discord`) with
+`AGENTCONNECT_SLACK_WEBHOOK` / `AGENTCONNECT_DISCORD_WEBHOOK`. You get a rich message with
+a one-tap **link** to a per-item page where you confirm (incoming webhooks can't do true
+in-message buttons — only ntfy can). Combine channels with a comma:
+`AGENTCONNECT_NOTIFY=ntfy,slack`.
+
+**All environment variables** (mode is set by `AGENTCONNECT_SPEND_AUTHORIZER`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTCONNECT_SPEND_AUTHORIZER` | `deny` | `deny` (fail-closed) · `web` · `console` · `auto` (trusted/tests) |
+| `AGENTCONNECT_APPROVAL_HOST` / `_PORT` | `127.0.0.1` / `8770` | where the approvals server binds |
+| `AGENTCONNECT_APPROVAL_URL` | `http://host:port` | public base URL used in notifications (set to your tunnel) |
+| `AGENTCONNECT_APPROVAL_TOKEN` | *(none)* | optional bearer token required on `/api/*` |
+| `AGENTCONNECT_APPROVAL_TIMEOUT` | `300` | seconds to wait before failing closed (deny) |
+| `AGENTCONNECT_NOTIFY` | *(none)* | comma list: `ntfy` · `slack` · `discord` · `webhook` |
+| `AGENTCONNECT_NTFY_URL` | — | your ntfy topic URL, e.g. `https://ntfy.sh/…` |
+| `AGENTCONNECT_SLACK_WEBHOOK` / `_DISCORD_WEBHOOK` | — | incoming-webhook URLs |
+| `AGENTCONNECT_APPROVAL_WEBHOOK` | — | raw JSON POST target (for `webhook` mode) |
+
+**Security:** the approvals endpoint controls money. It binds loopback by default; before
+exposing it (e.g. via a tunnel) set `AGENTCONNECT_APPROVAL_TOKEN` and keep it over HTTPS.
+Without the `[web]` extra installed, `web` mode logs a warning and falls back to `deny`.
 
 ## Privacy & secrets (fail-closed)
 
