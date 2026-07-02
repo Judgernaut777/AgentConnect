@@ -1,37 +1,80 @@
-# Provider & model registry (handoff §6).
+# Provider & model registry (handoff §6, Goal 4).
 #
-# The Agent Router reads this file. It may know the `secret_ref` for a provider,
-# but it must NEVER dereference it directly — only the provider gateway resolves
+# The Agent Router reads this file. For CLOUD providers it may know a `secret_ref`
+# but must NEVER dereference it directly — only the provider gateway resolves cloud
 # secrets at call time (see config/secrets.example.yaml and §7).
 #
-# privacy classes a provider is allowed to receive (see config/routing.yaml
-# `privacy` section for the authoritative task->provider rules):
-#   local_only     — task never leaves the local machine
-#   external       — free/low-cost cloud, only after redaction
-#   external_paid  — paid cloud, only after redaction + budget check
+# LOCAL inference nodes carry NO secret_ref: the router authenticates to them with
+# mutual TLS (identity = client certificate), so no shared secret exists on the
+# wire. Cert/key material is referenced by path under `tls` (env-expandable).
+#
+# provider privacy tiers (see config/routing.yaml `privacy` for the authoritative
+# task->tier rules):
+#   local_only      — task never leaves your owned hardware
+#   private_rented  — your model weights on a rented GPU (private, ephemeral)
+#   external        — free/low-cost cloud, only after redaction
+#   external_paid   — paid cloud, only after redaction + budget check
 
-policy_version: "2026-07-02.1"
+policy_version: "2026-07-02.2"
 
 providers:
+  # Owned, always-on local box. Reached over mutual TLS.
   local_r9700:
     type: local
-    endpoint: "https://r9700-box.local:8443/v1"
-    secret_ref: "op://AI/local-r9700/api-token"
+    node_class: owned
     privacy: local_only
-    # Local providers are backed by the Local Model Manager; residency and
-    # admission are decided from its live /status, not from this file.
-    manager_endpoint: "http://r9700-box.local:8080"
+    # Residency and admission are decided from the manager's live /status.
+    manager_endpoint: "https://r9700-box.local:8443"
     node_id: "r9700-box-01"
     capabilities: [coding, summarization, patch_generation, review, reasoning]
     quota:
       kind: local_gpu
+    tls:
+      mode: mutual                 # mutual | insecure_localhost (dev loopback only)
+      ca_cert:     "${AGENTCONNECT_LOCAL_CA}"
+      client_cert: "${AGENTCONNECT_LOCAL_CLIENT_CERT}"
+      client_key:  "${AGENTCONNECT_LOCAL_CLIENT_KEY}"
+      server_name: "r9700-box.local"
+
+  # Ephemeral rented GPU for very large models — private inference on your own
+  # weights. Reached over the SAME mutual TLS; provisioned on demand. The only
+  # secret is the vendor control-plane API key (rental.secret_ref), used solely to
+  # rent/terminate the box, never for inference traffic.
+  rented_h100_pool:
+    type: local
+    node_class: rented
+    privacy: private_rented
+    manager_endpoint: null         # assigned at provision time
+    capabilities: [reasoning, coding, summarization, review]
+    quota:
+      kind: rented_gpu
+    tls:
+      mode: mutual
+      ca_cert:     "${AGENTCONNECT_RENTED_CA}"
+      client_cert: "${AGENTCONNECT_RENTED_CLIENT_CERT}"
+      client_key:  "${AGENTCONNECT_RENTED_CLIENT_KEY}"
+    rental:
+      vendor: generic              # generic | runpod | lambda | vast (adapters later)
+      secret_ref: "op://AI/runpod/api-key"   # control-plane key -> secrets manager
+      instance_type: "1xH100-80GB"
+      min_rental_seconds: 900      # amortization floor for spin-up cost
+      max_hourly_usd: 3.50
+      max_daily_usd: 20.00
+      terminate_when_idle_seconds: 600
+      trust:                       # required for repo_sensitive (with task opt-in)
+        ephemeral: true
+        encrypted_volume: true
+        own_image: true
+        no_external_logging: true
 
   gemini_free:
     type: cloud
     endpoint: "https://generativelanguage.googleapis.com"
     secret_ref: "op://AI/gemini/api-key"
     privacy: external
-    capabilities: [public_reasoning, public_summarization, generic_test_generation, classification]
+    # Generic capability names (summarization/classification/reasoning/coding) are
+    # what the router matches on; keep provider-specific tags too for documentation.
+    capabilities: [summarization, classification, reasoning, coding, public_summarization, generic_test_generation]
     quota:
       kind: free_tier
       reset: daily
@@ -43,7 +86,7 @@ providers:
     endpoint: "https://api.groq.com/openai/v1"
     secret_ref: "op://AI/groq/api-key"
     privacy: external
-    capabilities: [fast_classification, routing, short_summaries]
+    capabilities: [classification, summarization, routing, fast_classification, short_summaries]
     quota:
       kind: free_or_low_cost
       reset: daily
@@ -55,7 +98,7 @@ providers:
     endpoint: "https://api.openai.com/v1"
     secret_ref: "op://AI/openai/api-key"
     privacy: external_paid
-    capabilities: [hard_reasoning, fallback, specialist_review]
+    capabilities: [reasoning, coding, review, patch_generation, summarization, hard_reasoning, specialist_review]
     quota:
       kind: paid
       max_daily_spend_usd: 3.00

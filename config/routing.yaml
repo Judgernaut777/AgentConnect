@@ -7,15 +7,18 @@
 # task. These are HARD constraints applied before scoring (§12).
 privacy:
   classes:
-    public:         [local_only, external, external_paid]
-    low_sensitive:  [local_only, external, external_paid]   # only after redaction
-    repo_sensitive: [local_only]
-    secret_sensitive: []                                    # never sent to any LLM
+    public:         [local_only, private_rented, external, external_paid]
+    low_sensitive:  [local_only, private_rented, external, external_paid]  # after redaction
+    repo_sensitive: [local_only]        # + private_rented ONLY with task opt-in (allow_rented)
+    secret_sensitive: []                                    # never sent to any LLM/node
     restricted:     [local_only]                            # unless explicitly approved
   # Classes that require the redaction pass to succeed before any external route.
   require_redaction: [low_sensitive]
   # Classes that must never reach an LLM at all — block or redact.
   block_from_llm: [secret_sensitive]
+  # A repo_sensitive task may use a rented node only with explicit opt-in AND when
+  # the node satisfies its trust policy (ephemeral/encrypted/own-image/no-logging).
+  rented_repo_sensitive_requires_optin: true
 
 # --- MCP output policy: context virtualization (§9) --------------------------
 mcp_output_policy:
@@ -60,6 +63,9 @@ scoring:
     model_switch_penalty: 3.0
     cost_penalty: 2.0
     opportunity_cost: 1.5
+    # Rented GPU nodes (Goal 4): spin-up/min-window setup + hourly-cost penalties.
+    rental_setup_penalty: 2.0
+    rental_cost_penalty: 2.0
   # A resident-model task pays no switch penalty; a specialist that is not loaded
   # pays the full model_switch_penalty unless the batch threshold is met.
   quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains

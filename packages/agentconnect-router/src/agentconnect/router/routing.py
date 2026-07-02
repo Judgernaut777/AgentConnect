@@ -44,6 +44,8 @@ class RoutingContext:
     cloud_safe: bool = True  # result of the redaction pass, if run
     # How many same-model tasks are queued behind this one (feeds switch policy §16).
     pending_same_model_batch: int = 0
+    # Opt-in for running a repo_sensitive task on a rented GPU node (Goal 4).
+    allow_rented: bool = False
 
 
 @dataclass
@@ -132,15 +134,33 @@ class RoutingEngine:
         return ctx.pending_same_model_batch >= ms.get("min_batch_size_for_switch", 4)
 
     # ------------------------------------------------------- eligibility
-    def _allowed_privacy_tiers(self, privacy_class: PrivacyClass) -> list[str]:
+    def _allowed_privacy_tiers(self, ctx: RoutingContext) -> list[str]:
         classes = self.routing.privacy.get("classes", {})
-        return list(classes.get(privacy_class.value, []))
+        tiers = list(classes.get(ctx.privacy_class.value, []))
+        # A repo_sensitive task may use a rented node ONLY with explicit opt-in
+        # (handoff Goal 4). secret_sensitive/restricted are never widened.
+        if (
+            ctx.allow_rented
+            and ctx.privacy_class == PrivacyClass.repo_sensitive
+            and "private_rented" not in tiers
+        ):
+            tiers.append("private_rented")
+        return tiers
+
+    @staticmethod
+    def _is_rented(cfg: ProviderConfig) -> bool:
+        return cfg.type == "local" and (cfg.node_class == "rented" or cfg.privacy == "private_rented")
+
+    @staticmethod
+    def _rented_trust_ok(cfg: ProviderConfig) -> bool:
+        t = (cfg.rental.trust if cfg.rental else {}) or {}
+        return all(t.get(k) for k in ("ephemeral", "encrypted_volume", "own_image", "no_external_logging"))
 
     def eligibility(
         self, ctx: RoutingContext, cfg: ProviderConfig, status: Optional[ManagerStatus]
     ) -> tuple[bool, str]:
         """Apply HARD constraints (§12). Returns (eligible, reason_if_not)."""
-        allowed_tiers = self._allowed_privacy_tiers(ctx.privacy_class)
+        allowed_tiers = self._allowed_privacy_tiers(ctx)
         if not allowed_tiers:
             return False, "privacy_class_blocks_all_llm_routing"
         if cfg.privacy not in allowed_tiers:
@@ -159,6 +179,14 @@ class RoutingEngine:
                 if not ctx.allow_paid:
                     return False, "paid_routing_not_allowed_for_task"
             ok, reason = self.quota.can_reserve(cfg, ctx.est_input_tokens, ctx.est_output_tokens)
+            if not ok:
+                return False, reason
+        elif self._is_rented(cfg):
+            # Rented node: provisioned on demand, so no live ManagerStatus is
+            # required at routing time. Enforce trust policy + rental budget.
+            if ctx.privacy_class == PrivacyClass.repo_sensitive and not self._rented_trust_ok(cfg):
+                return False, "rented_node_trust_policy_unmet"
+            ok, reason = self.quota.can_reserve_rental(cfg)
             if not ok:
                 return False, reason
         elif cfg.type == "local":
@@ -185,16 +213,38 @@ class RoutingEngine:
         cap = self.registry.capability_overlap(cfg, ctx.needed_capabilities)
         terms["capability_fit"] = cap * w.get("capability_fit", 3.0)
 
-        # expected_quality: paid > local-large > free-cloud, scaled by requirement.
-        quality_base = {"external_paid": 1.0, "local_only": 0.85, "external": 0.6}.get(cfg.privacy, 0.5)
+        # expected_quality: paid ~ rented-large > local-large > free-cloud.
+        quality_base = {
+            "external_paid": 1.0, "private_rented": 0.95, "local_only": 0.85, "external": 0.6,
+        }.get(cfg.privacy, 0.5)
         if ctx.quality == "high":
             quality_base *= 1.15
         terms["expected_quality"] = quality_base * w.get("expected_quality", 2.0)
 
-        terms["privacy_fit"] = (1.0 if cfg.privacy == "local_only" else 0.5) * w.get("privacy_fit", 1.5)
+        # privacy_fit: owned local best; rented (your weights, others' hardware) mid.
+        privacy_fit = {"local_only": 1.0, "private_rented": 0.7}.get(cfg.privacy, 0.5)
+        terms["privacy_fit"] = privacy_fit * w.get("privacy_fit", 1.5)
         terms["availability"] = (1.0 if self.registry.is_available(cfg.provider_id) else 0.0) * w.get("availability", 1.0)
 
-        if cfg.type == "local" and status is not None:
+        if self._is_rented(cfg):
+            # Rented GPU node: pay a spin-up/min-window setup penalty and an
+            # hourly-cost penalty vs. the daily rental budget. Same "is the
+            # expensive setup worth it?" logic as model switching, one level up.
+            model_id = ctx.require_exact_model or self._profile_preferred(ctx.profile) or self.profiles.default_resident_model
+            terms["latency_fit"] = 0.4 * w.get("latency_fit", 1.0)
+            terms["residency_bonus"] = 0.0
+            terms["model_switch_penalty"] = 0.0
+            terms["queue_delay_penalty"] = 0.0
+            terms["cost_penalty"] = 0.0
+            terms["opportunity_cost"] = 0.0
+            terms["quota_scarcity_penalty"] = 0.0
+            terms["rental_setup_penalty"] = -w.get("rental_setup_penalty", 2.0)
+            hourly = cfg.rental.max_hourly_usd if cfg.rental else 0.0
+            window_cost = hourly * ((cfg.rental.min_rental_seconds if cfg.rental else 0) / 3600.0)
+            rem = self.quota.rental_remaining_usd(cfg)
+            frac = 0.0 if rem == float("inf") else min(1.0, window_cost / max(rem, 1e-9))
+            terms["rental_cost_penalty"] = -frac * w.get("rental_cost_penalty", 2.0)
+        elif cfg.type == "local" and status is not None:
             choice = self.resolve_local_model(ctx, status)
             model_id = choice.model_id
             terms["latency_fit"] = (1.0 if not choice.switch_required else 0.3) * w.get("latency_fit", 1.0)
@@ -237,6 +287,11 @@ class RoutingEngine:
         fracs = [v for k, v in rem.items() if k.endswith("_frac")]
         return min(fracs) if fracs else None
 
+    def _profile_preferred(self, profile: Optional[str]) -> Optional[str]:
+        prof = self.profiles.profiles.get(profile or "", {})
+        pref = prof.get("preferred")
+        return pref if pref not in ("current_resident", "any", None) else None
+
     # -------------------------------------------------------------- route
     def route(self, ctx: RoutingContext, status: Optional[ManagerStatus]) -> RoutingDecision:
         """Full deterministic routing flow (§11 steps 8-12, 17)."""
@@ -255,7 +310,7 @@ class RoutingEngine:
         if not scores:
             decision = (
                 "blocked_secret_sensitive"
-                if not self._allowed_privacy_tiers(ctx.privacy_class)
+                if not self._allowed_privacy_tiers(ctx)
                 else "no_eligible_provider"
             )
             return RoutingDecision(
@@ -266,7 +321,9 @@ class RoutingEngine:
         best = scores[0]
         cfg = self.registry.get(best.provider)
         assert cfg is not None
-        if cfg.type == "local":
+        if self._is_rented(cfg):
+            decision = "route_to_rented_node"
+        elif cfg.type == "local":
             choice = self.resolve_local_model(ctx, status) if status else ModelChoice(None, False, "")
             decision = (
                 "route_to_local_resident_model" if not choice.switch_required else "route_to_local_after_switch"

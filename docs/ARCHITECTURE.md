@@ -4,18 +4,49 @@ This document maps the [handoff specification](../README.md) to the code and
 explains the boundaries that keep the system deterministic and safe. Section
 numbers (§) refer to the original handoff.
 
-## Two services, one shared core
+## Three packages, one shared core
 
 ```
-src/agentconnect/
-  common/        ← shared core: policy-agnostic, framework-free (pydantic+pyyaml)
-  router/        ← Machine A: Agent Router MCP — the global control plane (§4.1)
-  model_manager/ ← Machine B: Local Model Manager — the inference appliance (§4.2)
+packages/
+  agentconnect-core/          ← shared core: policy-agnostic (pydantic+pyyaml)  → agentconnect.common.*
+  agentconnect-router/        ← Machine A: Agent Router MCP — control plane (§4.1) → agentconnect.router.*
+  agentconnect-model-manager/ ← Machine B: Local Model Manager — appliance (§4.2)  → agentconnect.model_manager.*
 ```
 
-The **core** deliberately depends on nothing heavy so it is unit-testable and
-reusable by both services. The MCP SDK and FastAPI are imported *lazily* inside
-`router/mcp_server.py` and `model_manager/app.py` respectively.
+They share the `agentconnect` **PEP 420 namespace** (no top-level `__init__.py`),
+so import paths are unchanged even though the code lives in three distributions.
+The **Router is the primary product** and depends only on `agentconnect-core`; the
+Model Manager is an optional install (`agentconnect-router[embedded]`). The core
+depends on nothing heavy; the MCP SDK and FastAPI are imported lazily inside
+`router/mcp_server.py` and `model_manager/app.py`.
+
+### Inter-service transport: mutual TLS, no shared secret (§7)
+
+The Router↔Manager link authenticates with **X.509 client/server certificates**
+signed by a private CA — identity is the certificate, so no bearer token or shared
+secret crosses the wire. `HttpLocalClient` builds an `ssl.SSLContext` that pins the
+manager's server cert to the CA and presents the router's client cert; the manager
+launches uvicorn with `ssl_cert_reqs=CERT_REQUIRED + ssl_ca_certs`, so the
+handshake fails for any client not signed by the trusted CA. Cert/key material is
+referenced by **path** (env-expandable) in `providers.yaml` `tls`, never inlined.
+`ClientIdentityMiddleware` adds an optional per-CN/SAN allowlist (defense in depth;
+see `model_manager/tls.py` for the uvicorn ASGI-TLS caveat). The `SecretResolver`
+now serves **cloud providers only**.
+
+### Rented-GPU node tier (Goal 4)
+
+A rented box runs the **same** `agentconnect-model-manager` and is reached over the
+**same mTLS transport** — it is just another node with a `private_rented` privacy
+tier, an hourly cost model (`quota.py` `rented_gpu`, budgeted by
+`rental.max_daily_usd`), and a lifecycle (`router/provisioning.py`:
+`NodeProvisioner` + offline `StubProvisioner`). Two credential planes: inference =
+mTLS (no secret); the rental vendor control-plane key = the only secret, in the
+secrets manager, used solely to rent/terminate. A `repo_sensitive` task reaches a
+rented node only with explicit `allow_rented` **and** a satisfied trust policy;
+`secret_sensitive` never. Scoring adds `rental_setup_penalty` (spin-up/min-window)
+and `rental_cost_penalty` (hourly vs. budget), so the router rents only when the
+work justifies amortizing the window — the model-switch "is the setup worth it?"
+logic, one level up.
 
 ### Responsibility split (§26 — the most important rule)
 

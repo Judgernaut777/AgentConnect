@@ -40,35 +40,25 @@ context**.
 
 ## Repository layout
 
+Three independently-installable packages in one repo (a PEP 420 namespace, so
+every import path stays `agentconnect.*`):
+
 ```
 config/                      # policy & registry (edit these, not code)
-  providers.yaml             #   §6  provider & model registry
+  providers.yaml             #   §6  provider & node registry (local nodes = mTLS, no secret)
   profiles.yaml              #   §17 capability profiles + agent defaults
-  routing.yaml               #   §9,§12,§13,§16,§18 privacy, scoring, residency, limits
-  secrets.example.yaml       #   §7  secret_ref → resolver mapping (copy to secrets.yaml)
+  routing.yaml               #   §9,§12,§13,§16 privacy tiers, scoring, residency, rental
+  secrets.example.yaml       #   §7  CLOUD secret_ref → resolver (local nodes carry none)
 
-src/agentconnect/
-  common/                    # framework-free core (pydantic + pyyaml only)
-    schemas.py               #   all data contracts
-    state.py                 #   §19 deterministic task state machine
-    memory.py                #   §8  shared memory + artifact store (SQLite)
-    quota.py                 #   §15 quota reservation + reconciliation
-    privacy.py               #   §13,§14 privacy classes + redaction layer
-    providers.py             #   §6  provider registry access
-    secrets.py               #   §7  secret resolution (only the gateway uses it)
-    config.py / tokens.py    #   config loaders, token estimation
-  router/                    # global control plane (Agent Router MCP)
-    routing.py               #   §10,§11,§12 deterministic routing engine
-    gateway.py               #   §7  secret-aware provider gateway
-    service.py               #   §11 orchestration (submit_task … full flow)
-    mcp_server.py            #   §23 MCP tools
-    local_client.py          #   §5  client to the Local Model Manager
-  model_manager/             # local inference control plane (appliance)
-    residency.py             #   §16 residency + admission control
-    backends.py              #   backend abstraction + deterministic StubBackend
-    app.py                   #   §22 HTTP API (FastAPI)
+packages/
+  agentconnect-core/         # shared, framework-free (pydantic + pyyaml only)
+    …/common/{schemas,state,memory,quota,privacy,providers,secrets,config,tokens}.py
+  agentconnect-router/       # the PRIMARY product — Agent Router MCP control plane
+    …/router/{routing,gateway,service,mcp_server,local_client,provisioning}.py
+  agentconnect-model-manager/# optional satellite — local inference appliance
+    …/model_manager/{residency,backends,app,tls}.py
 
-tests/                       # 29 unit + e2e tests, run offline (stub backend)
+tests/                       # 43 unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end walkthrough, no GPU required
 docs/ARCHITECTURE.md         # detailed design notes + section map
 ```
@@ -76,23 +66,41 @@ docs/ARCHITECTURE.md         # detailed design notes + section map
 ## Quick start
 
 ```bash
-pip install -e ".[all]"        # or: pip install -e ".[dev]" for just tests
-pytest -q                      # 29 passing, fully offline
+pip install -e packages/agentconnect-core \
+            -e packages/agentconnect-router \
+            -e packages/agentconnect-model-manager
+pytest -q                      # 43 passing, fully offline
 python examples/demo.py        # end-to-end: submit tasks, see compact summaries
 ```
 
-### Run the two services
+The Router is the product and installs **without** the Model Manager:
 
 ```bash
-# Machine B — Local Model Manager (defaults to the deterministic stub backend)
-agentconnect-model-manager               # serves http://0.0.0.0:8080
+pip install -e packages/agentconnect-core -e packages/agentconnect-router
+agentconnect-router            # cloud-only standalone; local-only tasks report "no local node"
+```
+
+### Run the two services (mutual TLS, no shared secret)
+
+```bash
+# Machine B — Local Model Manager (serves HTTPS + requires a client cert)
+export MODEL_MANAGER_TLS_CERT=/certs/server.crt
+export MODEL_MANAGER_TLS_KEY=/certs/server.key
+export MODEL_MANAGER_TLS_CA=/certs/ca.crt          # trust anchor for router client certs
+export MODEL_MANAGER_ALLOWED_CLIENTS=agentconnect-router-01   # optional identity allowlist
+agentconnect-model-manager                         # serves https://0.0.0.0:8443 (mTLS)
 
 # Machine A — Agent Router MCP (stdio transport for Claude Code)
-#   point it at the manager, or omit MODEL_MANAGER_URL to run one in-process
-export MODEL_MANAGER_URL=http://machine-b:8080
-export LOCAL_R9700_API_TOKEN=...         # only if the manager enforces auth
+export MODEL_MANAGER_URL=https://machine-b:8443
+export AGENTCONNECT_LOCAL_CA=/certs/ca.crt
+export AGENTCONNECT_LOCAL_CLIENT_CERT=/certs/router.crt
+export AGENTCONNECT_LOCAL_CLIENT_KEY=/certs/router.key
 agentconnect-router
 ```
+
+Identity is the certificate — **no bearer token or shared secret crosses the
+wire**. For single-box dev, omit `MODEL_MANAGER_URL` and the Router embeds an
+in-process manager (needs no transport at all).
 
 Register the router with Claude Code (`.mcp.json`):
 
@@ -125,24 +133,49 @@ policy (`config/routing.yaml`) caps MCP payloads and forbids returning full logs
 full repo files, or full traces inline — the manager pulls detail on demand with
 `read_artifact_chunk` / `get_log_slice`.
 
+## Three-tier compute (owned · rented · cloud)
+
+A rented GPU running **your** open-weights model is a distinct tier — private
+inference for very large models without owning the hardware. It plugs in as *just
+another Model Manager node*, reached over the same mTLS transport:
+
+| Tier | Hardware | Model | Privacy tier | Cost |
+|---|---|---|---|---|
+| Local node | your box | small/mid, yours | `local_only` | free (owned) |
+| Rented node | rented GPU | **very large, yours** | `private_rented` | hourly rent + spin-up |
+| Cloud API | provider's | *their* model | `external` / `external_paid` | per-token |
+
+Renting has **two credential planes**: inference traffic is mTLS (no secret); the
+rental vendor's control-plane API key is the only secret and lives in the secrets
+manager, used solely to rent/terminate the box. A `repo_sensitive` task may run on
+a rented node only with explicit opt-in (`allow_rented`) **and** when the node
+meets its trust policy (ephemeral, encrypted, your image, no external logging).
+
 ## Privacy & secrets (fail-closed)
 
 - Tasks are classified into `public / low_sensitive / repo_sensitive /
   secret_sensitive / restricted` (§13). A redaction pass (§14) scrubs
   keys/JWTs/DB-URLs/PII before any external call.
-- `secret_sensitive` content is **blocked from every LLM** — the router rejects
-  it before routing.
-- Provider configs hold **secret references only**. The gateway is the sole
-  component that resolves a secret, at call time, and never returns/logs it.
+- `secret_sensitive` content is **blocked from every LLM/node** — the router
+  rejects it before routing.
+- **Local + rented inference nodes carry no secret at all** — they authenticate
+  via mutual TLS (identity = client certificate). Only the third-party secrets
+  manager holds secrets, and only cloud API keys + rental control-plane keys.
+- Cloud provider configs hold **secret references only**. The gateway is the sole
+  component that resolves a cloud secret, at call time, and never returns/logs it.
 
 ## Status vs. the phased plan (§25)
 
-Implemented end-to-end (offline, tested): the deterministic router (Phases 1 &
-5 core), shared memory + context virtualization (Phase 2), residency + admission
-(Phase 3), the provider gateway + secrets + quota ledger + privacy/redaction
-(Phase 4). Cloud calls degrade to a deterministic stub until real credentials are
-supplied; Phase 6 (learning/eval) is scaffolded via the quota/usage records but
-not yet scored. See `docs/ARCHITECTURE.md` for the section-by-section map.
+Implemented end-to-end (offline, tested — 43 tests): the deterministic router
+(Phases 1 & 5 core), shared memory + context virtualization (Phase 2), residency +
+admission (Phase 3), the provider gateway + secrets + quota ledger +
+privacy/redaction (Phase 4), **mutual-TLS inter-service transport**, the
+**three-package split** (Router installs without the Manager), and the
+**rented-GPU node tier** (privacy tier + budget + provisioning seam;
+`StubProvisioner` for offline runs, real vendor adapters TBD). Cloud calls degrade
+to a deterministic stub until real credentials are supplied; Phase 6
+(learning/eval) is scaffolded via the quota/usage records but not yet scored. See
+`docs/ARCHITECTURE.md` for the section-by-section map.
 
 ## License
 

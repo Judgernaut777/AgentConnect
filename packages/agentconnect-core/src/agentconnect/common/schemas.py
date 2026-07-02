@@ -33,8 +33,22 @@ class ProviderType(str, Enum):
 
 class ProviderPrivacyTier(str, Enum):
     local_only = "local_only"
+    private_rented = "private_rented"  # your model weights on rented hardware
     external = "external"
     external_paid = "external_paid"
+
+
+class NodeClass(str, Enum):
+    owned = "owned"  # your hardware (e.g. the R9700 box)
+    rented = "rented"  # ephemeral rented GPU running your model
+
+
+class NodeState(str, Enum):
+    absent = "absent"
+    provisioning = "provisioning"
+    ready = "ready"
+    draining = "draining"
+    terminated = "terminated"
 
 
 class TaskState(str, Enum):
@@ -76,6 +90,7 @@ class TaskConstraints(BaseModel):
     max_output_tokens: Optional[int] = None
     allow_external: bool = True
     allow_paid: bool = False
+    allow_rented: bool = False  # opt-in to run repo_sensitive on a rented GPU node
     priority: Priority = Priority.normal
     quality: str = "standard"  # standard | high | best_effort
 
@@ -264,3 +279,46 @@ class LoadResponse(BaseModel):
     loaded_model: Optional[str] = None
     estimated_load_seconds: int = 0
     reason: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Rented-node lifecycle (handoff Goal 4)
+# --------------------------------------------------------------------------- #
+class NodeTrust(BaseModel):
+    """Declared trust properties of an inference node. A rented node must satisfy
+    the policy (all required properties true) before a repo_sensitive task may run
+    on it."""
+
+    ephemeral: bool = False
+    encrypted_volume: bool = False
+    own_image: bool = False
+    no_external_logging: bool = False
+
+    def satisfies_repo_sensitive(self) -> bool:
+        return all(
+            (self.ephemeral, self.encrypted_volume, self.own_image, self.no_external_logging)
+        )
+
+
+class NodeSpec(BaseModel):
+    """What to provision. Derived from a rented provider's config entry."""
+
+    provider_id: str
+    vendor: str = "generic"
+    instance_type: Optional[str] = None
+    model_id: Optional[str] = None
+    min_rental_seconds: int = 900
+    max_hourly_usd: float = 0.0
+    trust: NodeTrust = Field(default_factory=NodeTrust)
+
+
+class NodeHandle(BaseModel):
+    """A provisioned inference node (owned always-on, or rented ephemeral)."""
+
+    node_id: str
+    provider_id: str
+    state: NodeState = NodeState.absent
+    manager_endpoint: Optional[str] = None
+    started_at: Optional[float] = None  # epoch seconds; None until ready
+    hourly_usd: float = 0.0
+    trust: NodeTrust = Field(default_factory=NodeTrust)

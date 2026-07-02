@@ -5,14 +5,16 @@ to the Local Model Manager through this interface, which has two implementations
 
   * :class:`InProcessLocalClient` — wraps a :class:`ResidencyManager` directly.
     Used in tests and single-box deployments; no network, fully deterministic.
-  * :class:`HttpLocalClient` — calls the Model Manager's HTTP API over the
-    network, resolving its bearer token from the secrets manager.
+  * :class:`HttpLocalClient` — calls the Model Manager's HTTP API over **mutual
+    TLS**. The router presents a client certificate and verifies the manager's
+    server certificate against a private CA. Identity is the certificate — there
+    is NO shared application secret on the wire (handoff §7).
 """
 
 from __future__ import annotations
 
 import abc
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..common.schemas import (
     CanAcceptRequest,
@@ -23,6 +25,9 @@ from ..common.schemas import (
     LoadResponse,
     ManagerStatus,
 )
+
+if TYPE_CHECKING:
+    from ..common.config import TlsClientConfig
 
 
 class LocalClient(abc.ABC):
@@ -57,15 +62,41 @@ class InProcessLocalClient(LocalClient):
 
 
 class HttpLocalClient(LocalClient):
-    """Talks to a remote Local Model Manager. Resolves the bearer token from the
-    secrets manager at construction — the token never crosses into agent state."""
+    """Talks to a remote Local Model Manager over mutual TLS.
 
-    def __init__(self, base_url: str, token: Optional[str] = None, timeout: float = 30.0):
+    Authentication is the X.509 client certificate: the router presents
+    ``(client_cert, client_key)`` and pins the manager's server cert to the
+    private CA (``verify=ca_cert``). No shared secret is exchanged. When ``tls``
+    is ``None`` or ``mode == "insecure_localhost"`` the client falls back to plain
+    HTTP (dev/single-box loopback only)."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        tls: Optional["TlsClientConfig"] = None,
+        timeout: float = 30.0,
+    ):
         import httpx
 
         self._base = base_url.rstrip("/")
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        self._client = httpx.Client(base_url=self._base, headers=headers, timeout=timeout)
+        if tls is not None and tls.mode == "mutual":
+            # Build an explicit SSLContext: pin the manager's server cert to the
+            # private CA and present the router's client cert. (Avoids httpx's
+            # deprecated verify=<str> / cert=<tuple> shortcuts.)
+            import ssl
+
+            ctx = (
+                ssl.create_default_context(cafile=tls.ca_cert)
+                if tls.ca_cert
+                else ssl.create_default_context()
+            )
+            if tls.client_cert and tls.client_key:
+                ctx.load_cert_chain(certfile=tls.client_cert, keyfile=tls.client_key)
+            self._client = httpx.Client(base_url=self._base, verify=ctx, timeout=timeout)
+        else:
+            # insecure_localhost / no TLS material — plain HTTP, loopback only.
+            self._client = httpx.Client(base_url=self._base, timeout=timeout)
 
     def status(self) -> ManagerStatus:
         r = self._client.get("/status")

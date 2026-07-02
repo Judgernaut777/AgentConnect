@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentconnect-model-manager"
+version = "0.2.0"
+description = "AgentConnect Local Model Manager — the local inference control plane (an appliance). Model residency, admission control, and generation over a mutually-authenticated (mTLS) HTTP API. Optional satellite in the Router's ecosystem."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "agentconnect-core==0.2.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.scripts]
+agentconnect-model-manager = "agentconnect.model_manager.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentconnect.model_manager*"]
+namespaces = true

@@ -171,3 +171,49 @@ class QuotaLedger:
         """Drop a reservation without committing usage (e.g. task cancelled pre-call)."""
         with self._lock:
             self._reservations.pop(reservation.reservation_id, None)
+
+    # ------------------------------------------------------------ rented GPU
+    # Rented nodes bill by TIME (hourly), not tokens. Budget comes from the
+    # provider's `rental` config, and committed spend is persisted like cloud cost
+    # so the daily cap survives across tasks (handoff Goal 4).
+    def rental_remaining_usd(self, cfg: ProviderConfig, now: Optional[float] = None) -> float:
+        now = time.time() if now is None else now
+        cap = cfg.rental.max_daily_usd if cfg.rental else 0.0
+        if cap <= 0:
+            return float("inf")  # no daily cap configured
+        used = self.memory.quota_usage_since(cfg.provider_id, _day_start(now))
+        return max(0.0, cap - used["cost"])
+
+    def can_reserve_rental(self, cfg: ProviderConfig) -> tuple[bool, str]:
+        """Whether a rental window can be afforded within the daily budget."""
+        if cfg.rental is None:
+            return False, "not_a_rented_node"
+        rem = self.rental_remaining_usd(cfg)
+        # Cost of the minimum billable window at the node's hourly rate.
+        window_cost = cfg.rental.max_hourly_usd * (cfg.rental.min_rental_seconds / 3600.0)
+        if rem < window_cost:
+            return False, "daily_rental_budget_exhausted"
+        return True, "rental_budget_available"
+
+    def record_rental_window(
+        self, cfg: ProviderConfig, task_id: str, seconds: float, status: str = "rented"
+    ) -> float:
+        """Commit the cost of a rental window (hourly rate * duration) to memory."""
+        hourly = cfg.rental.max_hourly_usd if cfg.rental else 0.0
+        cost = hourly * (max(0.0, seconds) / 3600.0)
+        self.memory.record_quota_usage(
+            {
+                "provider": cfg.provider_id,
+                "task_id": task_id,
+                "est_input": 0,
+                "est_output": 0,
+                "act_input": 0,
+                "act_output": 0,
+                "requests": 1,
+                "est_cost_usd": cost,
+                "act_cost_usd": cost,
+                "status": status,
+                "failure_reason": None,
+            }
+        )
+        return cost

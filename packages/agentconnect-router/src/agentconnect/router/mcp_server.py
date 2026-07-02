@@ -14,13 +14,17 @@ Run with:  ``agentconnect-router``  (stdio transport)
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
 
+from ..common.config import TlsClientConfig
 from ..common.memory import SharedMemory
 from ..common.schemas import TaskConstraints, TaskSubmission
 from .service import RouterService
+
+_log = logging.getLogger(__name__)
 
 
 def _default_memory() -> SharedMemory:
@@ -31,22 +35,56 @@ def _default_memory() -> SharedMemory:
     return SharedMemory(data_dir / "shared_memory.sqlite")
 
 
+def _local_tls_from_env() -> Optional[TlsClientConfig]:
+    """Build the router's client-side mTLS config from env, if provided."""
+    mode = os.environ.get("AGENTCONNECT_LOCAL_TLS_MODE", "mutual")
+    ca = os.environ.get("AGENTCONNECT_LOCAL_CA")
+    cert = os.environ.get("AGENTCONNECT_LOCAL_CLIENT_CERT")
+    key = os.environ.get("AGENTCONNECT_LOCAL_CLIENT_KEY")
+    if mode == "insecure_localhost":
+        return TlsClientConfig(mode="insecure_localhost")
+    if not (ca or cert or key):
+        return None  # no material configured; HttpLocalClient falls back to plain HTTP
+    return TlsClientConfig(
+        mode="mutual", ca_cert=ca, client_cert=cert, client_key=key,
+        server_name=os.environ.get("AGENTCONNECT_LOCAL_SERVER_NAME"),
+    )
+
+
+def _try_embedded_manager():
+    """Soft-optional: embed an in-process Model Manager for single-box convenience.
+
+    The router library never hard-imports the manager; this bootstrap is the ONLY
+    place that references it, guarded by try/except so the router runs fine when
+    ``agentconnect-model-manager`` is not installed."""
+    try:
+        from ..model_manager.residency import ResidencyManager  # optional dependency
+        from .local_client import InProcessLocalClient
+    except ImportError:
+        _log.info(
+            "agentconnect-model-manager is not installed; running cloud-only "
+            "standalone. Local-only/repo-sensitive tasks will report no local node. "
+            "Install the 'embedded' extra or set MODEL_MANAGER_URL to add local inference."
+        )
+        return None
+    return InProcessLocalClient(ResidencyManager())
+
+
 def _build_service() -> RouterService:
-    """Wire the router. If a Local Model Manager endpoint is configured we use the
-    HTTP client; otherwise we fall back to an in-process manager so the server is
-    usable on a single box out of the box."""
-    local_client = None
+    """Wire the router.
+
+    Local inference is optional and never a hard dependency:
+      * MODEL_MANAGER_URL set   -> talk to a remote manager over mutual TLS
+      * else manager installed  -> embed an in-process manager (single-box convenience)
+      * else                    -> cloud-only standalone (the Router is the product)
+    """
     manager_url = os.environ.get("MODEL_MANAGER_URL")
     if manager_url:
         from .local_client import HttpLocalClient
 
-        token = os.environ.get("LOCAL_R9700_API_TOKEN")
-        local_client = HttpLocalClient(manager_url, token=token)
+        local_client = HttpLocalClient(manager_url, tls=_local_tls_from_env())
     else:
-        from ..model_manager.residency import ResidencyManager
-        from .local_client import InProcessLocalClient
-
-        local_client = InProcessLocalClient(ResidencyManager())
+        local_client = _try_embedded_manager()
     return RouterService.create(memory=_default_memory(), local_client=local_client)
 
 
@@ -65,18 +103,23 @@ def build_mcp_server(service: Optional[RouterService] = None):
         privacy_class: Optional[str] = None,
         allow_external: bool = True,
         allow_paid: bool = False,
+        allow_rented: bool = False,
         priority: str = "normal",
         quality: str = "standard",
         max_output_tokens: Optional[int] = None,
         refs: Optional[list[str]] = None,
     ) -> str:
         """Submit a task for routing. Returns a COMPACT summary + artifact refs
-        (never full output). Use read_artifact_chunk / get_log_slice for detail."""
+        (never full output). Use read_artifact_chunk / get_log_slice for detail.
+
+        Set allow_rented=True to permit a repo_sensitive task to run on a trusted
+        rented GPU node (for very large private models)."""
         constraints = TaskConstraints(
             profile=profile,
             privacy_class=privacy_class,  # type: ignore[arg-type]
             allow_external=allow_external,
             allow_paid=allow_paid,
+            allow_rented=allow_rented,
             priority=priority,  # type: ignore[arg-type]
             quality=quality,
             max_output_tokens=max_output_tokens,

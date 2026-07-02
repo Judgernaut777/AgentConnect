@@ -1,13 +1,15 @@
 """Provider gateway — the only component that touches secrets (handoff §7, §24).
 
 Given a provider id and a request, the gateway:
-  1. resolves the provider's secret at call time (via :class:`SecretResolver`),
+  1. for CLOUD providers, resolves the API key at call time (via
+     :class:`SecretResolver`); for LOCAL nodes, uses mutual TLS (no secret),
   2. makes the outbound call (local via the Local Model Manager, cloud via HTTP),
   3. returns only the model output + token usage.
 
-The resolved secret NEVER leaves this module: it is not logged, not returned, and
-not placed in any artifact or MCP payload. Agents and Claude only ever see the
-provider id.
+Any resolved cloud secret NEVER leaves this module: it is not logged, not returned,
+and not placed in any artifact or MCP payload. Local inference nodes carry no
+shared secret at all — identity is the client certificate. Agents and Claude only
+ever see the provider id.
 """
 
 from __future__ import annotations
@@ -49,9 +51,9 @@ class ProviderGateway:
             return self._local
         if not cfg.manager_endpoint:
             raise RuntimeError(f"Local provider {cfg.provider_id} has no manager_endpoint configured.")
-        # Resolve the manager's bearer token from the secrets manager (§7).
-        token = self._secrets.resolve(cfg.secret_ref)
-        return HttpLocalClient(cfg.manager_endpoint, token=token)
+        # Local nodes authenticate via mutual TLS — no secret is resolved here.
+        # Identity is the client certificate (see HttpLocalClient / handoff §7).
+        return HttpLocalClient(cfg.manager_endpoint, tls=cfg.tls)
 
     # --------------------------------------------------------------- dispatch
     def call(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:

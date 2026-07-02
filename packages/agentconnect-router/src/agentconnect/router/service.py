@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..common import privacy as privacy_mod
 from ..common.config import ProfilesConfig, RoutingConfig, load_all
@@ -34,9 +34,12 @@ from ..common.schemas import (
 )
 from ..common.state import TERMINAL_STATES, assert_transition
 from ..common.tokens import estimate_io_tokens
-from .gateway import ProviderGateway
+from .gateway import GatewayResult, ProviderGateway
 from .local_client import LocalClient
 from .routing import RoutingContext, RoutingEngine
+
+if TYPE_CHECKING:
+    from .provisioning import NodeProvisioner
 
 
 @dataclass
@@ -49,6 +52,9 @@ class RouterService:
     engine: RoutingEngine
     gateway: ProviderGateway
     local_client: Optional[LocalClient] = None
+    # Rented-node lifecycle (Goal 4). Defaults keep everything offline/testable.
+    provisioner: Optional["NodeProvisioner"] = None
+    rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -57,6 +63,8 @@ class RouterService:
         memory: Optional[SharedMemory] = None,
         local_client: Optional[LocalClient] = None,
         gateway: Optional[ProviderGateway] = None,
+        provisioner: Optional["NodeProvisioner"] = None,
+        rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None,
     ) -> "RouterService":
         providers_cfg, profiles, routing_cfg = load_all()
         mem = memory or SharedMemory()
@@ -66,10 +74,57 @@ class RouterService:
         gw = gateway or ProviderGateway(local_client=local_client)
         if local_client is not None:
             gw.bind_local(local_client)
+        from .provisioning import StubProvisioner
+
         return cls(
             memory=mem, registry=registry, profiles=profiles, routing_cfg=routing_cfg,
             quota=quota, engine=engine, gateway=gw, local_client=local_client,
+            provisioner=provisioner or StubProvisioner(),
+            rented_client_factory=rented_client_factory,
         )
+
+    # ------------------------------------------------------------- dispatch
+    def _dispatch(self, cfg, gen_req: GenerateRequest) -> GatewayResult:
+        """Run a generation. Owned-local/cloud go through the gateway; a rented
+        node is provisioned on demand, used over mTLS, billed for its rental
+        window, then torn down (handoff Goal 4)."""
+        if not RoutingEngine._is_rented(cfg):
+            return self.gateway.call(cfg, gen_req)
+
+        from .provisioning import spec_from_provider
+
+        spec = spec_from_provider(cfg, model_id=gen_req.model_id)
+        handle = self.provisioner.provision(spec)
+        handle = self.provisioner.wait_ready(handle)
+        try:
+            factory = self.rented_client_factory or self._default_rented_client
+            client = factory(cfg, handle)
+            resp = client.generate(gen_req)
+            # Bill the minimum rental window (amortizes spin-up); a production
+            # reaper would keep the node warm until terminate_when_idle_seconds.
+            window = cfg.rental.min_rental_seconds if cfg.rental else 0
+            self.quota.record_rental_window(cfg, gen_req.task_id, seconds=window)
+            self.memory.append_log(
+                gen_req.task_id,
+                f"rented_node provisioned={handle.node_id} endpoint={handle.manager_endpoint} "
+                f"billed_window_s={window}",
+            )
+            return GatewayResult(
+                output_text=resp.output_text,
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                provider=cfg.provider_id,
+                model=resp.model_id,
+            )
+        finally:
+            self.provisioner.terminate(handle)
+
+    def _default_rented_client(self, cfg, handle) -> LocalClient:
+        from .local_client import HttpLocalClient
+
+        if not handle.manager_endpoint:
+            raise RuntimeError(f"Rented node {handle.node_id} has no endpoint after provisioning.")
+        return HttpLocalClient(handle.manager_endpoint, tls=cfg.tls)
 
     # --------------------------------------------------------------- helpers
     def _local_status(self) -> Optional[ManagerStatus]:
@@ -150,6 +205,7 @@ class RouterService:
             est_output_tokens=out_tok,
             allow_external=submission.constraints.allow_external,
             allow_paid=submission.constraints.allow_paid,
+            allow_rented=submission.constraints.allow_rented,
             priority=submission.constraints.priority,
             quality="high" if submission.constraints.quality == "high" else "standard",
             cloud_safe=redaction.cloud_safe,
@@ -201,7 +257,7 @@ class RouterService:
             priority=submission.constraints.priority,
         )
         try:
-            result = self.gateway.call(cfg, gen_req)
+            result = self._dispatch(cfg, gen_req)
         except Exception as exc:  # dispatch failure -> FAILED, reconcile as failure.
             if reservation is not None:
                 self.quota.reconcile(reservation, cfg, 0, 0, status="failed", failure_reason=str(exc))
