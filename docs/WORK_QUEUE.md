@@ -263,7 +263,27 @@ worker = PullWorker(
 worker.run_forever()   # claim -> run locally -> report, backing off when idle
 ```
 
-Each iteration: `claim` a ticket the worker's attested tier is authorized for (body delivered inline) → `execute` it through the local runtime → `report` the `WorkerResult` back under the lease. A trusted (`local_only`) worker's completed result auto-accepts to `done`; an untrusted contributor's result lands `in_review` until a `local_only` reviewer approves it. Identity is the mTLS client certificate the worker presents; `identity_headers` is only for the header-stripping-proxy / test seam. Crash safety is the broker's: a worker that dies mid-task loses its lease and the reaper requeues the ticket — a `report` after lease expiry returns `lease_lost` (refused, never corrupting), so `heartbeat` long-running tasks to keep the lease.
+Each iteration: `claim` a ticket the worker's attested tier is authorized for (body delivered inline) → `execute` it through the local runtime → `report` the `WorkerResult` back under the lease. A trusted (`local_only`) worker's completed result auto-accepts to `done`; an untrusted contributor's result lands `in_review` until a `local_only` reviewer approves it. Identity is the mTLS client certificate the worker presents; `identity_headers` is only for the header-stripping-proxy / test seam.
+
+**Heartbeating.** Crash safety is the broker's: a worker that dies mid-task loses its lease and the reaper requeues the ticket. To keep a *live* long task from being reaped out from under it, set `heartbeat_interval > 0` — a background thread renews the lease while the task runs (heartbeat failures are swallowed; `report` is the authoritative fence and returns `lease_lost` if the lease was already lost, refusing to corrupt a re-claim).
+
+### Running one: `agentconnect-worker`
+
+`runtime/worker_cli.py` (console script `agentconnect-worker`, or `python -m agentconnect.runtime.worker_cli`) makes a contributor launchable with no code. Install the `[worker]` extra for a real model, or use `--dry-run` (a built-in echo model) to smoke-test connectivity + auth + the claim/report flow first:
+
+```bash
+# Local dev / connectivity check (plain HTTP loopback, header identity):
+agentconnect-worker --broker http://127.0.0.1:8000 --dry-run \
+    --insecure-localhost --identity trusted-worker --once
+
+# A friend's box contributing real compute over mutual TLS:
+agentconnect-worker --broker https://broker:8443 \
+    --capabilities coding,summarization \
+    --ca ca.pem --cert worker.pem --key worker.key \
+    --heartbeat-interval 30
+```
+
+In production, identity is the mTLS client certificate (`--ca/--cert/--key`) — no header is sent and the broker reads the cert from the TLS layer. `--identity` sends the `X-Client-Cert-DN` header instead, for the header-stripping-proxy topology (broker started with `trust_proxy_headers=True`) or local `--insecure-localhost` dev where there is no cert to carry identity. The model is an OpenAI-compatible server via the model-manager's `backend_from_env` (`MODEL_BACKEND_URL`, …). `--once` processes a single ticket; otherwise it loops, backing off `--poll-interval` seconds when idle.
 
 ## Data Model
 
