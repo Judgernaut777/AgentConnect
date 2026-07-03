@@ -1,5 +1,12 @@
 # Agent Runtime
 
+> **Status:** the first slice is implemented in `packages/agentconnect-runtime`.
+> A LangGraph act/tool loop executes tasks in a confined workspace with
+> filesystem + shell tools and returns `WorkerResult`. The model is reached via
+> the `ModelSource` protocol (`generate(GenerateRequest) -> GenerateResponse`),
+> so the stub backend, residency manager, and HTTP clients all plug in.
+> Browser tool, test-runner tool, and remote transport remain future work.
+
 This repo is the deterministic control plane around agents, not the agent worker itself.
 
 The runtime layer should use **LangChain + LangGraph** as one stack:
