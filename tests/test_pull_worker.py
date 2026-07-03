@@ -141,3 +141,59 @@ def test_run_forever_drains_multiple_then_stops(tmp_path):
 
     assert processed == 3
     assert all(_status(wq, tid) == "done" for tid in ids)
+
+
+# ----------------------------------------------------------------- heartbeat
+def _make_slow(worker, seconds):
+    """Make the worker's execute() take `seconds`, so a heartbeat can fire mid-run."""
+    import time as _t
+
+    orig = worker.execute
+    worker.execute = lambda ticket: (_t.sleep(seconds), orig(ticket))[1]
+
+
+def test_heartbeat_renews_lease_while_a_slow_task_runs(tmp_path):
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="slow job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path, heartbeat_interval=0.02)
+
+    beats = []
+    real_hb = worker.heartbeat
+    worker.heartbeat = lambda tid, tok: (beats.append(tid), real_hb(tid, tok))[1]
+    _make_slow(worker, 0.06)  # spans ~3 heartbeat intervals
+
+    outcome = worker.run_once()
+
+    assert outcome is not None
+    assert len(beats) >= 1  # the lease was actively renewed mid-run
+    assert _status(wq, t) == "done"
+
+
+def test_heartbeat_disabled_by_default(tmp_path):
+    client, wq, _ = _broker(tmp_path)
+    wq.add(task="t", origin="test", privacy_class="public", payload="job")
+    worker = _worker(client, "trusted-worker", tmp_path)  # heartbeat_interval defaults to 0
+
+    beats = []
+    worker.heartbeat = lambda tid, tok: beats.append(tid)
+    _make_slow(worker, 0.03)
+
+    assert worker.run_once() is not None
+    assert beats == []
+
+
+def test_heartbeat_failure_is_swallowed_report_is_authoritative(tmp_path):
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path, heartbeat_interval=0.02)
+
+    def boom(tid, tok):
+        raise RuntimeError("transport hiccup")
+
+    worker.heartbeat = boom
+    _make_slow(worker, 0.05)
+
+    # A throwing heartbeat must not crash the run; report still lands the result.
+    outcome = worker.run_once()
+    assert outcome is not None
+    assert _status(wq, t) == "done"

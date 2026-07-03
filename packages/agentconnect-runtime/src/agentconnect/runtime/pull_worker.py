@@ -24,6 +24,7 @@ should ``heartbeat`` to renew; otherwise its ``report`` returns ``lease_lost``
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable, Iterable, Optional
 
@@ -43,6 +44,7 @@ class PullWorker:
         capabilities: Iterable[str] = (),
         identity_headers: Optional[dict[str, str]] = None,
         poll_interval: float = 2.0,
+        heartbeat_interval: float = 0.0,
         heartbeat_extend_seconds: int = 120,
         timeout: float = 600.0,
         task_id_prefix: str = "pull",
@@ -50,6 +52,9 @@ class PullWorker:
         self.runtime = runtime
         self.capabilities = list(capabilities)
         self.poll_interval = poll_interval
+        # >0 renews the lease every `heartbeat_interval`s while a task runs, so a
+        # task that outlives its lease is not reaped mid-flight. 0 disables it.
+        self.heartbeat_interval = heartbeat_interval
         self.heartbeat_extend_seconds = heartbeat_extend_seconds
         self._headers = dict(identity_headers or {})
         self._prefix = task_id_prefix
@@ -111,6 +116,30 @@ class PullWorker:
         submission = TaskSubmission(task=ticket.get("payload", "") or "")
         return self.runtime.run(submission, task_id=f"{self._prefix}_{ticket['ticket_id']}")
 
+    def _execute_with_heartbeat(self, ticket: dict[str, Any]) -> WorkerResult:
+        """Run the task while a background thread renews the lease, so a slow run
+        is not reaped and re-handed to another worker mid-flight. Heartbeat
+        failures (e.g. the lease was already lost) are swallowed here — ``report``
+        is the authoritative fence and will surface ``lease_lost`` if so."""
+        if self.heartbeat_interval <= 0:
+            return self.execute(ticket)
+        stop = threading.Event()
+
+        def _beat() -> None:
+            while not stop.wait(self.heartbeat_interval):
+                try:
+                    self.heartbeat(ticket["ticket_id"], ticket["lease_token"])
+                except Exception:  # transport hiccup or lost lease — report() decides.
+                    pass
+
+        beater = threading.Thread(target=_beat, name="pull-heartbeat", daemon=True)
+        beater.start()
+        try:
+            return self.execute(ticket)
+        finally:
+            stop.set()
+            beater.join(timeout=self.heartbeat_interval + 1.0)
+
     def run_once(self) -> Optional[dict[str, Any]]:
         """Claim → execute → report a single ticket. Returns the outcome, or
         ``None`` when nothing is authorized/available (the caller should back off)."""
@@ -118,7 +147,7 @@ class PullWorker:
         if not tickets:
             return None
         ticket = tickets[0]
-        result = self.execute(ticket)
+        result = self._execute_with_heartbeat(ticket)
         outcome = self.report(ticket["ticket_id"], ticket["lease_token"], result)
         return {"ticket_id": ticket["ticket_id"], "result": result, "report": outcome}
 
