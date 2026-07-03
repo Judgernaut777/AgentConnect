@@ -1,1 +1,1 @@
-"""Browser/tool-access placeholder."""
+"""Browser tool placeholder — gated by RuntimeConfig.allow_browser, unimplemented."""
