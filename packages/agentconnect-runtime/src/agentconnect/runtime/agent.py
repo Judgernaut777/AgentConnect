@@ -16,6 +16,7 @@ from agentconnect.common.schemas import GenerateRequest, GenerateResponse, TaskS
 
 from .results import worker_result_from_state
 from .state import RuntimeState
+from .tools.browser import Fetcher, Resolver
 from .workspace import Workspace
 
 
@@ -33,22 +34,52 @@ class RuntimeConfig:
     allow_shell: bool = True
     allow_browser: bool = False
     shell_timeout_seconds: float = 60.0
+    # Tests default-on (unlike the browser): the command below is operator
+    # config only — the model cannot pass arguments to run_tests. But running
+    # the suite still imports (and thus executes) model-written test files, so
+    # the graph additionally requires allow_shell before run_tests fires: on a
+    # worker with no OS sandbox, allow_shell=False must deny ALL arbitrary code
+    # execution, and run_tests is one such path.
+    allow_tests: bool = True
+    # "python -m pytest" resolves inside any venv/conda env; a wrong command
+    # fails loudly (exit 127 + raw output tail), never silently.
+    test_command: str = "python -m pytest"
+    # Suites legitimately outlast the 60s shell default.
+    test_timeout_seconds: float = 300.0
+    # Browser default-off (allow_browser above): fetch_url is network egress,
+    # unlike every other tool. The timeout is per redirect hop, so a run is
+    # bounded by (browser_max_redirects + 1) * browser_timeout_seconds.
+    browser_timeout_seconds: float = 20.0
+    browser_max_response_bytes: int = 1_000_000  # body cap per response
+    browser_max_redirects: int = 5
     # Tool output shown to the model is truncated to this many chars.
     observation_max_chars: int = 4000
     agent_profile: str = "resident_ok"
 
 
 class AgentRuntime(Protocol):
-    def run(self, task: TaskSubmission) -> WorkerResult:
+    def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult:
         """Execute a task and return the worker contract."""
 
 
 class LangGraphAgentRuntime:
     """Executes one task at a time through the LangGraph act/tool loop."""
 
-    def __init__(self, model_source: ModelSource, config: RuntimeConfig | None = None):
+    def __init__(
+        self,
+        model_source: ModelSource,
+        config: RuntimeConfig | None = None,
+        *,
+        fetcher: Fetcher | None = None,
+        url_resolver: Resolver | None = None,
+    ):
         self.model_source = model_source
         self.config = config or RuntimeConfig()
+        # Injection seams for the browser tool (offline tests, custom egress
+        # policy); None means the tool's stdlib defaults. Seams are wiring, so
+        # they live here rather than in the frozen RuntimeConfig (data only).
+        self._fetcher = fetcher
+        self._url_resolver = url_resolver
 
     def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult:
         from .graph import build_execution_graph
@@ -56,7 +87,13 @@ class LangGraphAgentRuntime:
 
         workspace = Workspace.create(self.config.workspace_root or None, task_id=task_id)
         try:
-            graph = build_execution_graph(self.config, self.model_source, workspace)
+            graph = build_execution_graph(
+                self.config,
+                self.model_source,
+                workspace,
+                fetcher=self._fetcher,
+                url_resolver=self._url_resolver,
+            )
             initial: RuntimeState = {
                 "task_id": task_id,
                 "messages": [

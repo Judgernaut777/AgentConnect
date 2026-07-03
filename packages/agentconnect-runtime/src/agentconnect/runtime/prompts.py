@@ -19,7 +19,7 @@ Respond with EXACTLY one JSON object per turn and nothing else. Available action
 {{"action": "read_file", "path": "<path relative to the workspace>"}}
 {{"action": "write_file", "path": "<relative path>", "content": "<full new file content>"}}
 {{"action": "list_dir", "path": "<relative path, default .>"}}
-{shell_action}{{"action": "finish", "summary": "<what you did / found>", "confidence": <0.0-1.0>, "risks": ["<risk>", ...], "recommended_next_action": "<optional>"}}
+{shell_action}{tests_action}{browser_action}{{"action": "finish", "summary": "<what you did / found>", "confidence": <0.0-1.0>, "risks": ["<risk>", ...], "recommended_next_action": "<optional>"}}
 
 Rules:
 - Paths must stay inside the workspace; there is no access outside it.
@@ -29,11 +29,17 @@ Rules:
 """
 
 _SHELL_LINE = '{"action": "shell", "command": "<command run in the workspace>"}\n'
+_TESTS_LINE = '{"action": "run_tests"}  (runs the project\'s test suite)\n'
+_BROWSER_LINE = '{"action": "fetch_url", "url": "<http(s) URL, returned as readable text>"}\n'
 
 
 def build_system_prompt(task: TaskSubmission, config: RuntimeConfig) -> str:
     protocol = _PROTOCOL.format(
         shell_action=_SHELL_LINE if config.allow_shell else "",
+        # run_tests executes workspace code, so the graph gates it on allow_shell
+        # too; only advertise it when it can actually run.
+        tests_action=_TESTS_LINE if (config.allow_tests and config.allow_shell) else "",
+        browser_action=_BROWSER_LINE if config.allow_browser else "",
         max_steps=config.max_steps,
     )
     return f"{protocol}\nProfile: {config.agent_profile}\nTask:\n{task.task}"

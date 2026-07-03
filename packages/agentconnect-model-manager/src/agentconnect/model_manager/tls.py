@@ -24,6 +24,13 @@ import os
 import ssl
 from typing import Optional
 
+# Moved to core (pure ASGI, shared with the worker transport); re-exported so
+# existing imports from this module keep working.
+from agentconnect.common.asgi_identity import (  # noqa: F401
+    ClientIdentityMiddleware,
+    _peer_identity,
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class ManagerTlsConfig:
@@ -53,53 +60,6 @@ def allowed_clients_from_env() -> Optional[set[str]]:
         with open(raw, "r", encoding="utf-8") as fh:
             return {line.strip() for line in fh if line.strip()}
     return {item.strip() for item in raw.split(",") if item.strip()}
-
-
-def _peer_identity(scope) -> Optional[str]:
-    """Best-effort peer identity from the ASGI-TLS extension or a proxy header."""
-    ext = (scope.get("extensions") or {}).get("tls") or {}
-    # ASGI-TLS extension (PEP-ish): client cert subject may be exposed here.
-    subject = ext.get("client_cert_name") or ext.get("client_cert_subject")
-    if subject:
-        return str(subject)
-    for name, value in scope.get("headers", []):
-        lname = name.decode().lower() if isinstance(name, bytes) else str(name).lower()
-        if lname in ("x-client-cert-dn", "x-spiffe-id"):
-            return value.decode() if isinstance(value, bytes) else str(value)
-    return None
-
-
-class ClientIdentityMiddleware:
-    """ASGI middleware: reject requests whose peer identity is not in ``allowed``.
-
-    Only enforces when an identity can actually be determined (extension or proxy
-    header). If none is available it defers to the transport-layer CA check rather
-    than blocking every request — see module docstring.
-    """
-
-    def __init__(self, app, allowed: set[str]):
-        self.app = app
-        self.allowed = allowed
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
-            identity = _peer_identity(scope)
-            if identity is not None and identity not in self.allowed:
-                await self._forbid(send, f"client identity {identity!r} not allowed")
-                return
-        await self.app(scope, receive, send)
-
-    @staticmethod
-    async def _forbid(send, detail: str) -> None:
-        body = f'{{"detail":"{detail}"}}'.encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 403,
-                "headers": [(b"content-type", b"application/json")],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
 
 
 def build_ssl_kwargs(tls: ManagerTlsConfig) -> dict:
