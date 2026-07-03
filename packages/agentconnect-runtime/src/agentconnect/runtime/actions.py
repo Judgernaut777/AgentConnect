@@ -7,6 +7,7 @@ native tool-calling API — so the model replies with one JSON object per turn:
     {"action": "write_file", "path": "src/app.py", "content": "..."}
     {"action": "list_dir",   "path": "."}
     {"action": "shell",      "command": "pytest -q"}
+    {"action": "fetch_url",  "url": "https://example.com/docs"}
     {"action": "finish",     "summary": "...", "confidence": 0.8,
      "risks": [], "recommended_next_action": "..."}
 
@@ -22,13 +23,15 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-KNOWN_ACTIONS = ("read_file", "write_file", "list_dir", "shell", "finish")
+KNOWN_ACTIONS = ("read_file", "write_file", "list_dir", "shell", "run_tests", "fetch_url", "finish")
 
 _REQUIRED_ARGS = {
     "read_file": ("path",),
     "write_file": ("path", "content"),
     "list_dir": (),
     "shell": ("command",),
+    "run_tests": (),
+    "fetch_url": ("url",),
     "finish": (),
 }
 

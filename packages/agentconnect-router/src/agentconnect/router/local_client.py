@@ -79,20 +79,14 @@ class HttpLocalClient(LocalClient):
     ):
         import httpx
 
-        self._base = base_url.rstrip("/")
-        if tls is not None and tls.mode == "mutual":
-            # Build an explicit SSLContext: pin the manager's server cert to the
-            # private CA and present the router's client cert. (Avoids httpx's
-            # deprecated verify=<str> / cert=<tuple> shortcuts.)
-            import ssl
+        from ..common.config import client_ssl_context
 
-            ctx = (
-                ssl.create_default_context(cafile=tls.ca_cert)
-                if tls.ca_cert
-                else ssl.create_default_context()
-            )
-            if tls.client_cert and tls.client_key:
-                ctx.load_cert_chain(certfile=tls.client_cert, keyfile=tls.client_key)
+        self._base = base_url.rstrip("/")
+        # Explicit SSLContext: pin the manager's server cert to the private CA
+        # and present the router's client cert. (Avoids httpx's deprecated
+        # verify=<str> / cert=<tuple> shortcuts.)
+        ctx = client_ssl_context(tls)
+        if ctx is not None:
             self._client = httpx.Client(base_url=self._base, verify=ctx, timeout=timeout)
         else:
             # insecure_localhost / no TLS material — plain HTTP, loopback only.

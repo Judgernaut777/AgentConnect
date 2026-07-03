@@ -66,6 +66,24 @@ class TlsClientConfig:
     server_name: str | None = None
 
 
+def client_ssl_context(tls: "TlsClientConfig | None") -> "ssl.SSLContext | None":
+    """SSLContext for mutual-TLS clients: pin the server cert to the private CA
+    and present the client cert. Returns ``None`` for ``tls=None`` or
+    ``mode != "mutual"`` — plain HTTP, loopback/dev only."""
+    import ssl
+
+    if tls is None or tls.mode != "mutual":
+        return None
+    ctx = (
+        ssl.create_default_context(cafile=tls.ca_cert)
+        if tls.ca_cert
+        else ssl.create_default_context()
+    )
+    if tls.client_cert and tls.client_key:
+        ctx.load_cert_chain(certfile=tls.client_cert, keyfile=tls.client_key)
+    return ctx
+
+
 @dataclass(frozen=True)
 class RentalConfig:
     """Lifecycle + cost + trust settings for a rented GPU node (handoff Goal 4).

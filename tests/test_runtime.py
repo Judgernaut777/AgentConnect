@@ -8,6 +8,8 @@ backend to prove the ModelSource seam matches the rest of the system.
 from __future__ import annotations
 
 import json
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -58,6 +60,10 @@ def test_parse_action_prose_becomes_freeform_finish():
 def test_parse_action_unknown_or_incomplete_is_invalid():
     assert parse_action('{"action": "rm_rf", "path": "/"}').kind == "invalid"
     assert parse_action('{"action": "write_file", "path": "a.py"}').kind == "invalid"
+
+
+def test_parse_run_tests_action():
+    assert parse_action('{"action": "run_tests"}').kind == "run_tests"
 
 
 # ------------------------------------------------------- workspace confinement
@@ -329,6 +335,253 @@ def test_default_config_uses_fresh_temp_workspace_and_cleans_up():
         if d.name.startswith("agentconnect-ws-tws-")
     ]
     assert leftovers == []
+
+
+# ------------------------------------------------------------ run_tests tool
+# The venv's pytest regardless of PATH; nested runs are local-only subprocesses.
+PYTEST_CMD = f"{shlex.quote(sys.executable)} -m pytest -q"
+
+_RUN_TESTS = json.dumps({"action": "run_tests"})
+
+
+def _seed_suite(tmp_path):
+    """One passing + one failing + one skipped test."""
+    (tmp_path / "test_demo.py").write_text(
+        "import pytest\n"
+        "def test_pass():\n"
+        "    assert True\n"
+        "def test_fail():\n"
+        "    assert False\n"
+        "@pytest.mark.skip(reason='later')\n"
+        "def test_skip():\n"
+        "    pass\n"
+    )
+
+
+def test_run_tests_reports_structured_counts_and_failing_names(tmp_path):
+    _seed_suite(tmp_path)
+    rt, source = _runtime([_RUN_TESTS, _finish("ran tests")], tmp_path, test_command=PYTEST_CMD)
+    result = rt.run(TaskSubmission(task="run the tests"), task_id="rt1")
+    assert result.status == "completed"
+    obs = source.requests[1].messages[-1]["content"]
+    assert "exit_code=1" in obs
+    assert "passed=1 failed=1 errors=0 skipped=1" in obs
+    assert "failing:" in obs
+    assert "test_demo::test_fail" in obs
+
+
+def test_run_tests_all_green_and_evidence_ref(tmp_path):
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    rt, source = _runtime([_RUN_TESTS, _finish("green")], tmp_path, test_command=PYTEST_CMD)
+    result = rt.run(TaskSubmission(task="run the tests"), task_id="rt2")
+    obs = source.requests[1].messages[-1]["content"]
+    assert "exit_code=0" in obs
+    assert "passed=1 failed=0" in obs
+    assert "failing:" not in obs
+    assert f"run_tests:{PYTEST_CMD[:120]}" in result.evidence_refs
+
+
+def test_run_tests_failing_suite_still_yields_evidence(tmp_path):
+    """Red results are evidence too; only ERROR observations are not."""
+    _seed_suite(tmp_path)
+    rt, _ = _runtime([_RUN_TESTS, _finish("red")], tmp_path, test_command=PYTEST_CMD)
+    result = rt.run(TaskSubmission(task="run the tests"), task_id="rt3")
+    assert f"run_tests:{PYTEST_CMD[:120]}" in result.evidence_refs
+
+
+def test_run_tests_non_pytest_runner_falls_back_to_tail(tmp_path):
+    rt, source = _runtime(
+        [_RUN_TESTS, _finish("ok")], tmp_path, test_command="echo one; echo two; exit 3"
+    )
+    rt.run(TaskSubmission(task="run the tests"), task_id="rt4")
+    obs = source.requests[1].messages[-1]["content"]
+    assert "exit_code=3" in obs
+    assert "no structured results" in obs
+    assert "two" in obs
+    # no junit injection for non-pytest commands
+    assert "--junitxml" not in obs
+
+
+def test_run_tests_disabled_by_policy(tmp_path):
+    rt, source = _runtime(
+        [_RUN_TESTS, _finish("ok")], tmp_path, allow_tests=False, test_command=PYTEST_CMD
+    )
+    result = rt.run(TaskSubmission(task="run the tests"), task_id="rt5")
+    obs = source.requests[1].messages[-1]["content"]
+    assert "disabled" in obs
+    assert result.evidence_refs == []
+
+
+def test_run_tests_requires_shell_gate(tmp_path):
+    """run_tests imports (and thus executes) workspace test files, so it is an
+    arbitrary-code-execution primitive equal to shell. With allow_shell=False
+    and no OS sandbox, it must stay disabled even when allow_tests is True —
+    otherwise the shell gate is silently defeated."""
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    rt, source = _runtime(
+        [_RUN_TESTS, _finish("done")],
+        tmp_path,
+        allow_shell=False,
+        allow_tests=True,
+        test_command=PYTEST_CMD,
+    )
+    result = rt.run(TaskSubmission(task="test without shell"), task_id="rt6")
+    assert result.status == "completed"
+    tests_obs = source.requests[1].messages[-1]["content"]
+    assert "disabled" in tests_obs
+    assert result.evidence_refs == []
+    # The action is not advertised when it cannot run.
+    prompt = source.requests[0].messages[0]["content"]
+    assert "run_tests" not in prompt
+    assert '"action": "shell"' not in prompt
+
+
+def test_run_tests_cannot_bypass_shell_gate_via_written_test(tmp_path):
+    """Concrete pwn: with allow_shell=False the model writes a test whose
+    module-level code executes on pytest import, then calls run_tests. The gate
+    must block run_tests so the payload never runs (marker file never created)."""
+    marker = tmp_path / "PWNED"
+    payload = (
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('x')\n"
+        "def test_noop():\n    assert True\n"
+    )
+    rt, source = _runtime(
+        [
+            json.dumps({"action": "write_file", "path": "test_pwn.py", "content": payload}),
+            _RUN_TESTS,
+            _finish("attempted"),
+        ],
+        tmp_path,
+        allow_shell=False,
+        allow_tests=True,
+        test_command=PYTEST_CMD,
+    )
+    rt.run(TaskSubmission(task="pwn the host"), task_id="rt6b")
+    run_tests_obs = source.requests[2].messages[-1]["content"]
+    assert "disabled" in run_tests_obs
+    assert not marker.exists()  # payload never executed
+
+
+def test_run_tests_prompt_line_absent_when_tests_disabled(tmp_path):
+    """Finding 4: the run_tests template must disappear when allow_tests=False,
+    mirroring the shell/browser conditional lines (both directions covered)."""
+    rt_on, source_on = _runtime([_finish("done")], tmp_path, allow_tests=True)
+    rt_on.run(TaskSubmission(task="anything"), task_id="rt6c")
+    assert "run_tests" in source_on.requests[0].messages[0]["content"]
+
+    rt_off, source_off = _runtime([_finish("done")], tmp_path, allow_tests=False)
+    rt_off.run(TaskSubmission(task="anything"), task_id="rt6d")
+    assert "run_tests" not in source_off.requests[0].messages[0]["content"]
+
+
+def test_run_tests_timeout_kills_process_group(tmp_path):
+    rt, source = _runtime(
+        [_RUN_TESTS, _finish("gave up")],
+        tmp_path,
+        test_command="sleep 5",
+        test_timeout_seconds=0.5,
+    )
+    result = rt.run(TaskSubmission(task="slow suite"), task_id="rt7")
+    obs = source.requests[1].messages[-1]["content"]
+    assert "timed out" in obs
+    assert result.evidence_refs == []
+
+
+def test_run_tests_leaves_no_report_in_workspace(tmp_path):
+    """The junit report lives in system temp, never the workspace, and is
+    always deleted."""
+    import tempfile
+
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    rt, _ = _runtime([_RUN_TESTS, _finish("clean")], tmp_path, test_command=PYTEST_CMD)
+    rt.run(TaskSubmission(task="run the tests"), task_id="rt8")
+    assert list(tmp_path.rglob("*.xml")) == []
+    leftovers = [
+        p for p in Path(tempfile.gettempdir()).iterdir()
+        if p.name.startswith("agentconnect-junit-")
+    ]
+    assert leftovers == []
+
+
+def test_summarize_junit_handles_wrapped_and_bare_roots(tmp_path):
+    from agentconnect.runtime.tools.tests import _summarize_junit
+
+    wrapped = tmp_path / "wrapped.xml"
+    wrapped.write_text(
+        '<testsuites>'
+        '<testsuite tests="2" failures="1" errors="0" skipped="0">'
+        '<testcase classname="a" name="ok"/>'
+        '<testcase classname="a" name="bad"><failure/></testcase>'
+        '</testsuite>'
+        '<testsuite tests="1" failures="0" errors="1" skipped="0">'
+        '<testcase classname="b" name="boom"><error/></testcase>'
+        '</testsuite>'
+        '</testsuites>'
+    )
+    counts, failing = _summarize_junit(str(wrapped))
+    assert counts == {"tests": 3, "failures": 1, "errors": 1, "skipped": 0}
+    assert failing == ["a::bad", "b::boom"]
+
+    bare = tmp_path / "bare.xml"
+    bare.write_text(
+        '<testsuite tests="2" failures="1" errors="1" skipped="0">'
+        '<testcase classname="a" name="bad"><failure/></testcase>'
+        '<testcase classname="b" name="boom"><error/></testcase>'
+        '</testsuite>'
+    )
+    counts, failing = _summarize_junit(str(bare))
+    assert counts == {"tests": 2, "failures": 1, "errors": 1, "skipped": 0}
+    assert failing == ["a::bad", "b::boom"]
+
+    garbage = tmp_path / "garbage.xml"
+    garbage.write_text("not xml at all")
+    assert _summarize_junit(str(garbage)) is None
+
+
+def test_format_structured_caps_failing_names_with_overflow_count(tmp_path):
+    """Finding 7: >20 failing tests are truncated to exactly 20 names plus a
+    '... and N more failing tests' line. Exercises _summarize_junit's slice and
+    _format_structured's overflow arithmetic end-to-end."""
+    from agentconnect.runtime.tools.tests import _format_structured, _summarize_junit
+
+    cases = "".join(
+        f'<testcase classname="m" name="t{i}"><failure/></testcase>' for i in range(25)
+    )
+    report = tmp_path / "many.xml"
+    report.write_text(f'<testsuite tests="25" failures="25" errors="0" skipped="0">{cases}</testsuite>')
+    counts, failing = _summarize_junit(str(report))
+    assert len(failing) == 25
+
+    out = _format_structured(1, counts, failing)
+    lines = out.splitlines()
+    listed = [ln for ln in lines if ln.startswith("m::t")]
+    assert len(listed) == 20
+    assert listed == [f"m::t{i}" for i in range(20)]
+    assert "... and 5 more failing tests" in lines
+    # No 21st name leaks past the cap.
+    assert "m::t20" not in listed
+
+
+def test_run_tests_pytest_command_without_report_falls_back_to_tail(tmp_path):
+    """Finding 8: a command containing 'pytest' (so structured=True) whose run
+    produces no valid junit report degrades to the exit-code + output tail,
+    never leaking the temp report path into the transcript."""
+    # 'pytest' appears only in a shell comment, which also swallows the
+    # appended --junitxml=<path> arg, so no report is ever written.
+    command = (
+        f'{shlex.quote(sys.executable)} '
+        '-c "import sys; print(\'no junit here\'); sys.exit(4)" #pytest'
+    )
+    rt, source = _runtime([_RUN_TESTS, _finish("ok")], tmp_path, test_command=command)
+    rt.run(TaskSubmission(task="run the tests"), task_id="rt9")
+    obs = source.requests[1].messages[-1]["content"]
+    assert "exit_code=4" in obs
+    assert "no structured results" in obs
+    assert "no junit here" in obs
+    # The temp junit path must not leak into the model transcript.
+    assert "agentconnect-junit-" not in obs
+    assert "--junitxml" not in obs
 
 
 # -------------------------------------------- integration with the stub backend

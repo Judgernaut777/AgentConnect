@@ -5,7 +5,9 @@
 > filesystem + shell tools and returns `WorkerResult`. The model is reached via
 > the `ModelSource` protocol (`generate(GenerateRequest) -> GenerateResponse`),
 > so the stub backend, residency manager, and HTTP clients all plug in.
-> Browser tool, test-runner tool, and remote transport remain future work.
+> All first-slice surfaces are implemented: filesystem, shell, test-runner,
+> and browser tools plus the remote transport (`create_worker_app` /
+> `HttpAgentRuntime`).
 
 This repo is the deterministic control plane around agents, not the agent worker itself.
 
@@ -135,11 +137,11 @@ Converts final runtime state into the shared contract.
 
 ### `transport.py`
 
-Defines how the runtime is invoked.
+How the runtime is invoked remotely.
 
-- local subprocess
-- HTTP worker service
-- future distributed execution
+- `create_worker_app(runtime)` — FastAPI app: `POST /run` (task_id + `TaskSubmission` → `WorkerResult`), `GET /can_accept` (capacity/liveness probe), lock-guarded capacity counter
+- `HttpAgentRuntime(base_url, tls=...)` — `AgentRuntime` client over HTTP; authentication is the mTLS client certificate
+- TLS terminates at the server launcher (uvicorn `ssl_cert_reqs=CERT_REQUIRED`), never in the app factory; the wire never carries `RuntimeConfig`
 
 ## How It Connects To The Router
 

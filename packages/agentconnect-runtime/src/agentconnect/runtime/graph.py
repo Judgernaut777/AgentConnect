@@ -4,9 +4,9 @@
 * ``tool``     — execute the action in the workspace, append an OBSERVATION message.
 * ``finalize`` — fold the finish action (or the max-steps cutoff) into result fields.
 
-The graph enforces worker-local policy only (step limit, shell gate, workspace
-confinement). Global policy — privacy, budget, provider selection — stays in
-the router.
+The graph enforces worker-local policy only (step limit, shell/tests/browser
+gates, workspace confinement). Global policy — privacy, budget, provider
+selection — stays in the router.
 """
 
 from __future__ import annotations
@@ -20,12 +20,18 @@ from langgraph.graph import END, START, StateGraph
 from .actions import parse_action
 from .agent import ModelSource, RuntimeConfig
 from .state import RuntimeState
-from .tools import list_dir, read_file, run_shell, write_file
+from .tools import fetch_url, list_dir, read_file, run_shell, run_tests, write_file
+from .tools.browser import Fetcher, Resolver
 from .workspace import Workspace
 
 
 def build_execution_graph(
-    config: RuntimeConfig, model_source: ModelSource, workspace: Workspace
+    config: RuntimeConfig,
+    model_source: ModelSource,
+    workspace: Workspace,
+    *,
+    fetcher: Fetcher | None = None,
+    url_resolver: Resolver | None = None,
 ) -> Any:
     """Build and compile the worker graph bound to one workspace."""
 
@@ -64,6 +70,35 @@ def build_execution_graph(
                     evidence = evidence + [f"shell:{args['command'][:120]}"]
             else:
                 obs = "ERROR: the shell action is disabled for this task."
+        elif kind == "run_tests":
+            # args are deliberately ignored: the command is operator config,
+            # never model input. But run_tests still executes workspace code —
+            # `pytest` imports every test_*.py under the root and write_file is
+            # ungated, so the model can drop a test file whose module-level code
+            # runs on import. With no OS sandbox on this worker, allow_shell is
+            # the only isolation boundary; run_tests is an equivalent
+            # code-execution primitive and must honour it, or allow_shell=False
+            # is silently defeated.
+            if config.allow_tests and config.allow_shell:
+                obs = run_tests(workspace, config.test_command, timeout=config.test_timeout_seconds)
+                if not obs.startswith("ERROR:"):
+                    evidence = evidence + [f"run_tests:{config.test_command[:120]}"]
+            else:
+                obs = "ERROR: the run_tests action is disabled for this task."
+        elif kind == "fetch_url":
+            if config.allow_browser:
+                obs = fetch_url(
+                    args["url"],
+                    timeout=config.browser_timeout_seconds,
+                    max_bytes=config.browser_max_response_bytes,
+                    max_redirects=config.browser_max_redirects,
+                    fetcher=fetcher,
+                    resolver=url_resolver,
+                )
+                if not obs.startswith("ERROR:"):
+                    evidence = evidence + [f"fetch_url:{args['url'][:120]}"]
+            else:
+                obs = "ERROR: the browser action is disabled for this task."
         else:  # "invalid"
             obs = f"ERROR: {args.get('error', 'invalid action')} — reply with one valid JSON action."
         if len(obs) > config.observation_max_chars:

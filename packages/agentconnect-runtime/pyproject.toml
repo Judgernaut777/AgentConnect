@@ -18,6 +18,10 @@ dependencies = [
 lang = [
     "langchain",
 ]
+remote = [
+    "fastapi>=0.110",
+    "httpx>=0.27",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -15,7 +15,14 @@ import subprocess
 from ..workspace import Workspace
 
 
-def run_shell(ws: Workspace, command: str, timeout: float = 60.0) -> str:
+class CommandTimeout(Exception):
+    """Command exceeded its timeout; the whole process group was SIGKILLed."""
+
+
+def run_process(ws: Workspace, command: str, timeout: float) -> tuple[int, str, str]:
+    """Run `command` in the workspace in its own session; return (returncode,
+    stdout, stderr). Raises CommandTimeout after killing the process group —
+    backgrounded children included."""
     proc = subprocess.Popen(
         command,
         shell=True,
@@ -33,8 +40,16 @@ def run_shell(ws: Workspace, command: str, timeout: float = 60.0) -> str:
         except ProcessLookupError:
             pass
         proc.wait()
+        raise CommandTimeout(command) from None
+    return proc.returncode, stdout, stderr
+
+
+def run_shell(ws: Workspace, command: str, timeout: float = 60.0) -> str:
+    try:
+        returncode, stdout, stderr = run_process(ws, command, timeout)
+    except CommandTimeout:
         return f"ERROR: command timed out after {timeout:.0f}s: {command}"
-    parts = [f"exit_code={proc.returncode}"]
+    parts = [f"exit_code={returncode}"]
     if stdout:
         parts.append(f"stdout:\n{stdout}")
     if stderr:
