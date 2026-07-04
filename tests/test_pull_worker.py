@@ -259,6 +259,57 @@ def test_run_once_refuses_null_payload_without_payload_error_key(tmp_path):
     assert "payload_missing" in reported[0].summary
 
 
+# --------------------------------------------------- task-exception robustness
+def test_run_once_reports_failure_when_runtime_raises(tmp_path):
+    # A non-httpx exception from runtime.run (a LangGraph graph bug, an
+    # unconverted tool failure) must be converted into a reported 'failed'
+    # result — never propagate out of execute()/run_once() (which catch no such
+    # exception) and leave the ticket stranded 'claimed'. Mirrors the push-side
+    # create_worker_app.run_task.
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path)
+
+    def boom(submission, task_id="x"):
+        raise ValueError("langgraph blew up")
+
+    worker.runtime.run = boom
+
+    outcome = worker.run_once()
+
+    assert outcome is not None
+    assert outcome["result"].status == "failed"
+    assert "worker_exception" in outcome["result"].risks
+    # The failure was actually reported: the ticket is not left 'claimed' (a
+    # default-max_attempts requeue puts it back to 'open').
+    assert _status(wq, t) != "claimed"
+
+
+def test_run_forever_survives_raising_task_and_keeps_draining(tmp_path):
+    # A raising task must not kill the poll loop: run_forever only catches httpx
+    # errors, so an escaping generic exception would stop the worker for ALL
+    # further work. execute() converts it to a reported failure and the loop
+    # drains the rest.
+    client, wq, _ = _broker(tmp_path)
+    ids = [
+        wq.add(task="t", origin="test", privacy_class="public", payload=f"j{i}",
+               dedup_key=f"k{i}", max_attempts=1)["ticket_id"]
+        for i in range(2)
+    ]
+    worker = _worker(client, "trusted-worker", tmp_path, poll_interval=0)
+
+    def boom(submission, task_id="x"):
+        raise ValueError("boom")
+
+    worker.runtime.run = boom
+
+    processed = worker.run_forever(max_iterations=6, sleep=lambda _s: None)
+
+    assert processed == 2  # both claimed, run, and reported — the loop never crashed
+    for tid in ids:
+        assert _status(wq, tid) == "failed"  # max_attempts=1 -> terminal failure
+
+
 def test_heartbeat_failure_is_swallowed_report_is_authoritative(tmp_path):
     client, wq, _ = _broker(tmp_path)
     t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]

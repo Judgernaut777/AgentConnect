@@ -513,6 +513,14 @@ class WorkQueue:
         if raw is None:
             return {"error": "unknown_ticket"}
         if raw["status"] != "claimed":
+            if raw["status"] == "failed":
+                # Self-heal an interrupted cascade: the terminal transition and
+                # _cascade_failure commit in separate transactions, so a store
+                # hiccup between them can leave this ticket 'failed' with its
+                # dependents un-cascaded (blocked forever). A retry (e.g. the
+                # worker's 503 back-off) re-drives the idempotent cascade rather
+                # than short-circuiting on 'already_reported' and stranding them.
+                self._cascade_failure(ticket_id, now)
             if raw["status"] in ("in_review", "done", "failed"):
                 return {"error": "already_reported"}
             return {"error": "not_claimable"}
@@ -661,6 +669,13 @@ class WorkQueue:
         if raw is None:
             return {"error": "unknown_ticket"}
         if raw["status"] != "in_review":
+            if raw["status"] == "failed":
+                # Self-heal an interrupted cascade (see report()): a store hiccup
+                # between this reject's terminal transition and _cascade_failure
+                # can strand dependents blocked forever. An operator re-click
+                # re-drives the idempotent cascade instead of just reporting
+                # 'not_in_review' and leaving them stranded.
+                self._cascade_failure(ticket_id, now)
             return {"error": "not_in_review"}
         prov = json.loads(raw["provenance"] or "[]")
         prov.append({"event": "review", "reviewer": reviewer_id, "verdict": "rejected",
@@ -805,6 +820,27 @@ class WorkQueue:
             if r["task_id"]:
                 self._set_task_state(r["task_id"], TaskState.FAILED)
             self._cascade_failure(r["ticket_id"], now)
+        # Self-heal an interrupted cascade across ticks: report()/reject() and the
+        # parked loop above commit the terminal transition and _cascade_failure in
+        # separate transactions, so a store hiccup between them can leave a
+        # terminally-failed (or attempts-exhausted parked) parent with un-cascaded,
+        # still-non-terminal dependents. Such a parent is never re-selected by the
+        # lease-expiry UPDATEs above (it is no longer 'claimed'), so it would strand
+        # its children forever. Re-drive the idempotent cascade here for any such
+        # parent. Intentionally-parked classes (secret_sensitive / redaction-
+        # required) are NOT failures and are excluded — only attempts-exhausted
+        # parking cascades, matching report()/reject()/the parked loop.
+        stranded = self._conn.execute(
+            "SELECT p.ticket_id AS pid FROM work_queue p"
+            " WHERE (p.status='failed'"
+            "        OR (p.status='parked' AND p.park_reason='max_attempts_exhausted'))"
+            "   AND EXISTS (SELECT 1 FROM work_queue_deps d"
+            "               JOIN work_queue c ON c.ticket_id=d.ticket_id"
+            "               WHERE d.depends_on=p.ticket_id"
+            "                 AND c.status NOT IN ('done','failed'))"
+        ).fetchall()
+        for r in stranded:
+            self._cascade_failure(r["pid"], now)
         return {"requeued": requeued, "parked": parked}
 
     def start_reaper(

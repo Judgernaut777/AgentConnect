@@ -320,6 +320,42 @@ def test_operational_error_degrades_to_503_not_500(tmp_path):
     assert r.headers.get("Retry-After") == "1"
 
 
+def test_queue_next_isolates_non_operational_payload_error(tmp_path):
+    """Per-ticket payload resolution must isolate ANY failure, not just
+    sqlite3.OperationalError. A sibling sqlite3.DatabaseError (e.g. a malformed-
+    DB condition from read_artifact_chunk) on one ticket must NOT 500 the whole
+    batch: claim_next already committed all claims, so a 500 would discard every
+    ticket's lease handle and strand them 'claimed'. The failing ticket surfaces
+    a per-ticket payload_error instead, exactly like the OperationalError branch."""
+    import sqlite3
+
+    wq, _ = _wq()
+    for i in range(3):
+        wq.add(privacy_class=PrivacyClass.public, payload=f"body{i}", origin="o")
+
+    real = wq.payload_for
+    calls = {"n": 0}
+
+    def flaky(identity, ticket_id, lease_token, tier=None, now=None):
+        calls["n"] += 1
+        if calls["n"] == 2:  # fail exactly one ticket mid-batch
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real(identity, ticket_id, lease_token, tier, now)
+
+    wq.payload_for = flaky
+    client = TestClient(_app(tmp_path, queue=wq))
+    r = client.get("/queue/next", headers=_dn(client, "trusted-worker"), params={"max": 3})
+
+    assert r.status_code == 200  # NOT a 500 that discards the committed claims
+    tickets = r.json()["tickets"]
+    assert len(tickets) == 3  # every claimed ticket's lease handle is returned
+    errored = [t for t in tickets if t.get("payload_error")]
+    assert len(errored) == 1
+    assert errored[0]["payload_error"] == "resolution_error"
+    assert errored[0]["payload"] is None
+    assert sum(1 for t in tickets if t.get("payload") is not None) == 2
+
+
 # --------------------------------------------------- lifecycle-bound reaper
 def test_reaper_autostarts_with_pull_routes(tmp_path):
     """reaper_interval>0 binds a lease reaper to the app lifecycle: a ticket

@@ -293,6 +293,17 @@ def add_pull_routes(
                 t["payload"] = None
                 t["payload_error"] = "store_busy"
                 continue
+            except Exception:  # noqa: BLE001 — per-ticket isolation must hold for ANY
+                # resolution failure, not just OperationalError. A sibling of
+                # OperationalError under sqlite3.DatabaseError (e.g. a malformed/
+                # partial-DB DatabaseError from read_artifact_chunk) would
+                # otherwise escape to a 500 and discard the already-committed
+                # claims of every ticket in this batch — the exact stranding the
+                # per-ticket seam exists to prevent. Surface it per-ticket so the
+                # client keeps the lease handle and can re-fetch or report.
+                t["payload"] = None
+                t["payload_error"] = "resolution_error"
+                continue
             if "error" in resolved:
                 t["payload"] = None
                 t["payload_error"] = resolved["error"]
