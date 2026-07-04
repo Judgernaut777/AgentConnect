@@ -204,3 +204,65 @@ def test_report_with_stale_lease_token_is_refused(tmp_path):
     )
     assert report.status_code == 200
     assert report.json() == {"error": "lease_lost"}
+
+
+# ------------------------------------------------ transient store back-pressure
+def test_operational_error_degrades_to_503_not_500(tmp_path):
+    """A store write lock held past busy_timeout by another process surfaces as a
+    sqlite3.OperationalError; the pull endpoint must degrade it to a retryable
+    503, never a raw 500 — a polling worker just backs off and retries."""
+    import sqlite3
+
+    wq, _ = _wq()
+
+    def _busy(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    wq.claim_next = _busy  # instance override; _guard reads it at call time
+    client = TestClient(_app(tmp_path, queue=wq))
+    r = client.get("/queue/next", headers=_dn(client, "trusted-worker"))
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "1"
+
+
+# --------------------------------------------------- lifecycle-bound reaper
+def test_reaper_autostarts_with_pull_routes(tmp_path):
+    """reaper_interval>0 binds a lease reaper to the app lifecycle: a ticket
+    orphaned by a dead worker (expired lease) is requeued without any external
+    scheduler once the app is running."""
+    import time
+
+    wq, _ = _wq()
+    runtime = LangGraphAgentRuntime(_NoopModelSource(), RuntimeConfig(workspace_root=str(tmp_path)))
+    app = add_pull_routes(
+        create_worker_app(runtime), wq, TIERS.get,
+        trust_proxy_headers=True, reaper_interval=0.05,
+    )
+    tid = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")["ticket_id"]
+    wq.claim("trusted-worker", LOCAL, tid, lease_seconds=0)  # already-expired lease
+    assert wq.get(tid)["status"] == "claimed"
+
+    with TestClient(app):  # fires startup -> reaper daemon thread
+        deadline = time.time() + 2.0
+        while time.time() < deadline and wq.get(tid)["status"] != "open":
+            time.sleep(0.02)
+    assert wq.get(tid)["status"] == "open", "lifecycle reaper did not requeue the expired lease"
+
+
+def test_reaper_disabled_when_interval_zero(tmp_path):
+    """reaper_interval=0 mounts no reaper — the expired lease stays claimed until
+    an external caller reaps it (the deterministic-gate default for tests)."""
+    import time
+
+    wq, _ = _wq()
+    runtime = LangGraphAgentRuntime(_NoopModelSource(), RuntimeConfig(workspace_root=str(tmp_path)))
+    app = add_pull_routes(
+        create_worker_app(runtime), wq, TIERS.get,
+        trust_proxy_headers=True, reaper_interval=0,
+    )
+    tid = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")["ticket_id"]
+    wq.claim("trusted-worker", LOCAL, tid, lease_seconds=0)
+
+    with TestClient(app):
+        time.sleep(0.25)
+    assert wq.get(tid)["status"] == "claimed", "no reaper should run when interval=0"
