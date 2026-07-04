@@ -170,6 +170,30 @@ def test_stale_token_after_requeue_and_reclaim_is_lease_lost():
     }
 
 
+def test_report_trust_is_gated_on_claim_time_tier_not_report_time():
+    # SECURITY: the verification gate ('only local_only auto-accepts') must key
+    # off the tier that actually PERFORMED the work (stored at claim time as
+    # lease_tier), never the tier resolved at report time. Otherwise an
+    # identity promoted mid-lease (or a tier_resolver reload) launders an
+    # untrusted-computed result straight to done/approved with no review.
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")
+    c = wq.claim("w", EXTERNAL, t["ticket_id"])  # claimed under EXTERNAL
+    assert wq.get(t["ticket_id"])["lease_tier"] == EXTERNAL
+    # Same identity now (re-)resolves to LOCAL at report time — must NOT grant
+    # trust for work actually done under EXTERNAL.
+    out = wq.report("w", LOCAL, t["ticket_id"], c["lease_token"], {"status": "completed"})
+    assert out["ticket_status"] == "in_review"
+    assert out["result_status"] == "pending"
+    assert wq.get(t["ticket_id"])["status"] == "in_review"
+    # The genuine trusted path (claimed AND reported under LOCAL) still auto-accepts.
+    t2 = wq.add(privacy_class=PrivacyClass.public, payload="y", origin="o")
+    c2 = wq.claim("w", LOCAL, t2["ticket_id"])
+    out2 = wq.report("w", LOCAL, t2["ticket_id"], c2["lease_token"], {"status": "completed"})
+    assert out2["ticket_status"] == "done"
+    assert out2["result_status"] == "approved"
+
+
 def test_dedup_key_returns_existing_and_never_reopens_done():
     wq, _ = _wq()
     a = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o", dedup_key="job-1")
@@ -193,6 +217,21 @@ def test_renew_refuses_non_holder():
     assert ok["lease_expires_at"] == 1061.0
 
 
+def test_renew_clamps_unbounded_extend_seconds():
+    # SECURITY: an unbounded extend_seconds would let an authorized worker pin
+    # a lease centuries into the future, permanently defeating the reaper for
+    # that ticket (it would never look expired). renew() must clamp it itself
+    # (not just at the HTTP edge), since it is also reachable from
+    # mcp_server.queue_update.
+    from agentconnect.common.workqueue import MAX_LEASE_EXTEND_SECONDS
+
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")
+    c = wq.claim("w", LOCAL, t["ticket_id"], now=1000.0)
+    ok = wq.renew("w", t["ticket_id"], c["lease_token"], extend_seconds=999_999_999_999, now=1001.0)
+    assert ok["lease_expires_at"] == 1001.0 + MAX_LEASE_EXTEND_SECONDS
+
+
 # ------------------------------------------------------- dependency + monotonicity
 def test_dependency_gate_blocks_until_parent_done():
     wq, _ = _wq()
@@ -206,6 +245,30 @@ def test_dependency_gate_blocks_until_parent_done():
     pc = wq.claim("w", LOCAL, parent["ticket_id"])
     wq.report("w", LOCAL, parent["ticket_id"], pc["lease_token"], {"summary": "ok"})
     # Now the child is claimable.
+    got = wq.claim("w", LOCAL, child["ticket_id"])
+    assert got.get("ticket_id") == child["ticket_id"]
+
+
+def test_dependency_gate_blocks_until_parent_reviewed_not_just_reported():
+    # SECURITY crown-jewel: an untrusted (in_review) result must never itself be
+    # the 'done' truth that unblocks a dependent. A parent claimed/reported by
+    # an untrusted tier lands 'in_review' (not 'done'), so the child must stay
+    # blocked until a local_only reviewer approves it.
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o")
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    pc = wq.claim("w", EXTERNAL, parent["ticket_id"])
+    wq.report("w", EXTERNAL, parent["ticket_id"], pc["lease_token"], {"status": "completed"})
+    assert wq.get(parent["ticket_id"])["status"] == "in_review"
+    # The child must still be blocked, not claimable, while the parent merely
+    # awaits review — 'in_review' must never satisfy the depends_on='done' gate.
+    assert wq.claim("w", LOCAL, child["ticket_id"]) == {"error": "not_claimable"}
+    assert wq.status(child["ticket_id"])[0]["status"] == "blocked"
+    # Once a local_only reviewer approves, the parent becomes 'done' and the
+    # child becomes claimable.
+    out = wq.approve("rev", LOCAL, parent["ticket_id"])
+    assert out["ticket_status"] == "done"
     got = wq.claim("w", LOCAL, child["ticket_id"])
     assert got.get("ticket_id") == child["ticket_id"]
 
@@ -446,6 +509,31 @@ def test_approve_is_compare_and_set_second_action_refused():
     assert wq.approve("rev", LOCAL, t["ticket_id"]) == {"error": "not_in_review"}
     assert wq.reject("rev", LOCAL, t["ticket_id"]) == {"error": "not_in_review"}
     assert wq.get(t["ticket_id"])["status"] == "done"
+
+
+def test_link_rejects_claimed_or_in_review_child():
+    # SECURITY: retroactively attaching a dependency to an actively-worked
+    # child is unsafe — if the new parent later fails terminally,
+    # _cascade_failure would force the child to 'failed' and clear its live
+    # lease out from under a worker, silently discarding a legitimate result.
+    wq, _ = _wq()
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o")
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    c = wq.claim("w", LOCAL, child["ticket_id"])
+    assert wq.link(child["ticket_id"], parent["ticket_id"]) == {"error": "child_not_linkable"}
+    # Still claimed, lease intact — the worker's in-flight lease was not touched.
+    row = wq.get(child["ticket_id"])
+    assert row["status"] == "claimed"
+    assert row["lease_token"] == c["lease_token"]
+    # Report under an untrusted tier -> in_review; still not linkable.
+    child2 = wq.add(privacy_class=PrivacyClass.public, payload="c2", origin="o")
+    c2 = wq.claim("w", EXTERNAL, child2["ticket_id"])
+    wq.report("w", EXTERNAL, child2["ticket_id"], c2["lease_token"], {"status": "completed"})
+    assert wq.get(child2["ticket_id"])["status"] == "in_review"
+    assert wq.link(child2["ticket_id"], parent["ticket_id"]) == {"error": "child_not_linkable"}
+    # An open child is linkable as before.
+    child3 = wq.add(privacy_class=PrivacyClass.public, payload="c3", origin="o")
+    assert wq.link(child3["ticket_id"], parent["ticket_id"]) == {"ok": True}
 
 
 def test_link_duplicate_edge_is_idempotent_ok():

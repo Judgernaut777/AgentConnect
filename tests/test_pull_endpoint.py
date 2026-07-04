@@ -9,6 +9,8 @@ the mTLS peer certificate (same seam ``asgi_identity._peer_identity`` and
 and a scripted ``tier_resolver`` dict stands in for config/workers.yaml.
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -139,6 +141,31 @@ def test_claim_heartbeat_report_round_trip_trusted(tmp_path):
     body = report.json()
     assert body["ticket_status"] == "done"
     assert body["result_status"] == "approved"
+
+
+def test_heartbeat_extend_seconds_is_clamped(tmp_path):
+    # SECURITY: an unbounded extend_seconds would let an authorized worker pin
+    # a lease centuries into the future, permanently defeating the reaper for
+    # that ticket. The server must clamp it, not trust the wire value.
+    wq, _ = _wq()
+    wq.add(privacy_class=PrivacyClass.public, payload="hi", origin="o")
+    client = TestClient(_app(tmp_path, queue=wq))
+
+    got = client.get("/queue/next", headers=_dn(client, "trusted-worker")).json()["tickets"]
+    ticket_id = got[0]["ticket_id"]
+    lease_token = got[0]["lease_token"]
+
+    hb = client.post(
+        f"/queue/{ticket_id}/heartbeat",
+        headers=_dn(client, "trusted-worker"),
+        json={"lease_token": lease_token, "extend_seconds": 999_999_999_999},
+    )
+    assert hb.status_code == 200
+    from agentconnect.runtime.transport import MAX_LEASE_EXTEND_SECONDS
+
+    assert hb.json()["lease_expires_at"] <= time.time() + MAX_LEASE_EXTEND_SECONDS + 5
+    row = wq.get(ticket_id)
+    assert row["lease_expires_at"] <= time.time() + MAX_LEASE_EXTEND_SECONDS + 5
 
 
 def test_untrusted_report_lands_in_review_over_http(tmp_path):

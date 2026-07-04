@@ -42,6 +42,13 @@ if TYPE_CHECKING:
 # same-tier peers) or inflate an unbounded response in one round trip.
 MAX_CLAIM_BATCH = 50
 
+# Server-side ceiling on a single heartbeat's extend_seconds: without this an
+# authorized worker could pin a lease centuries into the future and
+# permanently defeat the reaper for that ticket. Defense in depth alongside
+# WorkQueue.renew's own clamp (renew is also reachable from
+# mcp_server.queue_update, so the ceiling must not live only at this edge).
+MAX_LEASE_EXTEND_SECONDS = 3600
+
 
 @dataclass(frozen=True)
 class RuntimeEndpoint:
@@ -298,9 +305,10 @@ def add_pull_routes(
     @app.post("/queue/{ticket_id}/heartbeat")
     def queue_heartbeat(ticket_id: str, body: QueueHeartbeatBody, request: Request) -> dict:
         identity, _tier = _identity_and_tier(request)
+        extend = min(body.extend_seconds, MAX_LEASE_EXTEND_SECONDS)
         return _guard(
             queue.renew,
-            identity, ticket_id, body.lease_token, extend_seconds=body.extend_seconds,
+            identity, ticket_id, body.lease_token, extend_seconds=extend,
         )
 
     return app

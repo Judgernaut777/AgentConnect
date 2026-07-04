@@ -77,6 +77,13 @@ _TRUSTED_TIER = ProviderPrivacyTier.local_only.value
 # Terminal / non-reopenable ticket statuses.
 _TERMINAL = {"done", "failed"}
 
+# Ceiling on a single heartbeat/renew extension: the same anti-starvation
+# reasoning as MAX_CLAIM_BATCH (transport.py) — an authorized-but-buggy or
+# malicious worker must not be able to pin a lease centuries into the future
+# and permanently defeat the reaper for that ticket. Applied here (not just at
+# the HTTP edge) because renew() is also reachable from mcp_server.queue_update.
+MAX_LEASE_EXTEND_SECONDS = 3600
+
 
 def _tier_value(tier: Union[str, ProviderPrivacyTier, None]) -> Optional[str]:
     if tier is None:
@@ -382,6 +389,9 @@ class WorkQueue:
     ) -> dict[str, Any]:
         now = _now() if now is None else now
         extend = self.default_lease_seconds if extend_seconds is None else extend_seconds
+        # Clamp: an unbounded extend would let a worker pin a lease forever and
+        # permanently defeat the reaper for this ticket (see MAX_LEASE_EXTEND_SECONDS).
+        extend = max(0, min(extend, MAX_LEASE_EXTEND_SECONDS))
         expires = now + extend
         cur = self._conn.execute(
             "UPDATE work_queue SET lease_expires_at=?, updated_at=?"
@@ -488,7 +498,12 @@ class WorkQueue:
         result_ref = self.memory.put_artifact(raw["task_id"], "work_result", wr.model_dump_json())
 
         tier = _tier_value(attested_tier)
-        trusted = tier == _TRUSTED_TIER
+        # Trust must attach to the tier that actually PERFORMED the work — the
+        # tier stored on the claim (``lease_tier``) — never the report-time
+        # attested tier alone. Otherwise an identity promoted mid-lease (or a
+        # tier_resolver reload) launders an untrusted-computed result straight
+        # to done/approved, defeating the verification gate. Both must agree.
+        trusted = tier == _TRUSTED_TIER and _tier_value(raw["lease_tier"]) == _TRUSTED_TIER
         # A worker signals success with status=='completed' (the codebase's
         # canonical marker; see RouterService._run_agentic). ANY other status is a
         # reported failure and must NEVER become truth — not even on the trusted
@@ -665,6 +680,15 @@ class WorkQueue:
             return {"error": "unknown_ticket"}
         if ticket_id == depends_on:
             return {"error": "self_dependency"}
+        # A dependency retroactively attached while the child is actively being
+        # worked (claimed) or awaiting review (in_review) is unsafe: if this
+        # NEW parent later fails terminally, _cascade_failure would force the
+        # child straight to 'failed' and clear its lease out from under a live
+        # worker, silently discarding a legitimate in-flight/reported result. In
+        # the normal flow a child is never claimed while an existing parent is
+        # not-done, so this can only arise from a retroactive link — refuse it.
+        if child["status"] in ("claimed", "in_review"):
+            return {"error": "child_not_linkable"}
         child_tiers = set(self.allowed_tiers(child["privacy_class"]))
         parent_tiers = set(self.allowed_tiers(parent["privacy_class"]))
         if not child_tiers.issubset(parent_tiers):

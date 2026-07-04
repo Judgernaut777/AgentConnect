@@ -182,6 +182,51 @@ def test_heartbeat_disabled_by_default(tmp_path):
     assert beats == []
 
 
+# ------------------------------------------------------- payload delivery
+def test_run_once_refuses_payload_error_without_executing(tmp_path):
+    # A delivery error (e.g. a lease race between claim and payload_for) must
+    # short-circuit to a reported failure — never fall through to execute() on
+    # an empty/missing payload and report a bogus success.
+    client, wq, _ = _broker(tmp_path)
+    worker = _worker(client, "trusted-worker", tmp_path)
+
+    fake_ticket = {"ticket_id": "wq_fake", "lease_token": "tok",
+                   "payload": None, "payload_error": "lease_lost"}
+    worker.claim = lambda max_tickets=1: [fake_ticket]
+    executed = []
+    worker.execute = lambda ticket: executed.append(ticket) or pytest.fail("must not execute")
+    reported = []
+    real_report = worker.report
+    worker.report = lambda tid, tok, result: (reported.append(result), {"ticket_status": "failed"})[1]
+
+    outcome = worker.run_once()
+
+    assert executed == []
+    assert len(reported) == 1
+    assert reported[0].status == "failed"
+    assert "lease_lost" in reported[0].summary
+    assert outcome["report"] == {"ticket_status": "failed"}
+
+
+def test_run_once_refuses_null_payload_without_payload_error_key(tmp_path):
+    # payload=None with no payload_error key at all (e.g. a future delivery
+    # path that forgets to set the reason) must still be refused, not executed.
+    client, wq, _ = _broker(tmp_path)
+    worker = _worker(client, "trusted-worker", tmp_path)
+
+    fake_ticket = {"ticket_id": "wq_fake2", "lease_token": "tok", "payload": None}
+    worker.claim = lambda max_tickets=1: [fake_ticket]
+    worker.execute = lambda ticket: pytest.fail("must not execute")
+    reported = []
+    worker.report = lambda tid, tok, result: (reported.append(result), {"ticket_status": "failed"})[1]
+
+    worker.run_once()
+
+    assert len(reported) == 1
+    assert reported[0].status == "failed"
+    assert "payload_missing" in reported[0].summary
+
+
 def test_heartbeat_failure_is_swallowed_report_is_authoritative(tmp_path):
     client, wq, _ = _broker(tmp_path)
     t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
