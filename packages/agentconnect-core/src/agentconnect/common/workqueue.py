@@ -91,6 +91,16 @@ MAX_LEASE_EXTEND_SECONDS = 3600
 # because claim_next is also reachable from mcp_server.queue_next.
 MAX_CLAIM_BATCH = 50
 
+# Ceiling (and floor) on status()/list_tickets()/pending_review() limits. SQLite
+# treats a negative `LIMIT ?` as "no limit", so an unclamped caller-supplied
+# limit (e.g. -1) would return the entire table, defeating the response-size
+# bounding applied everywhere else in this file.
+MAX_LIST_LIMIT = 1000
+
+
+def _clamp_limit(limit: int) -> int:
+    return max(1, min(int(limit), MAX_LIST_LIMIT))
+
 
 def _tier_value(tier: Union[str, ProviderPrivacyTier, None]) -> Optional[str]:
     if tier is None:
@@ -586,6 +596,14 @@ class WorkQueue:
         )
         if cur.rowcount != 1:
             self._conn.rollback()
+            # put_artifact() above already committed the work_result row in its
+            # own transaction (before this fencing check), so the rollback alone
+            # discards only the uncommitted UPDATE. Without this, a lease lost to
+            # a reaper-requeue-and-reclaim race leaves that artifact permanently
+            # orphaned (no work_queue row ever references it). Delete it now
+            # rather than relying on a separate GC sweep.
+            self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (result_ref,))
+            self._conn.commit()
             return {"error": "lease_lost"}
         self._conn.commit()
 
@@ -880,6 +898,7 @@ class WorkQueue:
         """Redacted ticket rows for audit/UX. NEVER returns payload content —
         only the payload_ref id and queue metadata. ``blocked`` is derived (an
         open ticket with an unsatisfied dependency), never a stored state."""
+        limit = _clamp_limit(limit)
         if ticket_id is not None:
             rows = self._conn.execute(
                 "SELECT * FROM work_queue WHERE ticket_id=?", (ticket_id,)
@@ -959,6 +978,7 @@ class WorkQueue:
         """Operator-facing ticket listing, payload-free (see ``_operator_row``).
         Optional filters on status and/or privacy_class; ordered most-recently-
         updated first."""
+        limit = _clamp_limit(limit)
         clauses: list[str] = []
         params: list[Any] = []
         if status is not None:

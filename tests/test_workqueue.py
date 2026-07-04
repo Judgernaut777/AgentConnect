@@ -244,6 +244,29 @@ def test_stale_token_after_requeue_and_reclaim_is_lease_lost():
     }
 
 
+def test_lease_lost_report_does_not_orphan_the_work_result_artifact():
+    # report() commits the work_result artifact via put_artifact() BEFORE the
+    # fencing UPDATE. If the fence then loses the race (reaper requeue + a
+    # second worker's reclaim slipped in between), the rollback only discards
+    # the uncommitted UPDATE — the already-committed artifact row must not be
+    # left permanently orphaned (no work_queue row ever references it).
+    wq, mem = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o", max_attempts=3)
+    c1 = wq.claim("slow", LOCAL, t["ticket_id"], lease_seconds=10, now=1000.0)
+    wq.reap_expired(now=2000.0)  # requeues, clears token
+    wq.claim("fast", LOCAL, t["ticket_id"], now=2001.0)  # a second worker reclaims first
+
+    def count_work_result_artifacts() -> int:
+        return mem._conn.execute(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE kind='work_result'"
+        ).fetchone()["n"]
+
+    before = count_work_result_artifacts()
+    out = wq.report("slow", LOCAL, t["ticket_id"], c1["lease_token"], {"summary": "late"}, now=2002.0)
+    assert out == {"error": "lease_lost"}
+    assert count_work_result_artifacts() == before  # no orphaned artifact left behind
+
+
 def test_report_trust_is_gated_on_claim_time_tier_not_report_time():
     # SECURITY: the verification gate ('only local_only auto-accepts') must key
     # off the tier that actually PERFORMED the work (stored at claim time as
@@ -321,6 +344,42 @@ def test_renew_refuses_non_positive_extend_seconds():
     }
     # The original lease is untouched by the refused calls.
     assert wq.get(t["ticket_id"])["lease_expires_at"] == 1100.0
+
+
+def test_renew_keeps_a_live_lease_off_the_reaper_until_the_new_expiry():
+    # Crown-jewel heartbeat-liveness property: renew() must actually prevent
+    # reap_expired() from requeuing a lease it just extended. A regression
+    # where renew() and reap_expired() disagree on the lease_expires_at
+    # boundary would requeue a healthy worker's still-live ticket mid-flight
+    # and hand it to a second worker (double execution) with no failing test.
+    wq, _ = _wq()
+    renewed = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o", max_attempts=3)
+    sibling = wq.add(privacy_class=PrivacyClass.public, payload="y", origin="o", max_attempts=3)
+    c1 = wq.claim("w", LOCAL, renewed["ticket_id"], lease_seconds=100, now=1000.0)
+    wq.claim("w2", LOCAL, sibling["ticket_id"], lease_seconds=100, now=1000.0)
+
+    ok = wq.renew("w", renewed["ticket_id"], c1["lease_token"], extend_seconds=120, now=1050.0)
+    assert ok == {"status": "claimed", "lease_expires_at": 1170.0}
+
+    # Before either lease's (original OR extended) expiry: neither is touched.
+    out = wq.reap_expired(now=1100.0)
+    assert out == {"requeued": [], "parked": []}
+    renewed_row = wq.get(renewed["ticket_id"])
+    assert renewed_row["status"] == "claimed"
+    assert renewed_row["lease_token"] == c1["lease_token"]
+
+    # Past the sibling's un-renewed expiry but still before the renewed one's
+    # extended expiry: only the un-renewed sibling is reaped.
+    out = wq.reap_expired(now=1101.0)
+    assert out == {"requeued": [sibling["ticket_id"]], "parked": []}
+    renewed_row = wq.get(renewed["ticket_id"])
+    assert renewed_row["status"] == "claimed"
+    assert renewed_row["lease_token"] == c1["lease_token"]
+
+    # Past the extended expiry: the renewed ticket is now (finally) reaped too.
+    out = wq.reap_expired(now=1200.0)
+    assert out == {"requeued": [renewed["ticket_id"]], "parked": []}
+    assert wq.get(renewed["ticket_id"])["status"] == "open"
 
 
 # ------------------------------------------------------- dependency + monotonicity
@@ -510,6 +569,31 @@ def test_list_tickets_is_payload_free_and_filterable():
 
     only_open = wq.list_tickets(status="open")
     assert {r["ticket_id"] for r in only_open} == {t1["ticket_id"], t2["ticket_id"]}
+
+
+def test_negative_limit_is_clamped_not_treated_as_unbounded():
+    # SQLite treats a negative `LIMIT ?` as "no limit". Without clamping,
+    # status()/list_tickets() (and pending_review(), which delegates to
+    # list_tickets()) would return the entire table instead of a bounded page,
+    # defeating the response-size bounding applied everywhere else in this file.
+    from agentconnect.common.workqueue import MAX_LIST_LIMIT, _clamp_limit
+
+    # Non-positive (including SQLite's "unbounded" -1) floors to 1, never to
+    # "return the whole table" and never to "return nothing forever".
+    assert _clamp_limit(-1) == 1
+    assert _clamp_limit(0) == 1
+    assert _clamp_limit(10) == 10  # in-range values pass through unchanged
+    assert _clamp_limit(MAX_LIST_LIMIT + 500) == MAX_LIST_LIMIT  # ceiling on oversized requests
+
+    wq, _ = _wq()
+    for i in range(10):
+        wq.add(privacy_class=PrivacyClass.public, payload=f"x{i}", origin="o")
+
+    # A negative limit must NOT return the entire 10-row table (SQLite's raw
+    # `LIMIT -1` semantics); it floors to a single row instead.
+    assert len(wq.status(limit=-1)) == 1
+    assert len(wq.list_tickets(limit=-1)) == 1
+    assert len(wq.pending_review(limit=-1)) == 0  # none in_review yet, but must not error/blow up
 
 
 def test_pending_review_lists_only_in_review_tickets():
