@@ -198,13 +198,27 @@ def add_pull_routes(
 
     from fastapi import HTTPException, Request
 
-    def _guard(fn, *a, **kw):
+    def _guard(fn, *a, broad: bool = False, **kw):
         """Run a queue call, turning transient store contention into a retryable
         503 instead of a 500. Business-logic errors are typed dicts, not
-        exceptions, so they flow through untouched."""
+        exceptions, so they flow through untouched.
+
+        ``broad=True`` additionally degrades any ``sqlite3.DatabaseError`` (the
+        base class of ``OperationalError``, also raised on e.g. a malformed/
+        partial-DB read) to the same 503 — used by routes whose sibling
+        inline-delivery path on ``/queue/next`` was deliberately widened past
+        ``OperationalError`` alone so a store hiccup never escapes as a raw 500."""
         try:
             return fn(*a, **kw)
         except sqlite3.OperationalError:
+            raise HTTPException(
+                status_code=503,
+                detail="store_busy",
+                headers={"Retry-After": "1"},
+            )
+        except sqlite3.DatabaseError:
+            if not broad:
+                raise
             raise HTTPException(
                 status_code=503,
                 detail="store_busy",
@@ -317,7 +331,7 @@ def add_pull_routes(
         # that kept the lease). Same authorized, lease-gated seam as the inline
         # delivery on /queue/next.
         identity, tier = _identity_and_tier(request)
-        return _guard(queue.payload_for, identity, ticket_id, lease_token, tier)
+        return _guard(queue.payload_for, identity, ticket_id, lease_token, tier, broad=True)
 
     @app.post("/queue/{ticket_id}/report")
     def queue_report(ticket_id: str, body: QueueReportBody, request: Request) -> dict:

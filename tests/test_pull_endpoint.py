@@ -269,6 +269,34 @@ def test_standalone_payload_route_is_identity_and_lease_gated(tmp_path):
     assert other.json() == {"error": "lease_lost"}
 
 
+def test_standalone_payload_route_degrades_database_error_to_503(tmp_path):
+    """GET /queue/{id}/payload must not let a sqlite3.DatabaseError (a sibling of
+    OperationalError — e.g. a malformed/partial-DB condition) escape as a raw
+    500. The inline per-ticket delivery on /queue/next was deliberately widened
+    past OperationalError alone for exactly this; the standalone re-fetch route
+    must degrade the same way, not just its OperationalError subclass."""
+    import sqlite3
+
+    wq, _ = _wq()
+    wq.add(privacy_class=PrivacyClass.public, payload="redacted body", origin="o")
+    client = TestClient(_app(tmp_path, queue=wq))
+
+    got = client.get("/queue/next", headers=_dn(client, "trusted-worker")).json()["tickets"]
+    ticket_id, lease_token = got[0]["ticket_id"], got[0]["lease_token"]
+
+    def _malformed(*a, **k):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    wq.payload_for = _malformed
+    r = client.get(
+        f"/queue/{ticket_id}/payload",
+        headers=_dn(client, "trusted-worker"),
+        params={"lease_token": lease_token},
+    )
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "1"
+
+
 def test_capabilities_query_param_tolerates_whitespace(tmp_path):
     # The common "a, b" wire convention must still match a ticket's un-padded
     # required_capabilities: tokens are stripped server-side.

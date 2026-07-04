@@ -48,6 +48,8 @@ class PullWorker:
         heartbeat_extend_seconds: int = 120,
         timeout: float = 600.0,
         task_id_prefix: str = "pull",
+        report_retries: int = 3,
+        report_retry_backoff: float = 1.0,
     ):
         self.runtime = runtime
         self.capabilities = list(capabilities)
@@ -56,6 +58,13 @@ class PullWorker:
         # task that outlives its lease is not reaped mid-flight. 0 disables it.
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_extend_seconds = heartbeat_extend_seconds
+        # Bounded retries for reporting an ALREADY-COMPUTED result back to the
+        # SAME ticket on a transient broker failure (e.g. 503 store_busy) — see
+        # _report_with_retry. Without this, run_forever's outer retry loop would
+        # move on to claim a different ticket next iteration, silently discarding
+        # real completed work.
+        self.report_retries = report_retries
+        self.report_retry_backoff = report_retry_backoff
         self._headers = dict(identity_headers or {})
         self._prefix = task_id_prefix
         if client is not None:
@@ -156,7 +165,38 @@ class PullWorker:
             stop.set()
             beater.join(timeout=self.heartbeat_interval + 1.0)
 
-    def run_once(self) -> Optional[dict[str, Any]]:
+    def _report_with_retry(
+        self,
+        ticket_id: str,
+        lease_token: str,
+        result: WorkerResult,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> dict[str, Any]:
+        """Report an already-computed result, retrying THIS SAME ticket a bounded
+        number of times on a transient broker failure before giving up.
+
+        Without this, a report-time 503 (store_busy) raises straight out of
+        run_once; run_forever's outer handler backs off and calls run_once again,
+        which claims a DIFFERENT ticket — silently discarding the real result just
+        computed here. The original ticket is left 'claimed' until the reaper
+        requeues it, burning a real attempt for work that actually succeeded.
+        Retrying the SAME report first (bounded, with backoff) fixes the common
+        transient case; only sustained failure past ``report_retries`` falls
+        through to that reaper-requeue fallback."""
+        import httpx
+
+        attempt = 0
+        while True:
+            try:
+                return self.report(ticket_id, lease_token, result)
+            except (httpx.HTTPStatusError, httpx.TransportError):
+                if attempt >= self.report_retries:
+                    raise
+                attempt += 1
+                sleep(self.report_retry_backoff)
+
+    def run_once(self, *, sleep: Callable[[float], None] = time.sleep) -> Optional[dict[str, Any]]:
         """Claim → execute → report a single ticket. Returns the outcome, or
         ``None`` when nothing is authorized/available (the caller should back off)."""
         tickets = self.claim(max_tickets=1)
@@ -170,10 +210,10 @@ class PullWorker:
         if ticket.get("payload_error") or ticket.get("payload") is None:
             reason = ticket.get("payload_error", "payload_missing")
             result = WorkerResult(status="failed", summary=f"payload not delivered: {reason}")
-            outcome = self.report(ticket["ticket_id"], ticket["lease_token"], result)
+            outcome = self._report_with_retry(ticket["ticket_id"], ticket["lease_token"], result, sleep=sleep)
             return {"ticket_id": ticket["ticket_id"], "result": result, "report": outcome}
         result = self._execute_with_heartbeat(ticket)
-        outcome = self.report(ticket["ticket_id"], ticket["lease_token"], result)
+        outcome = self._report_with_retry(ticket["ticket_id"], ticket["lease_token"], result, sleep=sleep)
         return {"ticket_id": ticket["ticket_id"], "result": result, "report": outcome}
 
     def run_forever(
@@ -194,7 +234,7 @@ class PullWorker:
             if stop is not None and stop():
                 break
             try:
-                outcome = self.run_once()
+                outcome = self.run_once(sleep=sleep)
             except (httpx.HTTPStatusError, httpx.TransportError):
                 # A transient broker failure (e.g. 503 store_busy under write
                 # contention, or a dropped connection) is retryable by

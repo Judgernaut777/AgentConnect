@@ -10,6 +10,8 @@ routing.yaml privacy.classes[privacy_class] set, fail-closed.
 import sqlite3
 import threading
 
+import pytest
+
 from agentconnect.common.config import load_routing
 from agentconnect.common.memory import SharedMemory
 from agentconnect.common.schemas import PrivacyClass
@@ -265,6 +267,60 @@ def test_lease_lost_report_does_not_orphan_the_work_result_artifact():
     out = wq.report("slow", LOCAL, t["ticket_id"], c1["lease_token"], {"summary": "late"}, now=2002.0)
     assert out == {"error": "lease_lost"}
     assert count_work_result_artifacts() == before  # no orphaned artifact left behind
+
+
+class _FlakyCommitConn:
+    """Proxy a real sqlite3.Connection, failing ONLY the Nth ``commit()`` call.
+    (sqlite3.Connection is a C type — its ``commit`` slot can't be monkeypatched
+    directly on the instance or the class, hence this forwarding wrapper.)"""
+
+    def __init__(self, real, fail_at: int):
+        self._real = real
+        self._fail_at = fail_at
+        self._n = 0
+
+    def commit(self):
+        self._n += 1
+        if self._n == self._fail_at:
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_report_commit_failure_does_not_orphan_the_work_result_artifact():
+    # The fencing UPDATE can MATCH (rowcount 1) and still fail to persist if the
+    # commit itself raises (e.g. SQLITE_BUSY at commit time under cross-process
+    # WAL contention). put_artifact() already committed work_result in its own
+    # transaction before this UPDATE, so without explicit cleanup that artifact
+    # is orphaned forever (the ticket never got result_ref) and a retry mints a
+    # second one.
+    wq, mem = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")
+    c = wq.claim("w", LOCAL, t["ticket_id"], now=1000.0)
+
+    def count_work_result_artifacts() -> int:
+        return mem._conn.execute(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE kind='work_result'"
+        ).fetchone()["n"]
+
+    before = count_work_result_artifacts()
+    # Fail the 2nd commit() on the shared connection: the 1st is put_artifact's
+    # (work_result), the 2nd is the fencing UPDATE's.
+    flaky = _FlakyCommitConn(wq._conn, fail_at=2)
+    wq._conn = flaky
+    mem._conn = flaky
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            wq.report("w", LOCAL, t["ticket_id"], c["lease_token"], {"status": "completed"}, now=1001.0)
+    finally:
+        wq._conn = flaky._real
+        mem._conn = flaky._real
+
+    assert count_work_result_artifacts() == before  # no orphaned artifact left behind
+    # The ticket itself never landed the failed commit's state — still claimed.
+    assert wq._raw(t["ticket_id"])["status"] == "claimed"
 
 
 def test_report_trust_is_gated_on_claim_time_tier_not_report_time():
@@ -537,6 +593,18 @@ def test_concurrent_add_same_dedup_key_is_race_safe(tmp_path):
     assert len(results) == 2
     assert all("ticket_id" in r for r in results), results
     assert results[0]["ticket_id"] == results[1]["ticket_id"]
+    # The loser's committed work_payload artifact must not be orphaned: exactly
+    # one artifact should exist — the winning ticket's own payload_ref — not
+    # two, with the loser's referenced by nothing.
+    mem = SharedMemory(db)
+    winner = mem._conn.execute(
+        "SELECT payload_ref FROM work_queue WHERE ticket_id=?", (results[0]["ticket_id"],)
+    ).fetchone()
+    rows = mem._conn.execute(
+        "SELECT artifact_id FROM artifacts WHERE kind='work_payload'"
+    ).fetchall()
+    assert [r["artifact_id"] for r in rows] == [winner["payload_ref"]]
+    mem.close()
 
 
 def test_link_rejects_privacy_downgrade():
