@@ -218,3 +218,104 @@ def test_daemon_reaper_concurrent_with_claim_and_report_shared_connection():
         assert row["result_status"] == "approved"
         # Monotonic, bounded attempts even across reaper requeues.
         assert 1 <= row["attempts"] <= row["max_attempts"], f"{tid} attempts={row['attempts']}"
+
+
+# ------------------------------------------- interrupted-cascade self-healing
+# report()/reject()/reap_expired() commit the terminal-failure transition and
+# its dependent cascade in SEPARATE transactions. A store hiccup between them
+# can leave a terminally-failed parent with its dependents un-cascaded — blocked
+# forever, since a 'failed' parent can never satisfy the depends_on='done' claim
+# gate. Each terminal path must therefore re-drive the idempotent cascade when
+# re-invoked on an already-terminal parent that still has non-terminal children.
+
+def _parent_child_stranded(wq):
+    """Build a parent+child (child depends_on parent) and force the exact state a
+    mid-cascade failure leaves: parent terminally 'failed', child still 'open'
+    (never cascaded). Returns (parent_id, child_id)."""
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o")
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    wq._conn.execute("UPDATE work_queue SET status='failed' WHERE ticket_id=?",
+                     (parent["ticket_id"],))
+    wq._conn.commit()
+    assert wq.get(child["ticket_id"])["status"] == "open"
+    return parent["ticket_id"], child["ticket_id"]
+
+
+def test_report_recascades_after_interrupted_cascade():
+    """A real mid-report cascade interruption strands the child; the worker's
+    retry (same token) re-drives the cascade instead of short-circuiting on
+    'already_reported'."""
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    got = wq.claim_next("w", LOCAL, max=1)
+    assert got and got[0]["ticket_id"] == parent["ticket_id"]
+    token = got[0]["lease_token"]
+
+    # Simulate the cascade raising AFTER the terminal transition committed.
+    orig = wq._cascade_failure
+
+    def boom(*a, **k):
+        raise RuntimeError("store hiccup mid-cascade")
+
+    wq._cascade_failure = boom
+    try:
+        wq.report("w", LOCAL, parent["ticket_id"], token,
+                  WorkerResult(status="failed", summary="nope"))
+    except RuntimeError:
+        pass
+    wq._cascade_failure = orig
+
+    # Parent terminally failed, child stranded (un-cascaded).
+    assert wq.get(parent["ticket_id"])["status"] == "failed"
+    assert wq.get(child["ticket_id"])["status"] == "open"
+
+    # The retry self-heals: cascade re-driven, child now terminal.
+    out = wq.report("w", LOCAL, parent["ticket_id"], token,
+                    WorkerResult(status="failed", summary="nope"))
+    assert out == {"error": "already_reported"}
+    assert wq.get(child["ticket_id"])["status"] == "failed"
+
+
+def test_reject_recascades_after_interrupted_cascade():
+    """An operator re-click of reject() on an already-failed parent re-drives a
+    stranded cascade rather than only reporting 'not_in_review'."""
+    wq, _ = _wq()
+    parent_id, child_id = _parent_child_stranded(wq)
+
+    out = wq.reject("reviewer", LOCAL, parent_id)
+
+    assert out == {"error": "not_in_review"}
+    assert wq.get(child_id)["status"] == "failed"
+
+
+def test_reap_expired_reheals_stranded_cascade():
+    """reap_expired's self-heal scan re-drives a cascade left interrupted by a
+    prior tick or by report()/reject(): a terminally-failed parent is never
+    re-selected by the lease-expiry UPDATEs, so without the scan its children
+    stay blocked forever."""
+    wq, _ = _wq()
+    parent_id, child_id = _parent_child_stranded(wq)
+
+    wq.reap_expired()
+
+    assert wq.get(child_id)["status"] == "failed"
+
+
+def test_reap_does_not_cascade_intentionally_parked_parent():
+    """A secret_sensitive (intentionally parked, never-pullable) parent is NOT a
+    failure: the reaper's cascade self-heal must exclude it (park_reason is not
+    'max_attempts_exhausted'), or it would wrongly fail its dependents."""
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.secret_sensitive, payload="s", origin="o")
+    assert parent["park_reason"]  # parked, never open
+    child = wq.add(privacy_class=PrivacyClass.secret_sensitive, payload="s2", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    assert "ticket_id" in child  # both empty-tier -> monotonic edge allowed
+
+    wq.reap_expired()
+
+    # Neither is a failure; the intentionally-parked child must never be cascaded.
+    assert wq.get(child["ticket_id"])["status"] != "failed"

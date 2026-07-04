@@ -112,9 +112,25 @@ class PullWorker:
 
     # --------------------------------------------------------------- execution
     def execute(self, ticket: dict[str, Any]) -> WorkerResult:
-        """Run one claimed ticket's redacted payload through the local runtime."""
+        """Run one claimed ticket's redacted payload through the local runtime.
+
+        A raised exception from ``runtime.run`` (a LangGraph graph bug, an
+        unconverted tool failure, an unexpected type) is converted into a
+        ``failed`` ``WorkerResult`` rather than propagated: run_once/run_forever
+        only catch httpx errors, so an escaping generic exception would kill the
+        whole poll loop and leave the ticket stranded 'claimed' (the broker never
+        told of the failure) until the reaper expires it. Mirrors the push side's
+        ``create_worker_app.run_task`` — a crashing task is always reported."""
         submission = TaskSubmission(task=ticket.get("payload", "") or "")
-        return self.runtime.run(submission, task_id=f"{self._prefix}_{ticket['ticket_id']}")
+        try:
+            return self.runtime.run(submission, task_id=f"{self._prefix}_{ticket['ticket_id']}")
+        except Exception as exc:  # noqa: BLE001 — a crashing task must still be reported
+            return WorkerResult(
+                status="failed",
+                summary=f"ERROR: worker exception: {exc}"[:400],
+                confidence=0.0,
+                risks=["worker_exception"],
+            )
 
     def _execute_with_heartbeat(self, ticket: dict[str, Any]) -> WorkerResult:
         """Run the task while a background thread renews the lease, so a slow run
