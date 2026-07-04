@@ -138,6 +138,7 @@ def add_pull_routes(
     tier_resolver: Callable[[str], Optional[str]],
     *,
     trust_proxy_headers: bool = False,
+    reaper_interval: float = 30.0,
 ) -> "FastAPI":
     """Mount the federated pull surface on ``app``: ``GET /queue/next``,
     ``POST /queue/{ticket_id}/report``, ``POST /queue/{ticket_id}/heartbeat``.
@@ -165,12 +166,54 @@ def add_pull_routes(
 
     Business-logic outcomes (``lease_lost``, ``not_authorized``, ...) are the
     ``WorkQueue`` methods' own typed dict returns, passed through as 200 JSON —
-    never a raw 500. Only identity/authorization failures raise HTTP errors.
+    never a raw 500. A ``sqlite3.OperationalError`` (the store's write lock was
+    held past ``busy_timeout`` by another *process* on the same file) degrades to
+    a 503 with ``Retry-After``, not a 500 — it is transient back-pressure, and a
+    polling worker should simply retry.
+
+    ``reaper_interval`` (>0, the default) binds an opt-in lease reaper to the
+    app's lifecycle: a daemon thread started on ``startup`` and stopped on
+    ``shutdown`` that requeues leases orphaned by a worker that died mid-task.
+    Set it to 0 to disable (e.g. when an external scheduler calls
+    ``reap_expired``). Self-healing is on by default wherever the pull routes are
+    mounted, so a stranded ticket can no longer sit ``claimed`` forever.
     """
     if queue is None:
         return app
 
+    import sqlite3
+
     from fastapi import HTTPException, Request
+
+    def _guard(fn, *a, **kw):
+        """Run a queue call, turning transient store contention into a retryable
+        503 instead of a 500. Business-logic errors are typed dicts, not
+        exceptions, so they flow through untouched."""
+        try:
+            return fn(*a, **kw)
+        except sqlite3.OperationalError:
+            raise HTTPException(
+                status_code=503,
+                detail="store_busy",
+                headers={"Retry-After": "1"},
+            )
+
+    if reaper_interval and reaper_interval > 0:
+        _reaper: dict = {}
+
+        @app.on_event("startup")
+        def _start_reaper() -> None:  # pragma: no cover - lifecycle glue
+            thread, stop = queue.start_reaper(reaper_interval)
+            _reaper["thread"], _reaper["stop"] = thread, stop
+
+        @app.on_event("shutdown")
+        def _stop_reaper() -> None:  # pragma: no cover - lifecycle glue
+            stop = _reaper.get("stop")
+            thread = _reaper.get("thread")
+            if stop is not None:
+                stop.set()
+            if thread is not None:
+                thread.join(timeout=reaper_interval + 1.0)
 
     # ``from __future__ import annotations`` makes every annotation below a
     # string; FastAPI resolves it via ``typing.get_type_hints(fn)`` against
@@ -203,7 +246,7 @@ def add_pull_routes(
     def queue_next(request: Request, capabilities: str = "", max: int = 1) -> dict:
         identity, tier = _identity_and_tier(request)
         caps = [c for c in capabilities.split(",") if c]
-        tickets = queue.claim_next(identity, tier, capabilities=caps, max=max)
+        tickets = _guard(queue.claim_next, identity, tier, capabilities=caps, max=max)
         # Deliver the redacted body inline so a remote worker (which has no access
         # to the broker's artifact store) can actually run the task in one round
         # trip. Lease-gated resolution: the token was just minted for this holder.
@@ -211,7 +254,7 @@ def add_pull_routes(
         # the error explicitly rather than handing back an empty payload the worker
         # cannot distinguish from a genuinely empty task — see PullWorker.run_once.
         for t in tickets:
-            resolved = queue.payload_for(identity, t["ticket_id"], t["lease_token"], tier)
+            resolved = _guard(queue.payload_for, identity, t["ticket_id"], t["lease_token"], tier)
             if "error" in resolved:
                 t["payload"] = None
                 t["payload_error"] = resolved["error"]
@@ -225,7 +268,7 @@ def add_pull_routes(
         # that kept the lease). Same authorized, lease-gated seam as the inline
         # delivery on /queue/next.
         identity, tier = _identity_and_tier(request)
-        return queue.payload_for(identity, ticket_id, lease_token, tier)
+        return _guard(queue.payload_for, identity, ticket_id, lease_token, tier)
 
     @app.post("/queue/{ticket_id}/report")
     def queue_report(ticket_id: str, body: QueueReportBody, request: Request) -> dict:
@@ -239,13 +282,14 @@ def add_pull_routes(
             risks=body.risks,
             recommended_next_action=body.recommended_next_action,
         )
-        return queue.report(identity, tier, ticket_id, body.lease_token, result)
+        return _guard(queue.report, identity, tier, ticket_id, body.lease_token, result)
 
     @app.post("/queue/{ticket_id}/heartbeat")
     def queue_heartbeat(ticket_id: str, body: QueueHeartbeatBody, request: Request) -> dict:
         identity, _tier = _identity_and_tier(request)
-        return queue.renew(
-            identity, ticket_id, body.lease_token, extend_seconds=body.extend_seconds
+        return _guard(
+            queue.renew,
+            identity, ticket_id, body.lease_token, extend_seconds=body.extend_seconds,
         )
 
     return app
