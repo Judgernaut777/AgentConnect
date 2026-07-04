@@ -367,6 +367,8 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
         confidence: float = 0.0,
         changed_artifacts: Optional[list[str]] = None,
         risks: Optional[list[str]] = None,
+        evidence_refs: Optional[list[str]] = None,
+        recommended_next_action: Optional[str] = None,
     ) -> str:
         """Report a result under the fencing lease_token. Idempotent: a second
         report (or a stale token after a reaper requeue+reclaim) is refused.
@@ -382,6 +384,7 @@ def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Opti
         result = {
             "status": status, "summary": summary, "confidence": confidence,
             "changed_artifacts": changed_artifacts or [], "risks": risks or [],
+            "evidence_refs": evidence_refs or [], "recommended_next_action": recommended_next_action,
         }
         return _json(wq.report(worker_id, tier, ticket_id, lease_token, result))
 

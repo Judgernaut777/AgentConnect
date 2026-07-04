@@ -360,7 +360,7 @@ start_queue_operator(
 
 ## MCP Tools
 
-Eleven MCP tools expose the queue (in `router/mcp_server.py`):
+Twelve MCP tools expose the queue (in `router/mcp_server.py`):
 
 ### Adding Work
 
@@ -384,7 +384,7 @@ Heartbeat/renew the lease. Returns updated state or `{error: "lease_lost"}`.
 
 ### Reporting Results
 
-**`queue_report(worker_id, ticket_id, lease_token, status="completed", summary="", confidence=0.0, changed_artifacts=None, risks=None) -> {ticket_status, result_status, result_ref}`**
+**`queue_report(worker_id, ticket_id, lease_token, status="completed", summary="", confidence=0.0, changed_artifacts=None, risks=None, evidence_refs=None, recommended_next_action=None) -> {ticket_status, result_status, result_ref}`**
 
 Report a result under the fencing token. Idempotent: a second report or stale token is refused. Trusted tiers auto-accept (`done`); untrusted tiers land `in_review` (pending approval).
 

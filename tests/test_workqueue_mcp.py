@@ -120,6 +120,24 @@ def test_full_cycle_trusted_worker_auto_accepts():
     assert "payload_ref" in status[0]
 
 
+def test_queue_report_carries_evidence_refs_and_recommended_next_action():
+    # Feature parity with the HTTP /queue/{id}/report endpoint and WorkerResult:
+    # an MCP-side reporter must be able to attach these fields too, not just
+    # status/summary/confidence/changed_artifacts/risks.
+    mcp, svc = _server()
+    t = _call(mcp, "queue_add", task="hi", privacy_class="public")
+    claim = _call(mcp, "queue_claim", worker_id="trusted-worker", ticket_id=t["ticket_id"])
+    out = _call(
+        mcp, "queue_report", worker_id="trusted-worker", ticket_id=t["ticket_id"],
+        lease_token=claim["lease_token"], summary="done", confidence=0.9,
+        evidence_refs=["artifact://foo"], recommended_next_action="ship it",
+    )
+    assert out["ticket_status"] == "done"
+    stored = json.loads(svc.memory.read_artifact_chunk(out["result_ref"], 0, 10000).content)
+    assert stored["evidence_refs"] == ["artifact://foo"]
+    assert stored["recommended_next_action"] == "ship it"
+
+
 def test_untrusted_report_requires_local_only_review():
     mcp, _ = _server()
     t = _call(mcp, "queue_add", task="hi", privacy_class="public")
@@ -339,3 +357,22 @@ def test_queue_stats_reports_counts():
     assert stats["by_status"]["open"] == 2
     assert stats["by_privacy_class"]["public"] == 1
     assert stats["by_privacy_class"]["repo_sensitive"] == 1
+
+
+def test_reap_work_queue_delegates_to_workqueue_reap_expired():
+    # RouterService.reap_work_queue is the explicit-loop production hook for a
+    # broker's periodic self-healing (mirrors reap_idle_nodes). It had zero
+    # test coverage of either branch -- a regression here (arg-order swap,
+    # swallowed exception) would pass the whole gate silently.
+    _, svc = _server()
+    t = svc.workqueue.add(privacy_class="public", payload="x", origin="o", max_attempts=3)
+    svc.workqueue.claim("w", "local_only", t["ticket_id"], lease_seconds=10, now=1000.0)
+    out = svc.reap_work_queue(now=2000.0)
+    assert out == {"requeued": [t["ticket_id"]], "parked": []}
+    assert svc.workqueue.get(t["ticket_id"])["status"] == "open"
+
+
+def test_reap_work_queue_none_guard_returns_empty_lists():
+    svc = RouterService.create(memory=SharedMemory())
+    svc.workqueue = None
+    assert svc.reap_work_queue(now=0.0) == {"requeued": [], "parked": []}
