@@ -175,6 +175,52 @@ def test_run_forever_survives_transient_http_status_error(tmp_path):
     assert _status(wq, t) == "done"
 
 
+def test_report_transient_failure_retries_same_ticket_without_discarding_result(tmp_path):
+    # Regression: a transient failure REPORTING (not claiming) must retry the
+    # SAME ticket's already-computed WorkerResult, not silently discard it. Before
+    # the fix, run_once let the report()'s httpx.HTTPStatusError propagate; the
+    # caller (run_forever) then backed off and claimed a DIFFERENT ticket on the
+    # next iteration — the real, already-computed result for THIS ticket was
+    # thrown away, execute() would have to run again from scratch on a later
+    # retry, and the ticket sat 'claimed' burning a reaper-driven attempt for
+    # work that had actually succeeded.
+    import httpx
+
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path, poll_interval=0)
+
+    executed = []
+    real_execute = worker.execute
+
+    def counting_execute(ticket):
+        executed.append(ticket["ticket_id"])
+        return real_execute(ticket)
+
+    worker.execute = counting_execute
+
+    real_report = worker.report
+    calls = {"n": 0}
+
+    def flaky_report(ticket_id, lease_token, result):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            req = httpx.Request("POST", "http://test/queue/x/report")
+            resp = httpx.Response(503, request=req)
+            raise httpx.HTTPStatusError("store_busy", request=req, response=resp)
+        return real_report(ticket_id, lease_token, result)
+
+    worker.report = flaky_report
+
+    outcome = worker.run_once(sleep=lambda _s: None)
+
+    assert outcome is not None
+    assert outcome["ticket_id"] == t
+    assert calls["n"] == 2  # retried the SAME report rather than giving up
+    assert executed == [t]  # execute() ran exactly once — the result was reused
+    assert _status(wq, t) == "done"
+
+
 # ----------------------------------------------------------------- heartbeat
 def _make_slow(worker, seconds):
     """Make the worker's execute() take `seconds`, so a heartbeat can fire mid-run."""

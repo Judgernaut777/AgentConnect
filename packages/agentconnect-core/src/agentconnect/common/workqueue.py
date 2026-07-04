@@ -215,7 +215,8 @@ class WorkQueue:
             if not child_tiers.issubset(set(self.allowed_tiers(parent["privacy_class"]))):
                 return {"error": "privacy_downgrade", "depends_on": dep}
 
-        if payload_ref is None and payload is not None:
+        minted_payload_ref = payload_ref is None and payload is not None
+        if minted_payload_ref:
             payload_ref = self.memory.put_artifact(task_id, "work_payload", payload)
 
         tiers = self.allowed_tiers(pc)
@@ -258,6 +259,15 @@ class WorkQueue:
             # first, tripping the partial-unique index. Return the winner's ticket
             # rather than leaking a raw exception (repo convention: typed results).
             self._conn.rollback()
+            if minted_payload_ref and payload_ref is not None:
+                # This losing call already committed its own work_payload artifact
+                # above (put_artifact() commits in its own transaction, before this
+                # INSERT). The rollback just now only discarded the uncommitted
+                # work_queue row, so without this the loser's artifact is referenced
+                # by no ticket and no GC sweep exists — an orphan forever. Delete it
+                # now, mirroring report()'s analogous lease-lost cleanup.
+                self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (payload_ref,))
+                self._conn.commit()
             if dedup_key is not None:
                 existing = self._conn.execute(
                     "SELECT * FROM work_queue WHERE dedup_key=?", (dedup_key,)
@@ -605,7 +615,26 @@ class WorkQueue:
             self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (result_ref,))
             self._conn.commit()
             return {"error": "lease_lost"}
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except sqlite3.Error:
+            # The fencing UPDATE matched, but the commit that would persist it
+            # failed (e.g. SQLITE_BUSY at commit time under cross-process WAL
+            # contention). work_result was already committed in its own
+            # transaction above, before this UPDATE — the caller's retry-on-503
+            # never learns result_ref, so without this cleanup that artifact is
+            # orphaned forever (ticket stays 'claimed') and the eventual retry
+            # mints a second one. Best-effort delete it before propagating.
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            try:
+                self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (result_ref,))
+                self._conn.commit()
+            except Exception:
+                pass
+            raise
 
         eval_status = "failed" if not succeeded else ("completed" if trusted else "pending_review")
         self.memory.record_evaluation({
