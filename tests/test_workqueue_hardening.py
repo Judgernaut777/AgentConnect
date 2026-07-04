@@ -153,3 +153,68 @@ def test_start_reaper_requeues_expired_lease():
         thread.join(timeout=1.0)
 
     assert wq.get(t)["status"] == "open", "reaper thread did not requeue the expired lease"
+
+
+def test_daemon_reaper_concurrent_with_claim_and_report_shared_connection():
+    """Crown-jewel concurrency: the auto-started daemon reaper (what
+    add_pull_routes mounts by default) runs reap_expired — requeue + park, two
+    statements on the ONE shared connection — WHILE workers claim and report on
+    that same connection. A regression dropping @_synchronized from reap_expired,
+    requeuing at the same lease_token, or letting a report land on a
+    reaper-requeued ticket would corrupt an in-flight claim/report or double-count
+    attempts. With short leases some tickets ARE reaped mid-flight, exercising the
+    fencing: a stale-token report after a requeue must be refused, and each ticket
+    must still reach 'done' exactly once with attempts never exceeding the cap."""
+    wq, _ = _wq()
+    n = 40
+    ids = [
+        wq.add(privacy_class=PrivacyClass.public, payload=f"t{i}", origin="o",
+               max_attempts=1000)["ticket_id"]
+        for i in range(n)
+    ]
+
+    thread, stop = wq.start_reaper(interval=0.001)
+    accepted: dict[str, int] = {}
+    stale_lost = [0]
+    alock = threading.Lock()
+
+    def worker(name: str):
+        while True:
+            with alock:
+                if len(accepted) >= n:
+                    break
+            got = wq.claim_next(name, LOCAL, max=1, lease_seconds=0.05)
+            if not got:
+                time.sleep(0.001)
+                continue
+            t = got[0]
+            out = wq.report(name, LOCAL, t["ticket_id"], t["lease_token"],
+                            WorkerResult(status="completed", summary="ok"))
+            if out.get("ticket_status") == "done":
+                with alock:
+                    accepted[t["ticket_id"]] = accepted.get(t["ticket_id"], 0) + 1
+            elif out.get("error") == "lease_lost":
+                # The reaper requeued this ticket between our claim and report;
+                # the stale token is correctly refused. Another claim will retry.
+                with alock:
+                    stale_lost[0] += 1
+
+    try:
+        workers = [threading.Thread(target=worker, args=(f"w{i}",)) for i in range(6)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=20)
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    # Exactly-once terminal state for every ticket; no double-accept.
+    assert set(accepted) == set(ids), "some ticket never reached done under the reaper"
+    assert all(v == 1 for v in accepted.values()), f"double-accepted: {accepted}"
+    for tid in ids:
+        row = wq.get(tid)
+        assert row["status"] == "done", f"{tid} ended {row['status']}"
+        assert row["result_status"] == "approved"
+        # Monotonic, bounded attempts even across reaper requeues.
+        assert 1 <= row["attempts"] <= row["max_attempts"], f"{tid} attempts={row['attempts']}"

@@ -146,6 +146,34 @@ def test_reaper_parks_when_attempts_exhausted():
     assert wq.get(t["ticket_id"])["status"] == "parked"
 
 
+def test_reaper_park_fails_linked_task_and_cascades_to_dependents():
+    # Lease-expiry-driven attempts-exhaustion must NOT diverge from report/reject-
+    # driven exhaustion: a parked (exhausted) parent can never reach 'done', so it
+    # must drive its linked task to FAILED and cascade failure to every dependent,
+    # rather than stranding the task non-terminal and its children blocked forever.
+    from agentconnect.common.schemas import TaskState
+
+    wq, mem = _wq()
+    task_id = mem.create_task({"task": "parent work"})
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o",
+                    task_id=task_id, max_attempts=1)
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[parent["ticket_id"]])
+    grandchild = wq.add(privacy_class=PrivacyClass.public, payload="g", origin="o",
+                        depends_on=[child["ticket_id"]])
+    wq.claim("w", LOCAL, parent["ticket_id"], lease_seconds=10, now=1000.0)  # attempts -> 1
+    out = wq.reap_expired(now=2000.0)
+    assert out == {"requeued": [], "parked": [parent["ticket_id"]]}
+    assert wq.get(parent["ticket_id"])["status"] == "parked"
+    # The linked task is driven terminal (mirrors report()/reject()).
+    assert mem.get_task(task_id)["state"] == TaskState.FAILED.value
+    # Failure cascades transitively to every dependent, so nothing is stranded.
+    child_row = wq.get(child["ticket_id"])
+    assert child_row["status"] == "failed"
+    assert child_row["result_status"] == "dependency_failed"
+    assert wq.get(grandchild["ticket_id"])["status"] == "failed"
+
+
 # ----------------------------------------------------------- idempotency / lease
 def test_double_report_is_refused():
     wq, _ = _wq()
@@ -245,6 +273,30 @@ def test_dependency_gate_blocks_until_parent_done():
     pc = wq.claim("w", LOCAL, parent["ticket_id"])
     wq.report("w", LOCAL, parent["ticket_id"], pc["lease_token"], {"summary": "ok"})
     # Now the child is claimable.
+    got = wq.claim("w", LOCAL, child["ticket_id"])
+    assert got.get("ticket_id") == child["ticket_id"]
+
+
+def test_dependency_gate_requires_ALL_parents_done_not_just_one():
+    # Crown-jewel: a child with MULTIPLE depends_on parents stays blocked until
+    # EVERY parent is 'done' (AND-across-parents), never claimable as soon as one
+    # finishes. A regression narrowing the claim gate's NOT EXISTS to the first
+    # parent (e.g. a stray LIMIT 1) would let multi-input work start early.
+    wq, _ = _wq()
+    a = wq.add(privacy_class=PrivacyClass.public, payload="a", origin="o")
+    b = wq.add(privacy_class=PrivacyClass.public, payload="b", origin="o")
+    child = wq.add(privacy_class=PrivacyClass.public, payload="c", origin="o",
+                   depends_on=[a["ticket_id"], b["ticket_id"]])
+    # Complete ONLY parent A.
+    ca = wq.claim("w", LOCAL, a["ticket_id"])
+    wq.report("w", LOCAL, a["ticket_id"], ca["lease_token"], {"status": "completed"})
+    assert wq.get(a["ticket_id"])["status"] == "done"
+    # Child must still be blocked: B is not done yet.
+    assert wq.claim("w", LOCAL, child["ticket_id"]) == {"error": "not_claimable"}
+    assert wq.status(child["ticket_id"])[0]["status"] == "blocked"
+    # Complete B; only now is the AND-gate satisfied.
+    cb = wq.claim("w", LOCAL, b["ticket_id"])
+    wq.report("w", LOCAL, b["ticket_id"], cb["lease_token"], {"status": "completed"})
     got = wq.claim("w", LOCAL, child["ticket_id"])
     assert got.get("ticket_id") == child["ticket_id"]
 

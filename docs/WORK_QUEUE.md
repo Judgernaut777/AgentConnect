@@ -104,14 +104,14 @@ Only the token holder can renew. Token mismatches, expired leases, or wrong stat
 
 ### The Reaper
 
-An offline loop (not a background thread — determinism) calls `WorkQueue.reap_expired(now)` periodically (e.g., every 30s in tests, as often as the calling loop polls):
+Wherever the pull routes are mounted, `add_pull_routes(reaper_interval>0)` (the default) auto-starts a **daemon reaper thread** bound to the app lifecycle (`start_reaper`): it calls `WorkQueue.reap_expired(now)` every `reaper_interval` seconds and stops on shutdown. Set `reaper_interval=0` to opt out and drive reaping yourself — an **offline loop** calling `reap_expired(now)` periodically (e.g., every 30s in tests) is the deterministic test / external-scheduler mode. Either way the same two statements run:
 
 ```sql
 UPDATE work_queue SET status='open', lease_*=NULL WHERE status='claimed' AND lease_expires_at<? AND attempts<max_attempts
 UPDATE work_queue SET status='parked', park_reason='max_attempts_exhausted' WHERE status='claimed' AND lease_expires_at<? AND attempts>=max_attempts
 ```
 
-Tickets with attempts remaining are requeued; exhausted tickets are `parked`.
+Tickets with attempts remaining are requeued; exhausted tickets are `parked` — and, exactly as report/reject do on attempts-exhaustion, a parked ticket fails its linked task and cascades failure to every dependent (a parked parent can never reach `done`, so its children must not be stranded blocked forever).
 
 ### Lease Fencing
 

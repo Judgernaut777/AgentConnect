@@ -420,6 +420,7 @@ class WorkQueue:
             offset = chunk.next_offset
         return "".join(parts)
 
+    @_synchronized
     def payload_for(
         self,
         identity: str,
@@ -739,18 +740,26 @@ class WorkQueue:
                 (now, now),
             ).fetchall()
         ]
-        parked = [
-            r["ticket_id"]
-            for r in self._conn.execute(
-                "UPDATE work_queue SET status='parked', park_reason='max_attempts_exhausted',"
-                " lease_holder=NULL, lease_tier=NULL, lease_token=NULL, lease_expires_at=NULL,"
-                " updated_at=?"
-                " WHERE status='claimed' AND lease_expires_at<? AND attempts>=max_attempts"
-                " RETURNING ticket_id",
-                (now, now),
-            ).fetchall()
-        ]
+        parked_rows = self._conn.execute(
+            "UPDATE work_queue SET status='parked', park_reason='max_attempts_exhausted',"
+            " lease_holder=NULL, lease_tier=NULL, lease_token=NULL, lease_expires_at=NULL,"
+            " updated_at=?"
+            " WHERE status='claimed' AND lease_expires_at<? AND attempts>=max_attempts"
+            " RETURNING ticket_id, task_id",
+            (now, now),
+        ).fetchall()
+        parked = [r["ticket_id"] for r in parked_rows]
         self._conn.commit()
+        # A parked (attempts-exhausted) ticket can never reach 'done', so — exactly
+        # as report()/reject() do on the identical attempts-exhausted condition —
+        # drive its linked task to FAILED and cascade the failure to every
+        # dependent, rather than stranding the task non-terminal and its children
+        # blocked forever. Lease-expiry-driven exhaustion must not diverge from
+        # report-driven exhaustion.
+        for r in parked_rows:
+            if r["task_id"]:
+                self._set_task_state(r["task_id"], TaskState.FAILED)
+            self._cascade_failure(r["ticket_id"], now)
         return {"requeued": requeued, "parked": parked}
 
     def start_reaper(
@@ -780,6 +789,7 @@ class WorkQueue:
         return thread, stop
 
     # ---------------------------------------------------------------- status
+    @_synchronized
     def status(
         self,
         ticket_id: Optional[str] = None,
@@ -804,6 +814,7 @@ class WorkQueue:
             ).fetchall()
         return [self._status_row(r) for r in rows]
 
+    @_synchronized
     def open_capability_requirements(self) -> list[dict[str, Any]]:
         """Distinct required-capability sets among OPEN tickets, with counts —
         lets an operator spot "no worker can ever claim this" without exposing
@@ -857,6 +868,7 @@ class WorkQueue:
             "updated_at": d["updated_at"],
         }
 
+    @_synchronized
     def list_tickets(
         self,
         status: Optional[str] = None,
@@ -886,6 +898,7 @@ class WorkQueue:
         ``approve``/``reject`` — the human-spot-check triage queue."""
         return self.list_tickets(status="in_review", limit=limit)
 
+    @_synchronized
     def stats(self) -> dict[str, Any]:
         """Counts by status and by privacy_class, plus the distinct open
         capability requirements — a payload-free operator dashboard summary."""
@@ -978,6 +991,7 @@ class WorkQueue:
         return cascaded
 
     # ------------------------------------------------------------- internals
+    @_synchronized
     def _raw(self, ticket_id: str) -> Optional[dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM work_queue WHERE ticket_id=?", (ticket_id,)

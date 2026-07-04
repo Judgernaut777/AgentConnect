@@ -216,6 +216,13 @@ def add_pull_routes(
 
         @app.on_event("startup")
         def _start_reaper() -> None:  # pragma: no cover - lifecycle glue
+            # A second startup without an intervening shutdown (overlapping
+            # lifespans, a supervisor re-firing ASGI startup) must NOT overwrite
+            # the tracked thread/stop-event and leak the first daemon forever:
+            # refuse to start a new reaper while one is still live.
+            existing = _reaper.get("thread")
+            if existing is not None and existing.is_alive():
+                return
             thread, stop = queue.start_reaper(reaper_interval)
             _reaper["thread"], _reaper["stop"] = thread, stop
 
@@ -272,7 +279,20 @@ def add_pull_routes(
         # the error explicitly rather than handing back an empty payload the worker
         # cannot distinguish from a genuinely empty task — see PullWorker.run_once.
         for t in tickets:
-            resolved = _guard(queue.payload_for, identity, t["ticket_id"], t["lease_token"], tier)
+            # Do NOT _guard the per-ticket payload resolution: claim_next already
+            # committed these claims (attempts incremented), so aborting the whole
+            # batch with a 503 on a transient store hiccup would strand the
+            # already-claimed tickets — the client never learns their
+            # ticket_id/lease_token to report or heartbeat, and they sit 'claimed'
+            # until the reaper requeues them. Surface a per-ticket payload_error
+            # instead (same shape as the business-logic error branch), so the
+            # client keeps the lease handle and can re-fetch the payload.
+            try:
+                resolved = queue.payload_for(identity, t["ticket_id"], t["lease_token"], tier)
+            except sqlite3.OperationalError:
+                t["payload"] = None
+                t["payload_error"] = "store_busy"
+                continue
             if "error" in resolved:
                 t["payload"] = None
                 t["payload_error"] = resolved["error"]
