@@ -84,6 +84,13 @@ _TERMINAL = {"done", "failed"}
 # the HTTP edge) because renew() is also reachable from mcp_server.queue_update.
 MAX_LEASE_EXTEND_SECONDS = 3600
 
+# Ceiling on a single claim_next batch: mirrors transport.py's MAX_CLAIM_BATCH.
+# An authorized-but-buggy or malicious worker must not be able to drain the
+# whole open backlog in one lock-held call, starving same-tier peers and
+# inflating an unbounded response. Applied here (not just at the HTTP edge)
+# because claim_next is also reachable from mcp_server.queue_next.
+MAX_CLAIM_BATCH = 50
+
 
 def _tier_value(tier: Union[str, ProviderPrivacyTier, None]) -> Optional[str]:
     if tier is None:
@@ -269,6 +276,9 @@ class WorkQueue:
         admissible = self._admissible_classes(attested_tier)
         if not admissible:
             return []
+        # Clamp server-side: an unbounded max would let one caller drain the
+        # whole open backlog in a single lock-held call (see MAX_CLAIM_BATCH).
+        max = max if max <= MAX_CLAIM_BATCH else MAX_CLAIM_BATCH
         worker_caps = set(capabilities or [])
         claimed: list[dict[str, Any]] = []
         ph = ",".join("?" for _ in admissible)
@@ -389,9 +399,15 @@ class WorkQueue:
     ) -> dict[str, Any]:
         now = _now() if now is None else now
         extend = self.default_lease_seconds if extend_seconds is None else extend_seconds
+        # A non-positive extend must be refused, not silently floored to 0: a
+        # floor of 0 would set lease_expires_at==now, return a "success" status,
+        # and hand the reaper an immediately-reapable lease on the very next
+        # tick — a caller-visible success that silently loses the lease.
+        if extend <= 0:
+            return {"error": "invalid_extend_seconds"}
         # Clamp: an unbounded extend would let a worker pin a lease forever and
         # permanently defeat the reaper for this ticket (see MAX_LEASE_EXTEND_SECONDS).
-        extend = max(0, min(extend, MAX_LEASE_EXTEND_SECONDS))
+        extend = min(extend, MAX_LEASE_EXTEND_SECONDS)
         expires = now + extend
         cur = self._conn.execute(
             "UPDATE work_queue SET lease_expires_at=?, updated_at=?"
@@ -648,7 +664,7 @@ class WorkQueue:
         else:
             cur = self._conn.execute(
                 "UPDATE work_queue SET status='failed', result_status='rejected',"
-                " lease_holder=NULL, lease_token=NULL, lease_expires_at=NULL,"
+                " lease_holder=NULL, lease_tier=NULL, lease_token=NULL, lease_expires_at=NULL,"
                 " provenance=?, updated_at=? WHERE ticket_id=? AND status='in_review'",
                 (json.dumps(prov), now, ticket_id),
             )

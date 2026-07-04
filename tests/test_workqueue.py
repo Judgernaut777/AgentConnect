@@ -12,7 +12,7 @@ import threading
 from agentconnect.common.config import load_routing
 from agentconnect.common.memory import SharedMemory
 from agentconnect.common.schemas import PrivacyClass
-from agentconnect.common.workqueue import WorkQueue
+from agentconnect.common.workqueue import MAX_CLAIM_BATCH, WorkQueue
 
 LOCAL = "local_only"
 RENTED = "private_rented"
@@ -124,6 +124,19 @@ def test_concurrent_claim_exactly_one_winner(tmp_path):
     final = WorkQueue(SharedMemory(db), load_routing()).get(ticket)
     assert final["status"] == "claimed"
     assert final["attempts"] == 1  # incremented exactly once
+
+
+def test_claim_next_clamps_max_to_batch_ceiling():
+    # SECURITY: an unbounded `max` would let one caller drain the whole open
+    # backlog in a single lock-held call, starving same-tier peers -- the same
+    # anti-starvation reasoning the HTTP /queue/next edge enforces via
+    # MAX_CLAIM_BATCH. claim_next must clamp itself too, since it is also
+    # reachable from mcp_server.queue_next (no HTTP-edge clamp there).
+    wq, _ = _wq()
+    for i in range(MAX_CLAIM_BATCH + 10):
+        wq.add(privacy_class=PrivacyClass.public, payload=f"x{i}", origin="o")
+    got = wq.claim_next("w", LOCAL, max=MAX_CLAIM_BATCH + 10_000)
+    assert len(got) == MAX_CLAIM_BATCH
 
 
 # ---------------------------------------------------------------------- reaper
@@ -258,6 +271,23 @@ def test_renew_clamps_unbounded_extend_seconds():
     c = wq.claim("w", LOCAL, t["ticket_id"], now=1000.0)
     ok = wq.renew("w", t["ticket_id"], c["lease_token"], extend_seconds=999_999_999_999, now=1001.0)
     assert ok["lease_expires_at"] == 1001.0 + MAX_LEASE_EXTEND_SECONDS
+
+
+def test_renew_refuses_non_positive_extend_seconds():
+    # A floor of 0 would set lease_expires_at==now, report "success", and hand
+    # the reaper an immediately-reapable lease on its very next tick — a
+    # caller-visible success that silently loses the lease. Must be refused.
+    wq, _ = _wq()
+    t = wq.add(privacy_class=PrivacyClass.public, payload="x", origin="o")
+    c = wq.claim("w", LOCAL, t["ticket_id"], lease_seconds=100, now=1000.0)
+    assert wq.renew("w", t["ticket_id"], c["lease_token"], extend_seconds=0, now=1001.0) == {
+        "error": "invalid_extend_seconds"
+    }
+    assert wq.renew("w", t["ticket_id"], c["lease_token"], extend_seconds=-5, now=1001.0) == {
+        "error": "invalid_extend_seconds"
+    }
+    # The original lease is untouched by the refused calls.
+    assert wq.get(t["ticket_id"])["lease_expires_at"] == 1100.0
 
 
 # ------------------------------------------------------- dependency + monotonicity
@@ -507,6 +537,24 @@ def test_rejected_terminal_parent_cascades_failure_to_children():
     out = wq.reject("rev", LOCAL, parent["ticket_id"], reason="bad")
     assert out["ticket_status"] == "failed"
     assert wq.get(child["ticket_id"])["status"] == "failed"
+
+
+def test_reject_terminal_failure_clears_lease_tier():
+    # reject()'s terminal ('failed') branch must clear lease_tier just like its
+    # own requeue branch, report()'s clear_lease, and reap_expired()'s park --
+    # otherwise a stale lease_tier lingers on a ticket that holds no live lease
+    # and pollutes list_tickets/operator views.
+    wq, _ = _wq()
+    parent = wq.add(privacy_class=PrivacyClass.public, payload="p", origin="o", max_attempts=1)
+    c = wq.claim("w", EXTERNAL, parent["ticket_id"])  # untrusted -> in_review
+    wq.report("w", EXTERNAL, parent["ticket_id"], c["lease_token"], {"status": "completed"})
+    assert wq.get(parent["ticket_id"])["lease_tier"] == EXTERNAL
+    out = wq.reject("rev", LOCAL, parent["ticket_id"], reason="bad")
+    assert out["ticket_status"] == "failed"  # attempts exhausted -> terminal, not requeued
+    row = wq.get(parent["ticket_id"])
+    assert row["lease_holder"] is None
+    assert row["lease_token"] is None
+    assert row["lease_tier"] is None
 
 
 def test_payload_for_null_payload_ref_is_typed_error_not_empty_success():
