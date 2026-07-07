@@ -97,6 +97,30 @@ Concretely: the inference machine never becomes the global policy engine, agents
 never make infrastructure decisions, and **secrets never enter model-visible
 context**.
 
+### Two services, similar names — who decides what
+
+The **Agent Router** and the **Local Model Manager** are different processes with
+different jobs, and they usually run on different machines:
+
+| Service | Job | Typically runs on |
+|---|---|---|
+| **Agent Router** (control plane) | Makes **all routing decisions** — classify → privacy/redact → eligible providers → score → select → reserve quota/budget | the manager box, next to Claude Code |
+| **Local Model Manager** (inference appliance) | **Executes** generations; manages GPU residency/admission | your GPU / inference box |
+
+**All routing logic lives in the Router, never on the inference box** — the
+inference box is a trusted-but-dumb executor. There is one deliberate split:
+
+- **Global routing** (which provider/model/tier, given privacy, budget, quota,
+  capability) is decided entirely by the **Router**.
+- **Local admission** (can *this* GPU node load/serve that model right now) is
+  decided by the **Model Manager** and surfaced via its `/status` + `can_accept`;
+  the Router *reads* that live status but the decision is still the Router's.
+
+So the policy engine, task DB, shared memory, privacy classification, budgets, and
+quotas all live with the Router. If the link to the inference box drops, routing
+still happens — it just reports "no local node" and can fall back to cloud (if
+allowed) or queue the work.
+
 ## Repository layout
 
 Four independently-installable packages in one repo (a PEP 420 namespace, so
@@ -185,6 +209,32 @@ only status + summary + refs + risks + next action. The router's default output
 policy (`config/routing.yaml`) caps MCP payloads and forbids returning full logs,
 full repo files, or full traces inline — the manager pulls detail on demand with
 `read_artifact_chunk` / `get_log_slice`.
+
+## Token economics (paying per token vs. a subscription)
+
+This does **not** make a task use fewer tokens — it keeps tokens out of the
+expensive place (your manager agent's context) and routes the worker's tokens to
+the cheapest capable provider. Two separate effects:
+
+- **Manager side (the Claude context you pay API rates for) — the real saving.**
+  Delegating via `submit_task` returns a compact `TaskSummary` (status, one-line
+  summary, artifact *refs*, risks, next-action), not the full output or tool
+  transcript. Claude pulls detail only on demand. A big multi-file task that would
+  otherwise balloon Claude's window to tens of thousands of tokens (re-sent every
+  turn) becomes a submit + a few-hundred-token summary. The saving scales with how
+  bulky the delegated work is.
+- **Worker side (the model doing the work) — cost, not token count.** The task's
+  own tokens don't shrink; they're *routed* to the cheapest capable tier — local
+  GPU first (effectively free once the box is up), then free cloud, then paid —
+  under quota + budget guards so paid tokens are never spent silently.
+
+**Honest caveats:** the MCP tool schemas add a fixed per-session context overhead
+(order of a few thousand tokens); each delegation still costs its summary + any
+follow-up chunk reads; and for *small* tasks, delegating can cost more manager
+tokens than doing the work inline. The win is for large, context-heavy, or
+repetitive work — exactly where an inline agent's context explodes. A flat Claude
+subscription mostly hides the manager-side cost; without one, that manager-side
+compaction is where this design pays for itself.
 
 ## Federated work queue (pull-based, open surface)
 
