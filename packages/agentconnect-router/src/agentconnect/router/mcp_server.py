@@ -160,13 +160,28 @@ def _load_worker_tiers() -> dict[str, str]:
     return load_workers()
 
 
-def build_mcp_server(service: Optional[RouterService] = None, worker_tiers: Optional[dict[str, str]] = None):
-    """Construct the FastMCP server bound to a RouterService."""
+def build_mcp_server(
+    service: Optional[RouterService] = None,
+    worker_tiers: Optional[dict[str, str]] = None,
+    *,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+):
+    """Construct the FastMCP server bound to a RouterService.
+
+    ``host``/``port`` are only meaningful for the SSE / streamable-HTTP transports
+    (the shared multi-harness instance, Model B); they are ignored under stdio.
+    """
     from mcp.server.fastmcp import FastMCP
 
     svc = service or _build_service()
     workers = worker_tiers if worker_tiers is not None else _load_worker_tiers()
-    mcp = FastMCP("agentconnect-router")
+    fastmcp_kwargs: dict[str, Any] = {}
+    if host is not None:
+        fastmcp_kwargs["host"] = host
+    if port is not None:
+        fastmcp_kwargs["port"] = port
+    mcp = FastMCP("agentconnect-router", **fastmcp_kwargs)
 
     @mcp.tool()
     def submit_task(
@@ -519,8 +534,47 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
+_VALID_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+
+
+def _transport_from_env() -> tuple[str, str, int]:
+    """Resolve the MCP transport for a shared/interchangeable-harness deployment.
+
+    ``AGENTCONNECT_MCP_TRANSPORT`` = ``stdio`` (default) | ``sse`` | ``streamable-http``;
+    ``AGENTCONNECT_MCP_HOST`` (default ``127.0.0.1``) / ``AGENTCONNECT_MCP_PORT``
+    (default ``8760``) bind the network transports. Separated from :func:`main` so it
+    is testable without starting a server.
+    """
+    transport = os.environ.get("AGENTCONNECT_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport not in _VALID_TRANSPORTS:
+        raise SystemExit(
+            f"AGENTCONNECT_MCP_TRANSPORT must be one of {sorted(_VALID_TRANSPORTS)}, "
+            f"got {transport!r}"
+        )
+    host = os.environ.get("AGENTCONNECT_MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("AGENTCONNECT_MCP_PORT", "8760"))
+    return transport, host, port
+
+
 def main() -> None:
-    build_mcp_server().run()
+    transport, host, port = _transport_from_env()
+    if transport == "stdio":
+        # Model A (per-harness): each MCP client spawns its own stdio router process.
+        # Point every harness at the same AGENTCONNECT_DB to share tasks, the work
+        # queue, and the subagents draining it — so managers are interchangeable.
+        build_mcp_server().run()
+        return
+    # Model B (shared instance): ONE router process serves many harnesses over the
+    # network, so every manager sees one coherent state (one warm rented-node pool ->
+    # no double-provisioning, one routing/eval cache) and the same subagents. Binds
+    # loopback by default; put TLS/auth (or the mTLS ClientIdentityMiddleware) in front
+    # before exposing beyond localhost.
+    logging.basicConfig(level=logging.INFO)  # stderr; safe (stdout is not the MCP channel here)
+    _log.info(
+        "agentconnect-router serving MCP over %s on %s:%s (shared multi-harness instance)",
+        transport, host, port,
+    )
+    build_mcp_server(host=host, port=port).run(transport=transport)
 
 
 if __name__ == "__main__":
