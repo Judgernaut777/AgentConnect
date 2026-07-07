@@ -107,6 +107,33 @@ Manages the task checkout or working directory.
 - changed files
 - artifact generation
 
+### Mid-run resumability (opt-in)
+
+A crashed agentic run can resume **mid-reasoning** instead of re-dispatching from
+scratch. Off by default (ephemeral, in-memory); enable it per run:
+
+```python
+LangGraphAgentRuntime(model_source,
+    RuntimeConfig(checkpoint_root="/var/lib/agentconnect/checkpoints"))
+```
+
+- **Needs the `[resumable]` extra** (`pip install 'agentconnect-runtime[resumable]'`) —
+  a LangGraph `SqliteSaver`. Without it, setting `checkpoint_root` raises a clear error.
+- Everything for one task lives under `‹checkpoint_root›/‹task_id›/`: the durable
+  `workspace/` and a `checkpoint.sqlite`. The graph state is checkpointed after each
+  super-step; `thread_id = task_id`.
+- **Resume:** re-dispatch the same `task_id`. The runtime reads `graph.get_state(cfg)`;
+  if a node is pending it re-invokes with `None`, resuming from the **exact pending
+  node** — prior nodes are **not** re-run. On success the whole durable dir is removed;
+  on a crash it survives (the `finally` is skipped) for the next attempt.
+- **Guarantee & caveat:** exactly-once for every node that completed *and was
+  checkpointed*; only the single node in flight at crash time can re-run (LangGraph's
+  at-least-once bound). `act` has no side effects, so a re-run there is free; a `tool`
+  killed mid-side-effect is the irreducible case — `write_file` is idempotent,
+  `shell`/`run_tests` are not, so make workspace side effects idempotent if that matters.
+- **Interaction:** the work-queue lease-reaper can then *resume* a re-dispatched ticket
+  (same `task_id`) rather than restart it.
+
 ### `prompts.py`
 
 Assembles the runtime prompts.

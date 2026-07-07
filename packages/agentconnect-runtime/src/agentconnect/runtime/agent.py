@@ -9,7 +9,10 @@ in-process stub in tests and a real serving backend in production.
 
 from __future__ import annotations
 
+import re
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from agentconnect.common.schemas import GenerateRequest, GenerateResponse, TaskSubmission, WorkerResult
@@ -21,6 +24,14 @@ from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .memory import MemorySink
+
+
+def _safe_dirname(task_id: str) -> str:
+    """A filesystem-safe directory name for a task's durable checkpoint dir. Task
+    ids are normally simple tokens; this just fences off separators / oddities so a
+    crafted id can't escape checkpoint_root."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", task_id or "task")
+    return cleaned or "task"
 
 
 class ModelSource(Protocol):
@@ -62,6 +73,12 @@ class RuntimeConfig:
     # memory_sink is injected, the `remember` action writes durable findings to
     # shared memory (e.g. WikiBrain). The worker never reads memory back.
     allow_memory: bool = False
+    # Mid-run resumability: default off (empty -> today's ephemeral behavior). When
+    # set, the run is durable — full state is checkpointed after each super-step
+    # under <checkpoint_root>/<task_id>/ and the workspace lives there too (not a
+    # throwaway temp), so a crashed run RE-DISPATCHED with the same task_id resumes
+    # mid-reasoning instead of restarting. The whole dir is removed on completion.
+    checkpoint_root: str = ""
 
 
 class AgentRuntime(Protocol):
@@ -96,7 +113,23 @@ class LangGraphAgentRuntime:
         from .graph import build_execution_graph
         from .prompts import build_system_prompt
 
-        workspace = Workspace.create(self.config.workspace_root or None, task_id=task_id)
+        # Resumable mode (checkpoint_root set): a durable LangGraph SqliteSaver holds
+        # the graph state and the workspace lives beside it, both keyed by task_id, so
+        # a re-dispatched run reattaches to both and resumes from the pending node.
+        # Otherwise: today's ephemeral temp workspace, no checkpointer, in-memory.
+        base_dir: Path | None = None
+        conn = None
+        checkpointer = None
+        if self.config.checkpoint_root:
+            base_dir = Path(self.config.checkpoint_root) / _safe_dirname(task_id)
+            base_dir.mkdir(parents=True, exist_ok=True)
+            conn, checkpointer = self._open_checkpointer(base_dir / "checkpoint.sqlite")
+            workspace_root: str | None = str(base_dir / "workspace")
+        else:
+            workspace_root = self.config.workspace_root or None
+
+        workspace = Workspace.create(workspace_root, task_id=task_id)
+        success = False
         try:
             # Provenance for any captured memory: what the manager needs to judge a
             # finding's sensitivity at recall time. privacy_class is the DECLARED one
@@ -113,6 +146,7 @@ class LangGraphAgentRuntime:
                 url_resolver=self._url_resolver,
                 memory_sink=self._memory_sink,
                 provenance=provenance,
+                checkpointer=checkpointer,
             )
             initial: RuntimeState = {
                 "task_id": task_id,
@@ -130,10 +164,58 @@ class LangGraphAgentRuntime:
             # Each step is an act node plus at most one tool node; headroom covers
             # the finalize node and the entry edge.
             recursion_limit = self.config.max_steps * 2 + 8
-            final = graph.invoke(initial, config={"recursion_limit": recursion_limit})
-            return worker_result_from_state(final)
+            if checkpointer is None:
+                final = graph.invoke(initial, config={"recursion_limit": recursion_limit})
+            else:
+                cfg = {
+                    "configurable": {"thread_id": task_id},
+                    "recursion_limit": recursion_limit,
+                }
+                prior = graph.get_state(cfg)
+                if prior.next:
+                    # A prior run left pending work: resume from the exact pending
+                    # node (prior nodes are NOT re-run). Prime the workspace's
+                    # changed-file tracker from the checkpoint — the fresh Workspace
+                    # object starts empty and each tool node overwrites
+                    # changed_artifacts with workspace.changed_files, so without this
+                    # pre-crash file changes would drop out of the final result.
+                    workspace.changed_files = list(prior.values.get("changed_artifacts", []))
+                    final = graph.invoke(None, config=cfg)
+                else:
+                    final = graph.invoke(initial, config=cfg)
+            result = worker_result_from_state(final)
+            success = True
+            return result
         finally:
-            # Runtime-created temp workspaces are unreachable by the caller (the
-            # contract carries relative paths only), so remove them; a
-            # caller-supplied workspace_root is left untouched.
-            workspace.cleanup()
+            if conn is not None:
+                conn.close()
+            if checkpointer is None:
+                # Runtime-created temp workspaces are unreachable by the caller (the
+                # contract carries relative paths only), so remove them; a
+                # caller-supplied workspace_root is left untouched.
+                workspace.cleanup()
+            elif success and base_dir is not None:
+                # Completed: drop the whole durable dir (workspace + checkpoint.sqlite).
+                # On a hard crash the finally is skipped, so both survive for resume; if
+                # finally DOES run on a propagating error we also keep them (success is
+                # False), so a re-dispatch can resume.
+                shutil.rmtree(base_dir, ignore_errors=True)
+
+    def _open_checkpointer(self, db_path: Path):
+        """Open a durable SQLite checkpointer at ``db_path``. Returns (conn, saver);
+        the caller closes ``conn`` in its finally. Behind the ``[resumable]`` extra."""
+        import sqlite3
+
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+        except ImportError as e:  # pragma: no cover - exercised only without the extra
+            raise RuntimeError(
+                "mid-run resumability (RuntimeConfig.checkpoint_root) needs the "
+                "[resumable] extra: pip install 'agentconnect-runtime[resumable]'"
+            ) from e
+        # check_same_thread=False: the runtime may touch the saver from a helper
+        # thread; a single run is otherwise single-threaded through the graph.
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        saver = SqliteSaver(conn)
+        saver.setup()
+        return conn, saver
