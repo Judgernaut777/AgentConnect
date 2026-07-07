@@ -70,6 +70,9 @@ from typing import Any, Iterable, Optional, Union
 
 from .config import RoutingConfig
 from .memory import SharedMemory, _new_id, _now, _synchronized
+from .privacy import admissible_classes as _privacy_admissible_classes
+from .privacy import admits as _privacy_admits
+from .privacy import allowed_tiers as _privacy_allowed_tiers
 from .schemas import PrivacyClass, ProviderPrivacyTier, TaskState, WorkerResult
 
 _TRUSTED_TIER = ProviderPrivacyTier.local_only.value
@@ -130,32 +133,25 @@ class WorkQueue:
         self._lock = memory._lock
 
     # ---------------------------------------------------------- authorization
-    def _classes_map(self) -> dict[str, list[str]]:
-        return self.routing.privacy.get("classes", {}) or {}
-
+    # The tier×class rule lives in common.privacy (the single source of truth shared
+    # with the Temporal fork); these thin methods bind it to this queue's routing.
     def allowed_tiers(self, privacy_class: Union[str, PrivacyClass]) -> list[str]:
         """Tiers that may claim this class — recomputed LIVE from routing config.
 
         Deliberately NOT widened by any task opt-in (e.g. allow_rented). A pull
         worker's capability is its attested tier alone; fail-closed."""
-        return list(self._classes_map().get(_class_value(privacy_class), []))
+        return _privacy_allowed_tiers(self.routing, privacy_class)
 
     def _admissible_classes(self, attested_tier: Union[str, ProviderPrivacyTier, None]) -> list[str]:
         """Every privacy_class this attested tier is authorized to claim."""
-        tier = _tier_value(attested_tier)
-        if tier is None:
-            return []
-        return [pc for pc, tiers in self._classes_map().items() if tier in (tiers or [])]
+        return _privacy_admissible_classes(self.routing, attested_tier)
 
     def may_claim(
         self,
         attested_tier: Union[str, ProviderPrivacyTier, None],
         privacy_class: Union[str, PrivacyClass],
     ) -> bool:
-        tier = _tier_value(attested_tier)
-        if tier is None:
-            return False
-        return tier in self.allowed_tiers(privacy_class)
+        return _privacy_admits(self.routing, attested_tier, privacy_class)
 
     # ------------------------------------------------------------------- add
     @_synchronized

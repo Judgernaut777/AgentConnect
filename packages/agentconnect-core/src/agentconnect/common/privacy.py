@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
-from .schemas import PrivacyClass, RedactionResult
+from .schemas import PrivacyClass, ProviderPrivacyTier, RedactionResult
+
+if TYPE_CHECKING:
+    from .config import RoutingConfig
 
 # --- Denylisted sensitive file markers (§24) --------------------------------
 SENSITIVE_FILE_PATTERNS = [
@@ -142,3 +145,54 @@ def redact(payload: str, privacy_class: PrivacyClass) -> tuple[RedactionResult, 
         lossiness=lossiness,
     )
     return result, out
+
+
+# --- tier×class authorization (the single source of truth) ------------------
+# A worker of an attested ``ProviderPrivacyTier`` may handle a task of a given
+# ``PrivacyClass`` iff routing.yaml's ``privacy.classes`` map admits it. Expressed
+# as pure functions of ``(RoutingConfig, tier, class)`` — no store, no I/O — so EVERY
+# execution substrate enforces the SAME fail-closed rule: the zero-infra SQLite
+# ``WorkQueue`` (may_claim/allowed_tiers) and the optional Temporal fork's admission
+# activity. Fail-closed everywhere: unknown class, unknown/None tier, or empty tier
+# list ⇒ NOT admitted. Deliberately NOT widened by any task opt-in (e.g. allow_rented):
+# a worker's capability is its attested tier alone.
+
+def _tier_value(tier: Union[str, ProviderPrivacyTier, None]) -> Optional[str]:
+    if tier is None:
+        return None
+    return tier.value if isinstance(tier, ProviderPrivacyTier) else str(tier)
+
+
+def _class_value(pc: Union[str, PrivacyClass]) -> str:
+    return pc.value if isinstance(pc, PrivacyClass) else str(pc)
+
+
+def _classes_map(routing: "RoutingConfig") -> dict[str, list[str]]:
+    return routing.privacy.get("classes", {}) or {}
+
+
+def allowed_tiers(routing: "RoutingConfig", privacy_class: Union[str, PrivacyClass]) -> list[str]:
+    """Tiers that may handle this class, recomputed LIVE from routing config."""
+    return list(_classes_map(routing).get(_class_value(privacy_class), []))
+
+
+def admissible_classes(
+    routing: "RoutingConfig", attested_tier: Union[str, ProviderPrivacyTier, None]
+) -> list[str]:
+    """Every privacy_class this attested tier is authorized to handle."""
+    tier = _tier_value(attested_tier)
+    if tier is None:
+        return []
+    return [pc for pc, tiers in _classes_map(routing).items() if tier in (tiers or [])]
+
+
+def admits(
+    routing: "RoutingConfig",
+    attested_tier: Union[str, ProviderPrivacyTier, None],
+    privacy_class: Union[str, PrivacyClass],
+) -> bool:
+    """True iff a worker of ``attested_tier`` may handle ``privacy_class``. Fail-closed."""
+    tier = _tier_value(attested_tier)
+    if tier is None:
+        return False
+    return tier in allowed_tiers(routing, privacy_class)

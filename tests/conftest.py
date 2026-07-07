@@ -11,6 +11,9 @@ for _pkg in (
     "agentconnect-router",
     "agentconnect-model-manager",
     "agentconnect-runtime",
+    # Optional Temporal fork — only importable when its tests run (guarded by
+    # importorskip("temporalio")); never touched by the default path.
+    "agentconnect-temporal",
 ):
     _src = ROOT / "packages" / _pkg / "src"
     if str(_src) not in sys.path:
