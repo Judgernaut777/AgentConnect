@@ -120,6 +120,25 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class RemoteWorkerConfig:
+    """A remote agentic worker the router may PUSH a whole task to (router-driven
+    dispatch), reached over mTLS at ``endpoint`` via ``HttpAgentRuntime``.
+
+    ``tier`` is the worker's ATTESTED ``ProviderPrivacyTier``; dispatch eligibility
+    is decided live by ``WorkQueue.may_claim(tier, privacy_class)`` — the same
+    fail-closed trust predicate the pull federation uses — so this field can only
+    grant access routing.yaml's ``privacy.classes`` already admits for that tier.
+    ``capabilities`` is reserved for future capability matching (unused today).
+    """
+
+    worker_id: str
+    endpoint: str
+    tier: str  # attested ProviderPrivacyTier: local_only | private_rented | external | external_paid
+    tls: TlsClientConfig | None = None
+    capabilities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ProviderRegistryConfig:
     policy_version: str
     providers: dict[str, ProviderConfig]
@@ -243,6 +262,36 @@ def load_workers() -> dict[str, str]:
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
     return {str(k): str(v) for k, v in (data.get("workers") or {}).items()}
+
+
+def load_remote_workers() -> list[RemoteWorkerConfig]:
+    """Optional registry of remote agentic workers for router-driven push
+    dispatch (``config/remote_workers.yaml``, key ``remote_workers``).
+
+    Soft-optional like ``load_workers``: a missing file returns ``[]`` (feature
+    off — the router runs every agentic task in-process). Distinct from
+    ``workers.yaml`` (which maps a pull worker's identity to a tier only): push
+    dispatch additionally needs each worker's ``endpoint`` and mTLS material.
+    Registering a worker here does NOT by itself widen access — eligibility is
+    still gated live by ``WorkQueue.may_claim(tier, privacy_class)``.
+    """
+    path = CONFIG_DIR / "remote_workers.yaml"
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    workers: list[RemoteWorkerConfig] = []
+    for w in data.get("remote_workers") or []:
+        workers.append(
+            RemoteWorkerConfig(
+                worker_id=str(w["worker_id"]),
+                endpoint=str(w["endpoint"]),
+                tier=str(w["tier"]),
+                tls=_parse_tls(w.get("tls")),
+                capabilities=tuple(w.get("capabilities", [])),
+            )
+        )
+    return workers
 
 
 @lru_cache(maxsize=1)

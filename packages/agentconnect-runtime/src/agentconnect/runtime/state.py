@@ -26,3 +26,9 @@ class RuntimeState(TypedDict, total=False):
     evidence_refs: list[str]
     risks: list[str]
     recommended_next_action: Optional[str]
+    # Token usage accumulated across every act step, so a remote worker can
+    # self-report it in WorkerResult.usage (the router cannot meter a worker's
+    # own model). Each act node folds in the latest response's counts.
+    input_tokens: int
+    output_tokens: int
+    model_id: Optional[str]

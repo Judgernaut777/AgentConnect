@@ -104,6 +104,8 @@ class LangGraphAgentRuntime:
                 "changed_artifacts": [],
                 "evidence_refs": [],
                 "risks": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
             }
             # Each step is an act node plus at most one tool node; headroom covers
             # the finalize node and the entry edge.
