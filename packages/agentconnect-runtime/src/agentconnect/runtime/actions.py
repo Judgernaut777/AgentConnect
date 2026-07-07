@@ -23,7 +23,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-KNOWN_ACTIONS = ("read_file", "write_file", "list_dir", "shell", "run_tests", "fetch_url", "finish")
+KNOWN_ACTIONS = (
+    "read_file", "write_file", "list_dir", "shell", "run_tests", "fetch_url", "remember", "finish",
+)
 
 _REQUIRED_ARGS = {
     "read_file": ("path",),
@@ -32,6 +34,7 @@ _REQUIRED_ARGS = {
     "shell": ("command",),
     "run_tests": (),
     "fetch_url": ("url",),
+    "remember": ("text",),
     "finish": (),
 }
 
