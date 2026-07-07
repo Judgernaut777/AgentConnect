@@ -18,8 +18,16 @@ import abc
 import time
 from typing import Any, Optional
 
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_fixed
+
 from ..common.config import ProviderConfig
 from ..common.schemas import NodeHandle, NodeSpec, NodeState, NodeTrust
+
+
+class _NodeNotReady(Exception):
+    """Internal retry signal: the rented node is not yet RUNNING (drives the
+    tenacity poll loop; never escapes ``wait_ready``, which converts a give-up
+    into ``TimeoutError``)."""
 
 
 def spec_from_provider(cfg: ProviderConfig, model_id: Optional[str] = None) -> NodeSpec:
@@ -146,18 +154,36 @@ class RunPodProvisioner(NodeProvisioner):
         )
 
     def wait_ready(self, handle: NodeHandle, timeout_seconds: int = 600) -> NodeHandle:
+        # Count-based deadline (not wall-clock) so the injected ``self._sleep`` seam
+        # keeps tests deterministic. tenacity owns the poll/backoff; a give-up
+        # (last attempt still not RUNNING) re-raises _NodeNotReady, converted to the
+        # public TimeoutError below. A real HTTP error is NOT retried (not in the
+        # retry set) and propagates immediately, exactly as before.
         deadline_polls = max(1, timeout_seconds // max(1, int(self._poll)))
-        for _ in range(deadline_polls):
+
+        def _poll_once() -> NodeHandle:
             r = self._client.get(f"/pods/{handle.node_id}")
             r.raise_for_status()
             data = r.json()
             status = (data.get("desiredStatus") or data.get("status") or "").upper()
-            if status == "RUNNING":
-                return handle.model_copy(
-                    update={"state": NodeState.ready, "manager_endpoint": self._endpoint(data)}
-                )
-            self._sleep(self._poll)
-        raise TimeoutError(f"RunPod node {handle.node_id} not RUNNING within {timeout_seconds}s")
+            if status != "RUNNING":
+                raise _NodeNotReady()
+            return handle.model_copy(
+                update={"state": NodeState.ready, "manager_endpoint": self._endpoint(data)}
+            )
+
+        try:
+            return Retrying(
+                stop=stop_after_attempt(deadline_polls),
+                wait=wait_fixed(self._poll),
+                retry=retry_if_exception_type(_NodeNotReady),
+                sleep=self._sleep,
+                reraise=True,
+            )(_poll_once)
+        except _NodeNotReady:
+            raise TimeoutError(
+                f"RunPod node {handle.node_id} not RUNNING within {timeout_seconds}s"
+            )
 
     def drain(self, handle: NodeHandle) -> NodeHandle:
         return handle.model_copy(update={"state": NodeState.draining})

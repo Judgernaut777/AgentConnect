@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from agentconnect.common.config import load_routing
 from agentconnect.common.memory import SharedMemory
-from agentconnect.common.schemas import GenerateResponse
+from agentconnect.common.schemas import GenerateResponse, WorkerResult
 from agentconnect.common.workqueue import WorkQueue
 from agentconnect.runtime import PullWorker, add_pull_routes, create_worker_app
 from agentconnect.runtime.agent import LangGraphAgentRuntime, RuntimeConfig
@@ -219,6 +219,31 @@ def test_report_transient_failure_retries_same_ticket_without_discarding_result(
     assert calls["n"] == 2  # retried the SAME report rather than giving up
     assert executed == [t]  # execute() ran exactly once — the result was reused
     assert _status(wq, t) == "done"
+
+
+def test_report_gives_up_after_bounded_retries_and_reraises(tmp_path):
+    # Sustained transient failure: _report_with_retry retries report_retries times
+    # then re-raises the ORIGINAL httpx error (not a tenacity RetryError) so
+    # run_forever's reaper-requeue fallback sees a real transport failure.
+    import httpx
+
+    client, wq, _ = _broker(tmp_path)
+    t = wq.add(task="t", origin="test", privacy_class="public", payload="job")["ticket_id"]
+    worker = _worker(client, "trusted-worker", tmp_path, report_retries=2, report_retry_backoff=0)
+
+    calls = {"n": 0}
+
+    def always_503(ticket_id, lease_token, result):
+        calls["n"] += 1
+        req = httpx.Request("POST", "http://test/queue/x/report")
+        raise httpx.HTTPStatusError("store_busy", request=req, response=httpx.Response(503, request=req))
+
+    worker.report = always_503
+    result = WorkerResult(status="completed", summary="ok", confidence=1.0)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        worker._report_with_retry(t, "tok", result, sleep=lambda _s: None)
+    assert calls["n"] == 3  # report_retries(2) + 1 initial attempt
 
 
 # ----------------------------------------------------------------- heartbeat

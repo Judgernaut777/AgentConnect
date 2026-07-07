@@ -28,6 +28,8 @@ import threading
 import time
 from typing import Any, Callable, Iterable, Optional
 
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_fixed
+
 from agentconnect.common.schemas import TaskSubmission, WorkerResult
 
 from .agent import AgentRuntime
@@ -183,18 +185,21 @@ class PullWorker:
         requeues it, burning a real attempt for work that actually succeeded.
         Retrying the SAME report first (bounded, with backoff) fixes the common
         transient case; only sustained failure past ``report_retries`` falls
-        through to that reaper-requeue fallback."""
+        through to that reaper-requeue fallback.
+
+        tenacity owns the retry mechanics; the injected ``sleep`` seam is honored
+        so tests stay deterministic, and ``reraise=True`` surfaces the ORIGINAL
+        transient error (not a RetryError) to run_forever's fallback path."""
         import httpx
 
-        attempt = 0
-        while True:
-            try:
-                return self.report(ticket_id, lease_token, result)
-            except (httpx.HTTPStatusError, httpx.TransportError):
-                if attempt >= self.report_retries:
-                    raise
-                attempt += 1
-                sleep(self.report_retry_backoff)
+        retryer = Retrying(
+            stop=stop_after_attempt(self.report_retries + 1),
+            wait=wait_fixed(self.report_retry_backoff),
+            retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TransportError)),
+            sleep=sleep,
+            reraise=True,
+        )
+        return retryer(self.report, ticket_id, lease_token, result)
 
     def run_once(self, *, sleep: Callable[[float], None] = time.sleep) -> Optional[dict[str, Any]]:
         """Claim → execute → report a single ticket. Returns the outcome, or

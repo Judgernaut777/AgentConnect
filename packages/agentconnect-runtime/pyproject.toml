@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "agentconnect-core==0.2.0",
     "langgraph>=1.0",
+    "tenacity>=8",
 ]
 
 [project.optional-dependencies]
