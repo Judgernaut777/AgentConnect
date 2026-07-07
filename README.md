@@ -1,5 +1,9 @@
 # mcp-agentconnect
 
+A two-service agent infrastructure: Claude Code (or any agent) hands tasks off over MCP; a deterministic router classifies each task, keeps sensitive context out of the wrong models, routes to local GPU / free / paid cloud, and returns compact summaries + artifact references instead of flooding context. Runs end-to-end with no GPU (built-in stub); plug in one model server for real output.
+
+Suggested topics/tags: mcp · claude · llm-routing · agent-infrastructure · local-llm · vllm · ollama · mtls · privacy
+
 **TL;DR** — Give **Claude Code** (or any agent) a set of MCP tools that hand tasks
 off to a control plane. It classifies each task, keeps sensitive context out of
 the wrong models, and routes to the cheapest capable model — your local GPU, a
