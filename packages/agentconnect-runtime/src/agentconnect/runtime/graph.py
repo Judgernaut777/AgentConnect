@@ -11,7 +11,7 @@ selection — stays in the router.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agentconnect.common.schemas import GenerateRequest
 
@@ -24,6 +24,9 @@ from .tools import fetch_url, list_dir, read_file, run_shell, run_tests, write_f
 from .tools.browser import Fetcher, Resolver
 from .workspace import Workspace
 
+if TYPE_CHECKING:
+    from .memory import MemorySink
+
 
 def build_execution_graph(
     config: RuntimeConfig,
@@ -32,6 +35,8 @@ def build_execution_graph(
     *,
     fetcher: Fetcher | None = None,
     url_resolver: Resolver | None = None,
+    memory_sink: "MemorySink | None" = None,
+    provenance: dict | None = None,
 ) -> Any:
     """Build and compile the worker graph bound to one workspace."""
 
@@ -104,6 +109,16 @@ def build_execution_graph(
                     evidence = evidence + [f"fetch_url:{args['url'][:120]}"]
             else:
                 obs = "ERROR: the browser action is disabled for this task."
+        elif kind == "remember":
+            # Write-only durable memory. Gated on allow_memory AND an injected sink;
+            # the worker can never read memory back (there is no recall action).
+            if config.allow_memory and memory_sink is not None:
+                prov = {**(provenance or {}), "task_id": state["task_id"]}
+                obs = memory_sink.capture(args["text"], provenance=prov)
+                if not obs.startswith("ERROR:"):
+                    evidence = evidence + [f"remember:{args['text'][:120]}"]
+            else:
+                obs = "ERROR: the remember action is disabled for this task."
         else:  # "invalid"
             obs = f"ERROR: {args.get('error', 'invalid action')} — reply with one valid JSON action."
         if len(obs) > config.observation_max_chars:

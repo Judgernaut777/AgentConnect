@@ -10,7 +10,7 @@ in-process stub in tests and a real serving backend in production.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from agentconnect.common.schemas import GenerateRequest, GenerateResponse, TaskSubmission, WorkerResult
 
@@ -18,6 +18,9 @@ from .results import worker_result_from_state
 from .state import RuntimeState
 from .tools.browser import Fetcher, Resolver
 from .workspace import Workspace
+
+if TYPE_CHECKING:
+    from .memory import MemorySink
 
 
 class ModelSource(Protocol):
@@ -55,6 +58,10 @@ class RuntimeConfig:
     # Tool output shown to the model is truncated to this many chars.
     observation_max_chars: int = 4000
     agent_profile: str = "resident_ok"
+    # Outbound memory (write-only): default off, like the browser. When on AND a
+    # memory_sink is injected, the `remember` action writes durable findings to
+    # shared memory (e.g. WikiBrain). The worker never reads memory back.
+    allow_memory: bool = False
 
 
 class AgentRuntime(Protocol):
@@ -72,6 +79,7 @@ class LangGraphAgentRuntime:
         *,
         fetcher: Fetcher | None = None,
         url_resolver: Resolver | None = None,
+        memory_sink: "MemorySink | None" = None,
     ):
         self.model_source = model_source
         self.config = config or RuntimeConfig()
@@ -80,6 +88,9 @@ class LangGraphAgentRuntime:
         # they live here rather than in the frozen RuntimeConfig (data only).
         self._fetcher = fetcher
         self._url_resolver = url_resolver
+        # Outbound memory seam (write-only). None + allow_memory disables the
+        # remember action; a sink is what makes it live.
+        self._memory_sink = memory_sink
 
     def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult:
         from .graph import build_execution_graph
@@ -87,12 +98,21 @@ class LangGraphAgentRuntime:
 
         workspace = Workspace.create(self.config.workspace_root or None, task_id=task_id)
         try:
+            # Provenance for any captured memory: what the manager needs to judge a
+            # finding's sensitivity at recall time. privacy_class is the DECLARED one
+            # (the router's classified value never reaches the worker).
+            provenance = {
+                "agent_type": task.agent_type,
+                "privacy_class": getattr(task.constraints, "privacy_class", None),
+            }
             graph = build_execution_graph(
                 self.config,
                 self.model_source,
                 workspace,
                 fetcher=self._fetcher,
                 url_resolver=self._url_resolver,
+                memory_sink=self._memory_sink,
+                provenance=provenance,
             )
             initial: RuntimeState = {
                 "task_id": task_id,
