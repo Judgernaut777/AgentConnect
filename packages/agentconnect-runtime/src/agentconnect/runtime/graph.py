@@ -49,6 +49,11 @@ def build_execution_graph(
         return {
             "messages": state["messages"] + [{"role": "assistant", "content": resp.output_text}],
             "last_action": {"kind": action.kind, "args": action.args, "freeform": action.freeform},
+            # Accumulate token usage across steps (last-value-wins channel, so add
+            # to the running total). Surfaced as WorkerResult.usage for metering.
+            "input_tokens": state.get("input_tokens", 0) + resp.input_tokens,
+            "output_tokens": state.get("output_tokens", 0) + resp.output_tokens,
+            "model_id": resp.model_id or config.model_id,
         }
 
     def run_tool(state: RuntimeState) -> dict[str, Any]:

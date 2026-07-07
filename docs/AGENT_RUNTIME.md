@@ -143,6 +143,11 @@ How the runtime is invoked remotely.
 - `HttpAgentRuntime(base_url, tls=...)` — `AgentRuntime` client over HTTP; authentication is the mTLS client certificate
 - TLS terminates at the server launcher (uvicorn `ssl_cert_reqs=CERT_REQUIRED`), never in the app factory; the wire never carries `RuntimeConfig`
 
+The router can PUSH an agentic task to one of these workers instead of running the
+loop in-process (`HttpAgentRuntime` is a drop-in `AgentRuntime`), gated by the same
+fail-closed trust predicate as the pull queue. See
+[REMOTE_DISPATCH.md](REMOTE_DISPATCH.md).
+
 ## How It Connects To The Router
 
 The router already defines the control-plane contract:

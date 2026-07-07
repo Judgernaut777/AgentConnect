@@ -1,0 +1,38 @@
+# Remote agentic workers for router-driven PUSH dispatch.
+#
+# When a task is submitted with execution="agentic", the router will PUSH the
+# whole task to a registered worker here — over mutual TLS, via HttpAgentRuntime
+# -> POST /run — instead of running the LangGraph loop in-process, provided the
+# worker's ATTESTED tier is trusted for the task's privacy class and the worker
+# reports capacity (GET /can_accept). If no worker is eligible/available, the
+# router falls back to running the task in-process (today's behavior).
+#
+# This file is OPTIONAL and ships EMPTY: with no entries below, load_remote_workers()
+# returns [] and the feature is OFF. Uncomment and fill in real workers to enable it.
+#
+# Trust model (IMPORTANT): a worker runs its OWN model, and in an agentic loop the
+# tool observations (file contents, shell output) feed back into that model. So a
+# worker is only ever picked for a privacy class its `tier` already admits under
+# routing.yaml's `privacy.classes` — enforced live by WorkQueue.may_claim, the same
+# fail-closed predicate the pull federation uses. Registering a worker here can only
+# GRANT what routing.yaml already allows for that tier; it never widens access. In
+# particular, `repo_sensitive` admits only tier `local_only`, so a repo-sensitive
+# task dispatches remotely only to a worker you attest as `local_only` (a box you
+# control) — a private_rented worker is NOT eligible (no allow_rented widening on
+# this path; deliberately conservative — see docs/REMOTE_DISPATCH.md).
+
+remote_workers: []
+
+# Example (uncomment and adapt):
+#
+# remote_workers:
+#   - worker_id: fleet-box-1
+#     endpoint: "https://box1.internal:8443"   # the worker app (create_worker_app) base URL
+#     tier: local_only                          # attested ProviderPrivacyTier:
+#                                               #   local_only | private_rented | external | external_paid
+#     tls:                                       # mutual TLS material (filesystem paths; ${ENV} expanded)
+#       mode: mutual
+#       ca_cert:     "${AGENTCONNECT_FLEET_CA}"
+#       client_cert: "${AGENTCONNECT_FLEET_CLIENT_CERT}"
+#       client_key:  "${AGENTCONNECT_FLEET_CLIENT_KEY}"
+#     capabilities: [coding, review]             # optional; reserved for future capability matching (unused today)

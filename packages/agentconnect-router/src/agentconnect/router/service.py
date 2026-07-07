@@ -14,14 +14,20 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..common import privacy as privacy_mod
 from ..common.authorization import ChargeRequest, DenyingSpendAuthorizer, SpendAuthorizer
 from ..common.budget import BudgetManager
 from ..common.evaluation import Evaluator
-from ..common.config import ProfilesConfig, RoutingConfig, load_all
+from ..common.config import (
+    ProfilesConfig,
+    RemoteWorkerConfig,
+    RoutingConfig,
+    load_all,
+    load_remote_workers,
+)
 from ..common.memory import SharedMemory
 from ..common.privacy import ClassificationHints
 from ..common.providers import ProviderRegistry
@@ -72,6 +78,14 @@ class RouterService:
     # Federated pull work-queue (S1 core), sharing this same memory._conn. Optional
     # only for callers that construct a bare RouterService by hand in tests.
     workqueue: Optional[WorkQueue] = None
+    # Router-driven remote-worker dispatch: agentic tasks may be PUSHED whole to a
+    # registered remote worker over mTLS instead of running the loop in-process.
+    # Empty registry -> feature off (every agentic task runs in-process). The
+    # factory maps a RemoteWorkerConfig to an AgentRuntime (default builds
+    # HttpAgentRuntime); it is also the injection seam tests use to supply a
+    # TestClient-backed runtime with no real network.
+    remote_workers: list[RemoteWorkerConfig] = field(default_factory=list)
+    remote_runtime_factory: Optional[Callable[[RemoteWorkerConfig], Any]] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -95,6 +109,14 @@ class RouterService:
         from .provisioning import NodePool, StubProvisioner
 
         min_samples = int(routing_cfg.scoring.get("learned_min_samples", 5))
+
+        def _default_remote_runtime(w: RemoteWorkerConfig):
+            # Lazy import behind the [remote] extra: only reached when a remote
+            # worker is actually registered and selected.
+            from agentconnect.runtime import HttpAgentRuntime
+
+            return HttpAgentRuntime(w.endpoint, tls=w.tls)
+
         return cls(
             memory=mem, registry=registry, profiles=profiles, routing_cfg=routing_cfg,
             quota=quota, engine=engine, gateway=gw, local_client=local_client,
@@ -105,14 +127,20 @@ class RouterService:
             node_pool=NodePool(),
             budget=BudgetManager(mem, routing_cfg),
             authorizer=authorizer or DenyingSpendAuthorizer(),
+            remote_workers=load_remote_workers(),
+            remote_runtime_factory=_default_remote_runtime,
         )
 
     # ----------------------------------------------------------- evaluation
     def _record_eval(self, cfg, model, task_id, agent_type, status, latency_ms,
                      in_tok, out_tok, cost, confidence=None) -> None:
+        # ``cfg`` is a ProviderConfig for routed dispatch, or a plain provider-label
+        # string for router-driven remote dispatch (no provider object exists — the
+        # remote worker ran its own model).
+        provider = cfg if isinstance(cfg, str) else cfg.provider_id
         self.memory.record_evaluation(
             {
-                "provider": cfg.provider_id, "model": model, "task_id": task_id,
+                "provider": provider, "model": model, "task_id": task_id,
                 "agent_type": agent_type, "status": status, "latency_ms": latency_ms,
                 "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
                 "confidence": confidence, "retries": 0,
@@ -344,6 +372,22 @@ class RouterService:
             )
             return self._summary(task_id)
 
+        # Router-driven remote-worker dispatch: an agentic task may be PUSHED whole
+        # to a registered remote worker whose ATTESTED tier is trusted for this
+        # privacy class (the same fail-closed WorkQueue.may_claim predicate the pull
+        # federation uses) and that reports capacity. Placed BEFORE provider routing
+        # because the worker runs its OWN model — the wire carries no model pin, so no
+        # provider/spend/quota decision applies. No eligible/available worker -> fall
+        # through to in-process routing (today's path). secret_sensitive is already
+        # blocked above, and may_claim([], ...) would deny anyway.
+        if submission.constraints.execution == "agentic":
+            selected = self._select_remote_worker(privacy_class)
+            if selected is not None:
+                worker_cfg, runtime = selected
+                return self._run_agentic_remote(
+                    worker_cfg, runtime, submission, task_id, state, privacy_class
+                )
+
         # 5-6. Quality requirement + token estimate.
         max_out = submission.constraints.max_output_tokens or int(
             self.routing_cfg.local_inference_defaults.get("default_max_output_tokens", 1200)
@@ -537,6 +581,127 @@ class RouterService:
         return self._summary(task_id)
 
     # --------------------------------------------------------- agentic dispatch
+    def _select_remote_worker(self, privacy_class):
+        """Pick a registered remote worker trusted for ``privacy_class`` and
+        reporting capacity, returning ``(worker_cfg, runtime)`` or ``None``.
+
+        Trust reuses ``WorkQueue.may_claim`` — the pull federation's live,
+        fail-closed tier x privacy predicate — so a worker registered in
+        ``remote_workers.yaml`` can only be picked for a class its attested tier
+        already admits under ``routing.yaml``. Availability is a ``can_accept``
+        probe; any predicate miss, unreachable worker, or malformed response is
+        skipped, so a fully-unavailable fleet cleanly falls back to in-process.
+        """
+        if not self.remote_workers or self.workqueue is None or self.remote_runtime_factory is None:
+            return None
+        for w in self.remote_workers:
+            if not self.workqueue.may_claim(w.tier, privacy_class):
+                continue  # tier not trusted for this class -> skip
+            try:
+                runtime = self.remote_runtime_factory(w)
+                if runtime.can_accept().can_accept:
+                    return w, runtime
+            except Exception:
+                continue  # unreachable / malformed -> try the next worker
+        return None
+
+    def _run_agentic_remote(
+        self, worker_cfg: RemoteWorkerConfig, runtime, submission: TaskSubmission,
+        task_id: str, state: TaskState, privacy_class,
+    ) -> TaskSummary:
+        """Dispatch an agentic task WHOLE to a trusted remote worker over mTLS and
+        fold its ``WorkerResult`` into the state machine, mirroring
+        ``_run_agentic``'s reconcile/eval/state tail.
+
+        The worker runs its OWN model, so there is no provider ``cfg``, no quota
+        reservation, and no router-side spend — the worker self-reports token usage
+        in ``WorkerResult.usage``, which we record for observability. Availability
+        fallback already happened at selection (``can_accept``); a ``run()`` failure
+        AFTER acceptance is a genuine FAILED (the worker may already have performed
+        side effects) — never a silent in-process re-run.
+        """
+        provider_label = f"remote:{worker_cfg.worker_id}"
+        # Routing/quota/spend were skipped; walk the linear FSM to RUNNING.
+        state = self._transition(task_id, state, TaskState.ELIGIBLE_PROVIDERS_COMPUTED)
+        self.memory.append_log(
+            task_id,
+            f"remote_dispatch worker={worker_cfg.worker_id} tier={worker_cfg.tier} "
+            f"privacy_class={privacy_class.value} endpoint={worker_cfg.endpoint}",
+        )
+        state = self._transition(task_id, state, TaskState.QUEUED)
+        state = self._transition(task_id, state, TaskState.DISPATCHED)
+        state = self._transition(task_id, state, TaskState.RUNNING)
+
+        started = time.perf_counter()
+        try:
+            worker = runtime.run(submission, task_id=task_id)
+        except Exception as exc:  # accepted then dropped -> genuine FAILED, no re-run.
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            self._record_eval(
+                provider_label, "", task_id, submission.agent_type, "failed",
+                latency_ms, 0, 0, 0.0,
+            )
+            self.memory.append_log(
+                task_id, f"remote_dispatch_failed worker={worker_cfg.worker_id}: {exc}", level="error"
+            )
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=f"Remote agentic dispatch to {worker_cfg.worker_id} failed.",
+                recommended_next_action="Inspect logs via get_log_slice; retry or run in-process.",
+            )
+            return self._summary(task_id)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        # Worker-reported usage (None on an older worker -> record zeros + a marker).
+        usage = worker.usage
+        if usage is None:
+            in_tok = out_tok = 0
+            model_id = ""
+            self.memory.append_log(task_id, f"usage_unreported worker={worker_cfg.worker_id}")
+        else:
+            in_tok, out_tok, model_id = usage.input_tokens, usage.output_tokens, usage.model_id or ""
+        eval_status = "completed" if worker.status == "completed" else "failed"
+        # cost=0.0: remote compute is the worker's own; we record usage for
+        # observability, not billing against a router-side budget.
+        self._record_eval(
+            provider_label, model_id, task_id, submission.agent_type, eval_status,
+            latency_ms, in_tok, out_tok, 0.0, confidence=worker.confidence,
+        )
+
+        output_ref = self.memory.put_artifact(
+            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+        )
+        self.memory.append_log(
+            task_id, f"agentic_remote worker={worker_cfg.worker_id} model={model_id} "
+            f"status={worker.status} confidence={worker.confidence} in={in_tok} out={out_tok} "
+            f"changed={len(worker.changed_artifacts)} output_ref={output_ref}"
+        )
+
+        if worker.status == "completed":
+            state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
+            state = self._transition(task_id, state, TaskState.CHECKS_RUN)
+            state = self._transition(task_id, state, TaskState.REVIEW_READY)
+            state = self._transition(task_id, state, TaskState.APPROVED)
+            self._transition(task_id, state, TaskState.COMPLETE)
+            self.memory.update_task(
+                task_id, state=TaskState.COMPLETE.value,
+                summary=self._first_line(worker.summary) or "Remote agentic task completed.",
+                recommended_next_action=worker.recommended_next_action
+                or "Read the output artifact chunk if details are needed.",
+            )
+        else:
+            # Loop stopped without a finish (e.g. step cap): not an exception, but
+            # not a success — surface as FAILED with the worker's own next-action.
+            self._transition(task_id, state, TaskState.FAILED)
+            self.memory.update_task(
+                task_id, state=TaskState.FAILED.value,
+                summary=self._first_line(worker.summary) or "Remote agentic task did not complete.",
+                recommended_next_action=worker.recommended_next_action
+                or "Raise the step limit or narrow the task, then retry.",
+            )
+        return self._summary(task_id)
+
     def _run_agentic(
         self, cfg, submission: TaskSubmission, task_id: str, state: TaskState,
         max_out: int, reservation,

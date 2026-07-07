@@ -65,6 +65,7 @@ examples/demo.py             # end-to-end router walkthrough, no GPU required
 examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
 docs/WORK_QUEUE.md           # federated pull-based work queue design
+docs/REMOTE_DISPATCH.md      # router-driven remote-worker push dispatch
 ```
 
 ## Quick start
@@ -205,6 +206,17 @@ its rental window **billed exactly once** at spin-up, and it is **released** (fo
 the idle reaper) in a `finally`. Token usage is summed across steps for the
 evaluation record only — the single window bill is the whole money path (a rented
 node is `type="local"`, so no cloud quota is reserved or reconciled).
+
+### Router-driven remote-worker dispatch (push)
+
+Instead of running the agentic loop in-process, the router can PUSH the whole task
+to a **registered remote worker** over mutual TLS (`HttpAgentRuntime` → `POST /run`),
+automatically preferring any worker whose **attested tier** is trusted for the task's
+privacy class (the same fail-closed `WorkQueue.may_claim` predicate the pull queue
+uses) and that reports capacity — else it falls back to in-process. The worker runs
+its own model and **self-reports token usage**; there is no router-side spend. Register
+workers in `config/remote_workers.yaml` (ships empty → feature off). See
+[docs/REMOTE_DISPATCH.md](docs/REMOTE_DISPATCH.md).
 
 ## Spend budget & direct user authorization (fail-closed on money)
 

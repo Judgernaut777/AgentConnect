@@ -130,6 +130,21 @@ class TaskSummary(BaseModel):
 # --------------------------------------------------------------------------- #
 # Worker structured return (handoff §21)
 # --------------------------------------------------------------------------- #
+class Usage(BaseModel):
+    """Token usage a worker self-reports for a whole task run.
+
+    A remote worker runs its OWN model, so the router cannot meter it through a
+    ModelSource the way the in-process path does. The worker sums usage across
+    every step of its loop and returns it here; the router records it against the
+    task's evaluation. ``None`` on a ``WorkerResult`` means an older worker that
+    predates this field — the router records zeros and logs ``usage_unreported``.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model_id: Optional[str] = None
+
+
 class WorkerResult(BaseModel):
     status: str = "completed"
     summary: str = ""
@@ -138,6 +153,7 @@ class WorkerResult(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     recommended_next_action: Optional[str] = None
+    usage: Optional[Usage] = None
 
 
 # --------------------------------------------------------------------------- #
