@@ -60,6 +60,7 @@ def _try_embedded_manager():
     place that references it, guarded by try/except so the router runs fine when
     ``agentconnect-model-manager`` is not installed."""
     try:
+        from ..model_manager.backends import backend_from_env  # optional dependency
         from ..model_manager.residency import ResidencyManager  # optional dependency
         from .local_client import InProcessLocalClient
     except ImportError:
@@ -69,7 +70,10 @@ def _try_embedded_manager():
             "Install the 'embedded' extra or set MODEL_MANAGER_URL to add local inference."
         )
         return None
-    return InProcessLocalClient(ResidencyManager())
+    # Honor MODEL_MANAGER_BACKEND / MODEL_BACKEND_URL the same way the standalone
+    # manager service does, so a single-box `agentconnect-router` can front a real
+    # OpenAI-compatible server (Ollama/vLLM/llama.cpp/SGLang), not only the stub.
+    return InProcessLocalClient(ResidencyManager(backend=backend_from_env()))
 
 
 def _build_service() -> RouterService:
