@@ -37,8 +37,12 @@ def build_execution_graph(
     url_resolver: Resolver | None = None,
     memory_sink: "MemorySink | None" = None,
     provenance: dict | None = None,
+    checkpointer: Any = None,
 ) -> Any:
-    """Build and compile the worker graph bound to one workspace."""
+    """Build and compile the worker graph bound to one workspace. When a
+    ``checkpointer`` is supplied (a LangGraph ``BaseCheckpointSaver``), the graph
+    persists state after each super-step so a crashed run can resume from the pending
+    node; without one it runs in-memory (the default ephemeral behavior)."""
 
     def act(state: RuntimeState) -> dict[str, Any]:
         req = GenerateRequest(
@@ -180,4 +184,4 @@ def build_execution_graph(
     graph.add_conditional_edges("act", route_after_act, {"tool": "tool", "finalize": "finalize"})
     graph.add_conditional_edges("tool", route_after_tool, {"act": "act", "finalize": "finalize"})
     graph.add_edge("finalize", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

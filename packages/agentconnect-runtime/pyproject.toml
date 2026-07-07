@@ -19,6 +19,12 @@ dependencies = [
 lang = [
     "langchain",
 ]
+# Mid-run resumability: a durable SQLite checkpointer for the execution graph, so a
+# crashed run resumes from the pending node (RuntimeConfig.checkpoint_root). Lazily
+# imported — the default ephemeral runtime does not need it.
+resumable = [
+    "langgraph-checkpoint-sqlite>=2.0",
+]
 remote = [
     "fastapi>=0.110",
     "httpx>=0.27",
