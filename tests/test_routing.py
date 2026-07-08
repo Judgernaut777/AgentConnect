@@ -1,6 +1,12 @@
 import pytest
 
-from agentconnect.common.config import load_profiles, load_providers, load_routing
+from agentconnect.common.config import (
+    ProviderConfig,
+    ProviderRegistryConfig,
+    load_profiles,
+    load_providers,
+    load_routing,
+)
 from agentconnect.common.memory import SharedMemory
 from agentconnect.common.providers import ProviderRegistry
 from agentconnect.common.quota import QuotaLedger
@@ -96,6 +102,37 @@ def test_public_task_can_use_cloud_when_local_absent(engine):
     )
     decision = eng.route(ctx, None)  # no local manager available
     assert decision.selected_provider in {"gemini_free", "groq_free"}
+
+
+def test_subscription_provider_eligible_then_falls_through():
+    """A coding-plan (subscription) provider routes like the free tier while its
+    window has headroom, and is dropped with a quota reason once the window is
+    exhausted — so the router falls through to the other tiers."""
+    mem = SharedMemory()
+    ledger = QuotaLedger(memory=mem)
+    sub = ProviderConfig(
+        provider_id="glm_coding_plan", type="cloud", endpoint="x", secret_ref="op://x",
+        privacy="external", capabilities=("coding",),
+        quota={"kind": "subscription", "reset": "rolling", "window_seconds": 18000,
+               "max_requests": 1},
+    )
+    reg = ProviderRegistry(
+        config=ProviderRegistryConfig(policy_version="test", providers={"glm_coding_plan": sub})
+    )
+    eng = RoutingEngine(reg, load_profiles(), load_routing(), ledger)
+    ctx = RoutingContext(
+        task_id="s1", privacy_class=PrivacyClass.public,
+        needed_capabilities=("coding",), est_input_tokens=100, est_output_tokens=100,
+    )
+    # Healthy window -> eligible. No allow_paid / budget gate: $0 marginal cost.
+    ok, _ = eng.eligibility(ctx, sub, None)
+    assert ok
+    # Consume the single-request window, then it drops out on quota.
+    r = ledger.reserve(sub, "s1", 100, 100)
+    ledger.reconcile(r, sub, 100, 100)
+    ok2, reason2 = eng.eligibility(ctx, sub, None)
+    assert not ok2
+    assert reason2 == "daily_request_quota_exhausted"
 
 
 def test_decision_is_deterministic(engine):
