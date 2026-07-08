@@ -73,6 +73,15 @@ class RuntimeConfig:
     # memory_sink is injected, the `remember` action writes durable findings to
     # shared memory (e.g. WikiBrain). The worker never reads memory back.
     allow_memory: bool = False
+    # Hierarchical delegation (Track 4): default off. When on, the `delegate` action
+    # lets a planner/manager agent emit sub-tasks (recorded on WorkerResult.subtasks;
+    # the router runs them as children then synthesizes). Bounded to prevent runaway
+    # recursion: delegation is disabled once delegation_depth reaches
+    # max_delegation_depth, and at most max_subtasks may be delegated per run.
+    allow_delegation: bool = False
+    delegation_depth: int = 0
+    max_delegation_depth: int = 2
+    max_subtasks: int = 8
     # Mid-run resumability: default off (empty -> today's ephemeral behavior). When
     # set, the run is durable — full state is checkpointed after each super-step
     # under <checkpoint_root>/<task_id>/ and the workspace lives there too (not a
@@ -160,6 +169,7 @@ class LangGraphAgentRuntime:
                 "risks": [],
                 "input_tokens": 0,
                 "output_tokens": 0,
+                "subtasks": [],
             }
             # Each step is an act node plus at most one tool node; headroom covers
             # the finalize node and the entry edge.

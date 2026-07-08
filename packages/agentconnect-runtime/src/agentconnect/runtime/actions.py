@@ -24,7 +24,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 KNOWN_ACTIONS = (
-    "read_file", "write_file", "list_dir", "shell", "run_tests", "fetch_url", "remember", "finish",
+    "read_file", "write_file", "list_dir", "shell", "run_tests", "fetch_url",
+    "remember", "delegate", "finish",
 )
 
 _REQUIRED_ARGS = {
@@ -35,6 +36,9 @@ _REQUIRED_ARGS = {
     "run_tests": (),
     "fetch_url": ("url",),
     "remember": ("text",),
+    # delegate: `task` is required; agent_type/privacy_class are optional and
+    # pass through as args (the router assigns/validates them at schedule time).
+    "delegate": ("task",),
     "finish": (),
 }
 

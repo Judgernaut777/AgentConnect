@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agentconnect.common.schemas import Usage, WorkerResult
+from agentconnect.common.schemas import SubTask, Usage, WorkerResult
 
 from .state import RuntimeState
 
@@ -16,6 +16,8 @@ def worker_result_from_state(state: RuntimeState) -> WorkerResult:
         evidence_refs=list(state.get("evidence_refs", [])),
         risks=list(state.get("risks", [])),
         recommended_next_action=state.get("recommended_next_action"),
+        # Sub-tasks delegated during the run (Track 4); empty for a leaf worker.
+        subtasks=[SubTask(**s) for s in state.get("subtasks", [])],
         # The loop always ran the model at least once, so report real usage; the
         # router folds it into the task evaluation.
         usage=Usage(
