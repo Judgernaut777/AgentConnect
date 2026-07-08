@@ -38,9 +38,11 @@ from ..common.schemas import (
     Priority,
     PrivacyClass,
     RoutingDecision,
+    TaskConstraints,
     TaskState,
     TaskSubmission,
     TaskSummary,
+    WorkerResult,
 )
 from ..common.state import TERMINAL_STATES, assert_transition
 from ..common.tokens import estimate_io_tokens
@@ -93,6 +95,15 @@ class RouterService:
     # deployments never import the runtime / its langgraph dependency). See
     # _make_local_runtime and docs/AGENT_RUNTIME.md ("Bring your own runtime").
     local_runtime_factory: Optional[Callable[[Any, Any], Any]] = None
+    # Hierarchical delegation (Track 4): default OFF, so an agentic run stays a single
+    # worker unless explicitly enabled. When on, an agentic worker may emit sub-tasks
+    # via the `delegate` action; the router runs each as a child agentic sub-run at the
+    # next depth (privacy_class clamped child ⊆ parent — never a downgrade), then folds
+    # the child summaries back into one parent summary (recursive context
+    # virtualization). Bounded by depth + per-node fan-out so recursion can't run away.
+    enable_delegation: bool = False
+    max_delegation_depth: int = 2
+    max_subtasks: int = 8
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -543,7 +554,9 @@ class RouterService:
         state = self._transition(task_id, state, TaskState.RUNNING)
 
         if submission.constraints.execution == "agentic":
-            return self._run_agentic(cfg, submission, task_id, state, max_out, reservation)
+            return self._run_agentic(
+                cfg, submission, task_id, state, max_out, reservation, privacy_class
+            )
 
         gen_req = GenerateRequest(
             request_id=f"req_{uuid.uuid4().hex[:10]}",
@@ -726,44 +739,37 @@ class RouterService:
 
     def _run_agentic(
         self, cfg, submission: TaskSubmission, task_id: str, state: TaskState,
-        max_out: int, reservation,
+        max_out: int, reservation, privacy_class=None,
     ) -> TaskSummary:
         """Execute the task through the worker runtime's act/tool loop instead of
         a single generation. The model is reached through the gateway (same
         provider/secrets/mTLS as one-shot); token usage is summed across steps
-        and reconciled once. Reached only for owned-local or trusted-rented
-        providers (guarded above)."""
+        (and across any delegated sub-runs) and reconciled once. Reached only for
+        owned-local or trusted-rented providers (guarded above)."""
         # A rented private node cannot be served through the gateway (it neither
         # provisions nor bills), so agentic on a trusted rented tier takes a
         # dedicated path that acquires the node ONCE, reuses it across every
         # step, bills the rental window once, and releases/reaps after.
         if RoutingEngine._is_rented(cfg):
             return self._run_agentic_rented(cfg, submission, task_id, state, max_out)
-        # Lazy import: one-shot-only deployments need not install the runtime
-        # (and its langgraph dependency). RuntimeConfig is data; the runtime impl is
-        # resolved through _make_local_runtime (injectable).
-        from agentconnect.runtime import RuntimeConfig
-        from .runtime_dispatch import GatewayModelSource
 
         model_id = submission.constraints.require_exact_model or self.profiles.default_resident_model
-        source = GatewayModelSource(self.gateway, cfg, model_id)
-        runtime = self._make_local_runtime(
-            source,
-            RuntimeConfig(model_id=model_id, max_output_tokens=max_out),
-        )
+        # One meter for the whole delegation tree: the parent worker plus every child
+        # sub-run and the synthesis call bill against ONE reservation on ONE provider,
+        # so usage is summed here and reconciled once (like a flat agentic run).
+        meter = {"in": 0, "out": 0, "calls": 0, "children": 0}
 
         started = time.perf_counter()
         try:
-            worker = runtime.run(submission, task_id=task_id)
+            worker = self._agentic_tree(cfg, submission, task_id, privacy_class, 0, max_out, meter)
         except Exception as exc:  # runtime failure -> FAILED, reconcile as failure.
             latency_ms = (time.perf_counter() - started) * 1000.0
             if reservation is not None:
-                self.quota.reconcile(reservation, cfg, source.total_input_tokens,
-                                     source.total_output_tokens, status="failed",
-                                     failure_reason=str(exc))
+                self.quota.reconcile(reservation, cfg, meter["in"], meter["out"],
+                                     status="failed", failure_reason=str(exc))
             self._record_eval(
                 cfg, model_id, task_id, submission.agent_type, "failed", latency_ms,
-                source.total_input_tokens, source.total_output_tokens, 0.0
+                meter["in"], meter["out"], 0.0
             )
             self.memory.append_log(task_id, f"agentic_run_failed: {exc}", level="error")
             self._transition(task_id, state, TaskState.FAILED)
@@ -775,7 +781,7 @@ class RouterService:
             return self._summary(task_id)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        in_tok, out_tok = source.total_input_tokens, source.total_output_tokens
+        in_tok, out_tok = meter["in"], meter["out"]
         if reservation is not None:
             self.quota.reconcile(reservation, cfg, in_tok, out_tok)
         cost = self.quota.estimate_cost_usd(cfg, in_tok, out_tok)
@@ -790,9 +796,10 @@ class RouterService:
             task_id, "output", self._clamp(worker.model_dump_json(indent=2))
         )
         self.memory.append_log(
-            task_id, f"agentic provider={cfg.provider_id} model={model_id} steps={source.calls} "
+            task_id, f"agentic provider={cfg.provider_id} model={model_id} steps={meter['calls']} "
             f"status={worker.status} confidence={worker.confidence} in={in_tok} out={out_tok} "
-            f"changed={len(worker.changed_artifacts)} output_ref={output_ref}"
+            f"changed={len(worker.changed_artifacts)} delegated={meter['children']} "
+            f"output_ref={output_ref}"
         )
 
         if worker.status == "completed":
@@ -819,6 +826,174 @@ class RouterService:
                 or "Raise the step limit or narrow the task, then retry.",
             )
         return self._summary(task_id)
+
+    # ------------------------------------------------- hierarchical delegation
+    def _agentic_tree(self, cfg, submission, task_id, privacy_class, depth, max_out, meter):
+        """Run ONE agentic worker and, if it delegates, its whole sub-tree — returning
+        the final (possibly synthesis-folded) WorkerResult. Recursion is bounded: a
+        node may delegate only while ``depth < max_delegation_depth`` and the runtime
+        advertises the ``delegate`` action only below that limit, so leaves never
+        decompose. Every node's token usage accumulates into ``meter`` (in/out/calls),
+        so the caller reconciles the whole tree against one reservation. ``meter`` is
+        updated as we go, so a mid-tree exception still leaves partial usage to bill."""
+        # Lazy import: one-shot-only deployments need not install the runtime (and its
+        # langgraph dependency). RuntimeConfig is data; the impl is resolved through
+        # _make_local_runtime (injectable).
+        from agentconnect.runtime import RuntimeConfig
+        from .runtime_dispatch import GatewayModelSource
+
+        model_id = submission.constraints.require_exact_model or self.profiles.default_resident_model
+        can_delegate = self.enable_delegation and depth < self.max_delegation_depth
+        source = GatewayModelSource(self.gateway, cfg, model_id)
+        runtime = self._make_local_runtime(
+            source,
+            RuntimeConfig(
+                model_id=model_id, max_output_tokens=max_out,
+                allow_delegation=can_delegate, delegation_depth=depth,
+                max_delegation_depth=self.max_delegation_depth, max_subtasks=self.max_subtasks,
+            ),
+        )
+        try:
+            worker = runtime.run(submission, task_id=task_id)
+        finally:
+            meter["in"] += source.total_input_tokens
+            meter["out"] += source.total_output_tokens
+            meter["calls"] += source.calls
+
+        subtasks = list(getattr(worker, "subtasks", []) or [])
+        # No delegation requested (leaf, disabled, or the worker didn't decompose):
+        # return the worker verbatim.
+        if not (can_delegate and worker.status == "completed" and subtasks):
+            return worker
+
+        # Decompose -> execute each child as its own agentic sub-run at depth+1, with a
+        # privacy_class clamped to child ⊆ parent (never a downgrade — same monotonicity
+        # the WorkQueue enforces on dependency edges). Then synthesize.
+        child_records = []
+        for i, st in enumerate(subtasks):
+            child_pc = self._child_privacy_class(privacy_class, st.privacy_class)
+            child_id = f"{task_id}/d{depth + 1}.{i + 1}"
+            child_pc_val = child_pc.value if hasattr(child_pc, "value") else child_pc
+            if child_pc_val == PrivacyClass.secret_sensitive.value:
+                # Same rule as the top-level dispatch guard: secret_sensitive content
+                # must never reach an LLM. A child that clamps to it is refused here —
+                # it is NOT run on this (or any) model — and folded in as a failure.
+                child_worker = WorkerResult(
+                    status="failed",
+                    summary="Sub-task refused: secret_sensitive content must not reach an LLM.",
+                    confidence=0.0,
+                    risks=["secret_sensitive_child_refused"],
+                )
+            else:
+                child_sub = TaskSubmission(
+                    task=st.task,
+                    agent_type=st.agent_type or submission.agent_type,
+                    constraints=TaskConstraints(
+                        privacy_class=child_pc,
+                        execution="agentic",
+                        max_output_tokens=submission.constraints.max_output_tokens,
+                    ),
+                )
+                child_worker = self._agentic_tree(
+                    cfg, child_sub, child_id, child_pc, depth + 1, max_out, meter
+                )
+            meter["children"] += 1
+            # Child output lands under the PARENT task's artifacts (it's a sub-run, not
+            # a first-class queued task) so the whole tree is inspectable from the root.
+            self.memory.put_artifact(
+                task_id, "child_output", self._clamp(child_worker.model_dump_json(indent=2))
+            )
+            pc_label = child_pc.value if hasattr(child_pc, "value") else (child_pc or "inherit")
+            self.memory.append_log(
+                task_id,
+                f"delegate_child depth={depth + 1} idx={i + 1} child={child_id} "
+                f"privacy={pc_label} status={child_worker.status} "
+                f"confidence={child_worker.confidence}",
+            )
+            child_records.append((st.task, child_worker))
+
+        return self._synthesize_children(
+            cfg, model_id, task_id, submission, worker, child_records, max_out, meter
+        )
+
+    def _child_privacy_class(self, parent_pc, proposed):
+        """Resolve a delegated child's privacy_class, enforcing child ⊆ parent. A
+        proposal is accepted only when it is equal-or-more-restrictive than the parent
+        (its admissible-tier set is a subset of the parent's — the same test the
+        WorkQueue applies to dependency edges); otherwise it is clamped to the parent's
+        class so sensitive work can never be laundered down to a looser tier. Fail-closed:
+        an unknown/empty proposal set is clamped, not widened."""
+        if proposed is None or parent_pc is None:
+            # No proposal -> inherit the parent. No parent constraint -> take the
+            # proposal (nothing stricter to enforce against).
+            return proposed if parent_pc is None else parent_pc
+        from agentconnect.common.privacy import allowed_tiers
+
+        prop_val = proposed.value if hasattr(proposed, "value") else proposed
+        parent_val = parent_pc.value if hasattr(parent_pc, "value") else parent_pc
+        # A KNOWN class may map to an empty tier set (secret_sensitive: un-routable, the
+        # strictest of all) — that is still a valid, stricter proposal, so gate on map
+        # membership, not on non-emptiness. An UNKNOWN class (absent from the map) is
+        # fail-closed: clamped to the parent, never honored.
+        classes = self.routing_cfg.privacy.get("classes", {}) or {}
+        child_tiers = set(allowed_tiers(self.routing_cfg, prop_val))
+        parent_tiers = set(allowed_tiers(self.routing_cfg, parent_val))
+        if prop_val in classes and child_tiers.issubset(parent_tiers):
+            return proposed
+        return parent_pc
+
+    def _synthesize_children(self, cfg, model_id, task_id, submission, parent_worker,
+                             child_records, max_out, meter):
+        """Fold the parent worker's own findings plus every child summary into ONE
+        consolidated parent summary (a single gateway generation on the same provider),
+        so the manager sees one summary for the whole sub-tree — recursive context
+        virtualization. Confidence collapses to the weakest link; risks and changed
+        artifacts union across the tree."""
+        lines = [
+            f"Parent task: {submission.task}",
+            f"Your own findings: {parent_worker.summary or '(none)'}",
+            "",
+            "Results of the sub-tasks you delegated:",
+        ]
+        for st_task, cw in child_records:
+            lines.append(f"- [{cw.status}] {st_task}: {cw.summary or '(no summary)'}")
+        lines += [
+            "",
+            "Write a SINGLE consolidated summary of the overall task for the manager, "
+            "integrating the sub-task results. Be concise; do not repeat this prompt.",
+        ]
+        from .runtime_dispatch import GatewayModelSource
+
+        source = GatewayModelSource(self.gateway, cfg, model_id)
+        req = GenerateRequest(
+            request_id=f"req_{task_id}_synth",
+            task_id=task_id,
+            model_id=model_id,
+            messages=[{"role": "user", "content": "\n".join(lines)}],
+            max_output_tokens=max_out,
+            temperature=0.2,
+        )
+        try:
+            resp = source.generate(req)
+            synth_summary = (resp.output_text or "").strip()
+        finally:
+            meter["in"] += source.total_input_tokens
+            meter["out"] += source.total_output_tokens
+            meter["calls"] += source.calls
+
+        risks = list(parent_worker.risks)
+        changed = list(parent_worker.changed_artifacts)
+        confidences = [parent_worker.confidence]
+        for _st_task, cw in child_records:
+            risks += list(cw.risks)
+            changed += [a for a in cw.changed_artifacts if a not in changed]
+            confidences.append(cw.confidence)
+        return parent_worker.model_copy(update={
+            "summary": synth_summary or parent_worker.summary,
+            "confidence": min(confidences),
+            "risks": risks,
+            "changed_artifacts": changed,
+        })
 
     def _run_agentic_rented(
         self, cfg, submission: TaskSubmission, task_id: str, state: TaskState, max_out: int,

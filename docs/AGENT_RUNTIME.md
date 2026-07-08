@@ -134,6 +134,15 @@ LangGraphAgentRuntime(model_source,
 - **Interaction:** the work-queue lease-reaper can then *resume* a re-dispatched ticket
   (same `task_id`) rather than restart it.
 
+### Hierarchical delegation (opt-in)
+
+A planner/manager worker can **decompose** a task: the `delegate` action records
+self-contained sub-tasks on `WorkerResult.subtasks`, and the router runs each as a
+child agentic sub-run at the next depth, then folds the child summaries into one
+parent summary (recursive context virtualization). Off by default; bounded by depth +
+fan-out; child privacy is clamped child ⊆ parent (never a downgrade). See
+[HIERARCHICAL_DELEGATION.md](HIERARCHICAL_DELEGATION.md).
+
 ### `prompts.py`
 
 Assembles the runtime prompts.
