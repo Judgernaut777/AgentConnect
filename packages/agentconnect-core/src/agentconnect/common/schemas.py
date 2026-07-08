@@ -145,6 +145,17 @@ class Usage(BaseModel):
     model_id: Optional[str] = None
 
 
+class SubTask(BaseModel):
+    """A sub-task a planner/manager agent delegates (Track 4 — hierarchical
+    decomposition). The router schedules it as a child task at the next delegation
+    depth; ``privacy_class`` is a proposal only — the router enforces child ⊆ parent
+    monotonicity, never a downgrade."""
+
+    task: str
+    agent_type: Optional[str] = None
+    privacy_class: Optional[PrivacyClass] = None
+
+
 class WorkerResult(BaseModel):
     status: str = "completed"
     summary: str = ""
@@ -154,6 +165,9 @@ class WorkerResult(BaseModel):
     risks: list[str] = Field(default_factory=list)
     recommended_next_action: Optional[str] = None
     usage: Optional[Usage] = None
+    # Sub-tasks this run delegated (empty for a leaf worker). The router decomposes
+    # into children + a synthesizer; see RouterService hierarchical dispatch.
+    subtasks: list[SubTask] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #

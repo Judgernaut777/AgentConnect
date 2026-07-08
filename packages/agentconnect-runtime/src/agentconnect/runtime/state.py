@@ -32,3 +32,6 @@ class RuntimeState(TypedDict, total=False):
     input_tokens: int
     output_tokens: int
     model_id: Optional[str]
+    # Sub-tasks delegated via the `delegate` action (Track 4). Each entry is
+    # {task, agent_type?, privacy_class?}; the router schedules them as children.
+    subtasks: list[dict[str, Any]]

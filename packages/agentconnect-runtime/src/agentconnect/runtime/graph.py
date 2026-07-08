@@ -69,6 +69,7 @@ def build_execution_graph(
         action = state["last_action"] or {}
         kind, args = action.get("kind"), action.get("args", {})
         evidence = state["evidence_refs"]
+        subtasks = state.get("subtasks", [])
         if kind == "read_file":
             obs = read_file(workspace, args["path"], max_chars=config.observation_max_chars)
             if not obs.startswith("ERROR:"):
@@ -123,6 +124,35 @@ def build_execution_graph(
                     evidence = evidence + [f"remember:{args['text'][:120]}"]
             else:
                 obs = "ERROR: the remember action is disabled for this task."
+        elif kind == "delegate":
+            # Hierarchical decomposition (Track 4): record a sub-task for the router
+            # to run as a child. Bounded — disabled past the depth limit and capped
+            # per run — so recursion cannot run away. The worker never waits here; it
+            # keeps its own context small and gets a synthesized summary from the router.
+            if not config.allow_delegation:
+                obs = "ERROR: the delegate action is disabled for this task."
+            elif config.delegation_depth >= config.max_delegation_depth:
+                obs = (
+                    f"ERROR: delegation depth limit ({config.max_delegation_depth}) reached "
+                    "— do this work directly instead of delegating."
+                )
+            elif len(subtasks) >= config.max_subtasks:
+                obs = (
+                    f"ERROR: subtask limit ({config.max_subtasks}) reached — finish with the "
+                    "sub-tasks already delegated."
+                )
+            else:
+                at, pc = args.get("agent_type"), args.get("privacy_class")
+                subtasks = subtasks + [{
+                    "task": args["task"],
+                    "agent_type": at if isinstance(at, str) and at else None,
+                    "privacy_class": pc if isinstance(pc, str) and pc else None,
+                }]
+                obs = (
+                    f"Recorded sub-task #{len(subtasks)} for delegation (the router runs it as a "
+                    "child and hands you back a synthesized summary). Continue or finish."
+                )
+                evidence = evidence + [f"delegate:{args['task'][:120]}"]
         else:  # "invalid"
             obs = f"ERROR: {args.get('error', 'invalid action')} — reply with one valid JSON action."
         if len(obs) > config.observation_max_chars:
@@ -132,6 +162,7 @@ def build_execution_graph(
             "iteration": state["iteration"] + 1,
             "changed_artifacts": list(workspace.changed_files),
             "evidence_refs": evidence,
+            "subtasks": subtasks,
         }
 
     def finalize(state: RuntimeState) -> dict[str, Any]:
