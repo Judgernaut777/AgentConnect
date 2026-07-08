@@ -109,3 +109,75 @@ providers:
       # $ per 1K tokens, used for spend estimation / budget enforcement.
       price_per_1k_input_usd: 0.0025
       price_per_1k_output_usd: 0.01
+
+  # --- Subscription "coding plans" (GLM / Kimi / MiniMax / Qwen) ---------------
+  # Flat-fee plans that hand you an OpenAI-/Anthropic-compatible API key and
+  # explicitly invite third-party tooling — so they route like the free tier
+  # (privacy: external, $0 marginal cost, no per-token price keys), NOT like a
+  # per-token paid provider. What makes them "subscription" is the QUOTA WINDOW:
+  # a flat allowance that resets on a rolling or fixed period rather than per-day.
+  # The router prefers them while the window has headroom (no cost penalty) and
+  # falls through to your other tiers when the window is exhausted (can_reserve).
+  #
+  # To activate one: uncomment it, drop in your `secret_ref`, and CONFIRM the
+  # base URL, model id, and your plan's real window + allowance (the vendor
+  # dashboard shows the limit). Leaving them commented keeps them out of routing.
+  # They're kept OUT of the sensitive privacy tiers on purpose — third-party
+  # clouds, same as the other `external` providers.
+  #
+  # Quota keys (see common/quota.py):
+  #   reset: rolling            -> sliding `now - window_seconds` window
+  #   reset: calendar (default) -> fixed windows aligned to window_seconds
+  #   window_seconds            -> window length (e.g. 18000 = 5h, 2592000 = 30d)
+  #   max_requests / max_tokens -> per-window allowance (generic; falls through
+  #                                to your other providers once hit)
+  #
+  # glm_coding_plan:            # Zhipu / Z.ai GLM Coding Plan
+  #   type: cloud
+  #   endpoint: "https://api.z.ai/api/coding/paas/v4"   # confirm for your region
+  #   secret_ref: "op://AI/glm/coding-plan-key"
+  #   privacy: external
+  #   capabilities: [coding, reasoning, summarization, classification]
+  #   # If the plan's OpenAI-compat surface needs LiteLLM's native handler, set:
+  #   # litellm_model: "openai/glm-4.6"
+  #   quota:
+  #     kind: subscription
+  #     reset: rolling
+  #     window_seconds: 18000    # ~5h prompt-usage window — confirm for your plan
+  #     max_requests: 120        # your plan's per-window prompt allowance
+  #
+  # kimi_coding_plan:           # Moonshot Kimi
+  #   type: cloud
+  #   endpoint: "https://api.moonshot.ai/v1"            # or .cn; confirm
+  #   secret_ref: "op://AI/kimi/coding-plan-key"
+  #   privacy: external
+  #   capabilities: [coding, reasoning, summarization]
+  #   quota:
+  #     kind: subscription
+  #     reset: rolling
+  #     window_seconds: 2592000  # ~30d monthly pool — confirm shape for your plan
+  #     max_tokens: 8000000      # per-window token allowance
+  #
+  # minimax_coding_plan:        # MiniMax
+  #   type: cloud
+  #   endpoint: "https://api.minimax.io/v1"             # confirm for your region
+  #   secret_ref: "op://AI/minimax/coding-plan-key"
+  #   privacy: external
+  #   capabilities: [coding, reasoning, summarization]
+  #   quota:
+  #     kind: subscription
+  #     reset: rolling
+  #     window_seconds: 2592000
+  #     max_requests: 5000
+  #
+  # qwen_coding_plan:           # Alibaba Qwen (DashScope compatible-mode)
+  #   type: cloud
+  #   endpoint: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"  # intl; confirm
+  #   secret_ref: "op://AI/qwen/coding-plan-key"
+  #   privacy: external
+  #   capabilities: [coding, reasoning, summarization, classification]
+  #   quota:
+  #     kind: subscription
+  #     reset: rolling
+  #     window_seconds: 2592000
+  #     max_requests: 2000

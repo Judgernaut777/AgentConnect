@@ -28,6 +28,35 @@ def _day_start(now: float) -> float:
     return now - (now % 86400)
 
 
+def _window_start(now: float, quota: dict) -> float:
+    """Epoch seconds for the start of the quota accounting window.
+
+    Free-tier providers use the default UTC-day boundary (``reset: daily`` or no
+    ``window_seconds``) — identical to :func:`_day_start`, so existing configs are
+    unchanged. Subscription / coding-plan providers (GLM, Kimi, MiniMax, Qwen)
+    configure an explicit window, since their flat-fee quota resets on a period
+    other than the UTC day:
+
+    * ``reset: rolling`` + ``window_seconds`` — a sliding ``now - window`` window
+      (e.g. a 5-hour prompt-usage window).
+    * ``reset: calendar`` (or any non-rolling value) + ``window_seconds`` — fixed
+      windows aligned to ``window_seconds`` boundaries (the daily default,
+      generalized to an arbitrary length).
+
+    Determinism is preserved: the window boundary is a pure function of ``now``
+    and the config, with no hidden clock beyond the one the caller passes in.
+    """
+    window = quota.get("window_seconds")
+    if window is None:
+        return _day_start(now)
+    window = float(window)
+    if window <= 0:
+        return _day_start(now)
+    if quota.get("reset") == "rolling":
+        return now - window
+    return now - (now % window)
+
+
 @dataclass
 class _LiveReservation:
     reservation_id: str
@@ -81,20 +110,22 @@ class QuotaLedger:
         if kind in (None, "local_gpu"):
             return {"kind": kind or "unknown", "unlimited": 1.0}
 
-        used = self.memory.quota_usage_since(cfg.provider_id, _day_start(now))
+        used = self.memory.quota_usage_since(cfg.provider_id, _window_start(now, q))
         out: dict[str, float] = {}
-        if "max_daily_requests" in q:
-            cap = q["max_daily_requests"]
-            out["requests_remaining"] = max(0, cap - used["requests"] - res_req)
-            out["requests_frac"] = out["requests_remaining"] / cap if cap else 0.0
-        if "max_daily_tokens" in q:
-            cap = q["max_daily_tokens"]
-            out["tokens_remaining"] = max(0, cap - used["tokens"] - res_tok)
-            out["tokens_frac"] = out["tokens_remaining"] / cap if cap else 0.0
-        if "max_daily_spend_usd" in q:
-            cap = q["max_daily_spend_usd"]
-            out["spend_remaining_usd"] = max(0.0, cap - used["cost"] - res_cost)
-            out["spend_frac"] = out["spend_remaining_usd"] / cap if cap else 0.0
+        # Generic per-window caps (subscription/coding plans) with the legacy
+        # ``max_daily_*`` names as backward-compatible aliases (free tiers).
+        req_cap = q.get("max_requests", q.get("max_daily_requests"))
+        if req_cap is not None:
+            out["requests_remaining"] = max(0, req_cap - used["requests"] - res_req)
+            out["requests_frac"] = out["requests_remaining"] / req_cap if req_cap else 0.0
+        tok_cap = q.get("max_tokens", q.get("max_daily_tokens"))
+        if tok_cap is not None:
+            out["tokens_remaining"] = max(0, tok_cap - used["tokens"] - res_tok)
+            out["tokens_frac"] = out["tokens_remaining"] / tok_cap if tok_cap else 0.0
+        spend_cap = q.get("max_spend_usd", q.get("max_daily_spend_usd"))
+        if spend_cap is not None:
+            out["spend_remaining_usd"] = max(0.0, spend_cap - used["cost"] - res_cost)
+            out["spend_frac"] = out["spend_remaining_usd"] / spend_cap if spend_cap else 0.0
         return out
 
     def can_reserve(self, cfg: ProviderConfig, in_tokens: int, out_tokens: int) -> tuple[bool, str]:
