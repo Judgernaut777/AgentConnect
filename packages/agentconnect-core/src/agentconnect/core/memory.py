@@ -329,6 +329,10 @@ def label_pending(items: list[MemoryItem]) -> list[str]:
     return [f"{count} unpromoted (pending) memory item(s) included at explicit request"]
 
 
+def _scope_payload(scopes: list["MemoryScope"]) -> list[dict[str, str]]:
+    return [{"scope_type": s.scope_type, "scope_id": s.scope_id} for s in scopes]
+
+
 def _http_call(
     transport: Optional[Any], base_url: str, api_key: Optional[str], timeout: float,
     method: str, path: str, payload: Optional[dict] = None,
@@ -378,8 +382,7 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
             "max_items": request.max_items, "trusted_only": request.trusted_only,
             "include_pending": request.include_pending,
             "include_superseded": request.include_superseded,
-            "scopes": [{"scope_type": s.scope_type, "scope_id": s.scope_id}
-                       for s in request.scopes],
+            "scopes": _scope_payload(request.scopes),
         })
         items = []
         for raw in body.get("items", []):
@@ -526,8 +529,12 @@ class CogneeMemoryAdapter(IndexingMemoryAdapter):
         )
 
     def recall(self, request: RecallRequest) -> RecallPack:
+        # Scopes are a *filter*, not a hint. Without them a repo-scoped question
+        # gets answered out of another project's documents, and the result reads
+        # exactly like a relevant one.
         body = self._call("POST", "/search", {
             "query": request.query, "top_k": request.max_items,
+            "scopes": _scope_payload(request.scopes),
         })
         items = [
             label(MemoryItem(
@@ -597,6 +604,7 @@ class GraphitiMemoryAdapter(IndexingMemoryAdapter):
     def recall(self, request: RecallRequest) -> RecallPack:
         body = self._call("POST", "/search", {
             "query": request.query, "top_k": request.max_items,
+            "scopes": _scope_payload(request.scopes),
         })
         items, warnings = [], []
         for raw in body.get("facts", []):
@@ -759,8 +767,7 @@ class HttpMemoryAdapter(MemoryAdapter):
             "max_items": request.max_items, "trusted_only": request.trusted_only,
             "include_pending": request.include_pending,
             "include_superseded": request.include_superseded,
-            "scopes": [{"scope_type": s.scope_type, "scope_id": s.scope_id}
-                       for s in request.scopes],
+            "scopes": _scope_payload(request.scopes),
         })
         items = [
             MemoryItem(

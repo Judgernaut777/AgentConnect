@@ -10,7 +10,7 @@ what exists.**
 * `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
 * `docs/BACKPLANE_SPEC_COMPLIANCE.md` — easiest useful Level 4: launch, shell, audit
 
-Gate: `.venv/bin/python -m pytest -q` → **647 passed**, all offline.
+Gate: `.venv/bin/python -m pytest -q` → **677 passed**, all offline.
 
 ## The one rule
 
@@ -103,7 +103,15 @@ Cognee search hit can never be read as a recorded decision.
 
 `ContextBuilder` is the whole read path. `MemoryRouter` decides which backends a
 *profile* may even ask (nine profiles; `implementation_constraints` asks only the
-trusted authority, `worker_brief` never reaches the temporal graph).
+trusted authority, `worker_brief` never reaches the temporal graph), and
+`resolve_scopes` decides *at which scopes* — `global`, `project:<id>`, `repo:<id>`,
+`task:<id>`, `manager:<id>`, and (for `model_performance` alone) `worker:<id>` /
+`model:<id>`. Ids come from `task.metadata["project_id"]` / `["repo_id"]`, then
+from `memory.default_scopes`. A scope that resolves to nothing is dropped and
+reported in `warnings`, never sent as an empty id — `repo:` matches nothing and
+looks exactly like a repo that had nothing to say. `global` carries no id, because
+that is the trusted authority's vocabulary: WikiBrain raises on `global` with one.
+Every pack reports `scopes_queried`.
 `MemoryRanker` merges, dedupes by normalized text, and orders by a fixed
 authority: ledger > WikiBrain verified > WikiBrain promoted > Graphiti tied to a
 promoted claim > Cognee > pending/unknown. A retrieval engine surfacing a

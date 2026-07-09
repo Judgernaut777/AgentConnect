@@ -133,11 +133,13 @@ def health(request: Request) -> dict[str, Any]:
 def context_pack(
     task_id: str, request: Request, profile: str = "manager_brief",
     max_memory_items: Optional[int] = None, manager_id: Optional[str] = None,
-    include_pending: bool = False,
+    include_pending: bool = False, worker_id: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> dict[str, Any]:
     pack = service(request).get_task_context_pack(
         task_id, profile=profile, max_memory_items=max_memory_items,
         manager_id=manager_id, include_pending=include_pending,
+        worker_id=worker_id, model_id=model_id,
     )
     return {
         "task_id": pack.task_id, "profile": pack.profile,
@@ -145,6 +147,7 @@ def context_pack(
         # its constraints, never the manager's debate.
         "handoff": pack.handoff.model_dump(mode="json") if pack.handoff else None,
         "backends_queried": pack.backends_queried,
+        "scopes_queried": pack.scopes_queried,
         "memory": _pack(pack.memory),
         "warnings": pack.warnings,
         "memory_is_external_context": pack.memory_is_external_context,

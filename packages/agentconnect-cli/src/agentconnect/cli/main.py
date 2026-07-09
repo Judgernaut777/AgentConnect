@@ -281,12 +281,14 @@ def _cmd_memory_promote(svc: AgentConnectService, a: argparse.Namespace) -> None
 
 def _cmd_tasks_context_pack(svc: AgentConnectService, a: argparse.Namespace) -> None:
     pack = svc.get_task_context_pack(
-        a.task_id, profile=a.profile, max_memory_items=a.max_items, manager_id=a.manager
+        a.task_id, profile=a.profile, max_memory_items=a.max_items, manager_id=a.manager,
+        worker_id=a.worker, model_id=a.model,
     )
     _emit({
         "task_id": pack.task_id, "profile": pack.profile,
         "handoff": pack.handoff.model_dump(mode="json") if pack.handoff else None,
         "backends_queried": pack.backends_queried,
+        "scopes_queried": pack.scopes_queried,
         "memory": {
             "backend": pack.memory.backend, "warnings": pack.warnings,
             "items": [
@@ -593,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", default="manager_brief", choices=sorted(PROFILES))
     p.add_argument("--max-items", dest="max_items", type=int, default=None)
     p.add_argument("--manager")
+    p.add_argument("--worker", help="worker scope; only model_performance uses it")
+    p.add_argument("--model", help="model scope; only model_performance uses it")
     p.set_defaults(func=_cmd_tasks_context_pack)
 
     # decisions

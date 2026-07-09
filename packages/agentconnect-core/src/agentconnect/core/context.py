@@ -49,6 +49,43 @@ WIKIBRAIN = "wikibrain"
 COGNEE = "cognee"
 GRAPHITI = "graphiti"
 
+# ------------------------------------------------------------------- scopes
+#: The scope vocabulary a claim can be filed under. A recall that asks only for
+#: `task:<id>` sees only claims somebody filed against that one task — which is
+#: almost none of them. Durable knowledge ("this repo pins sqlite WAL", "Qwen is
+#: weak at auth review") lives at repo, project, model, or global scope, and a
+#: task-only request silently misses all of it.
+GLOBAL = "global"
+PROJECT = "project"
+REPO = "repo"
+TASK = "task"
+MANAGER = "manager"
+WORKER = "worker"
+MODEL = "model"
+
+#: Every scope kind, broadest first. Used to order the scopes on a request so a
+#: backend that honors ordering sees the widest context before the narrowest.
+SCOPE_ORDER: tuple[str, ...] = (GLOBAL, PROJECT, REPO, TASK, MANAGER, WORKER, MODEL)
+
+#: **`global` takes no scope_id.** This is the trusted authority's vocabulary, not
+#: ours: WikiBrain's `Scope.__post_init__` raises on `global` with an id, and on
+#: every other type *without* one. A synthetic id like `"*"` therefore makes the
+#: whole recall throw — which `ContextBuilder` would dutifully degrade into an
+#: empty pack and a warning, losing every trusted claim in silence.
+GLOBAL_SCOPE_ID = ""
+
+#: WikiBrain's closed vocabulary (`wiki.scopes.SCOPE_TYPES`). We use a subset;
+#: sending anything outside it is a caller bug, and it should surface here rather
+#: than as a degraded pack.
+VALID_SCOPE_TYPES: frozenset[str] = frozenset({
+    GLOBAL, "user", PROJECT, REPO, TASK, MANAGER, WORKER, MODEL, "tool",
+})
+
+#: Task metadata keys the resolver reads. Set them at `create_task` time, or let
+#: `MemoryConfig.default_scopes` supply a deployment-wide fallback.
+PROJECT_KEY = "project_id"
+REPO_KEY = "repo_id"
+
 
 @dataclass
 class ProfileConfig:
@@ -60,22 +97,47 @@ class ProfileConfig:
     #: Locked decisions and task constraints are ledger truth, always allowed.
     include_ledger: bool = True
     include_superseded: bool = False
+    #: Which scope kinds this profile asks for. A bounded worker never gets
+    #: manager-scoped claims; `model_performance` is the only profile that reaches
+    #: worker/model scope, because it is the only one that is *about* them.
+    scopes: tuple[str, ...] = (GLOBAL, PROJECT, REPO, TASK)
 
 
 #: Spec §7 + §14. A profile names *what the caller is for*, and that determines
 #: which backends are even asked.
 PROFILES: dict[str, ProfileConfig] = {
-    "manager_brief": ProfileConfig([WIKIBRAIN, COGNEE, GRAPHITI], 8),
-    "worker_brief": ProfileConfig([WIKIBRAIN, COGNEE], 5, include_handoff=False),
-    "reviewer_brief": ProfileConfig([WIKIBRAIN, GRAPHITI], 8),
-    "implementation_constraints": ProfileConfig([WIKIBRAIN], 6, include_handoff=False),
-    "known_failures": ProfileConfig([WIKIBRAIN, GRAPHITI], 8),
-    "model_performance": ProfileConfig([WIKIBRAIN, GRAPHITI], 8, include_handoff=False),
+    "manager_brief": ProfileConfig(
+        [WIKIBRAIN, COGNEE, GRAPHITI], 8,
+        scopes=(GLOBAL, PROJECT, REPO, TASK, MANAGER)),
+    # No manager scope: a bounded worker does not inherit the manager's history.
+    "worker_brief": ProfileConfig(
+        [WIKIBRAIN, COGNEE], 5, include_handoff=False,
+        scopes=(GLOBAL, PROJECT, REPO, TASK)),
+    "reviewer_brief": ProfileConfig(
+        [WIKIBRAIN, GRAPHITI], 8,
+        scopes=(GLOBAL, PROJECT, REPO, TASK, MANAGER)),
+    "implementation_constraints": ProfileConfig(
+        [WIKIBRAIN], 6, include_handoff=False,
+        scopes=(GLOBAL, PROJECT, REPO, TASK)),
+    "known_failures": ProfileConfig(
+        [WIKIBRAIN, GRAPHITI], 8,
+        scopes=(GLOBAL, PROJECT, REPO, TASK)),
+    # The only profile that is *about* a worker or a model, so the only one that
+    # asks at those scopes. Task scope stays: "this model failed on this task".
+    "model_performance": ProfileConfig(
+        [WIKIBRAIN, GRAPHITI], 8, include_handoff=False,
+        scopes=(GLOBAL, PROJECT, TASK, WORKER, MODEL)),
     # Roomier than the rest: superseded claims rank last, so at a budget of 8 the
     # ledger and the live claims would crowd out the very history this asks for.
-    "project_evolution": ProfileConfig([WIKIBRAIN, GRAPHITI], 10, include_superseded=True),
-    "broad_project_rag": ProfileConfig([COGNEE], 8, include_handoff=False),
-    "hard_policy": ProfileConfig([WIKIBRAIN], 6, include_handoff=False),
+    "project_evolution": ProfileConfig(
+        [WIKIBRAIN, GRAPHITI], 10, include_superseded=True,
+        scopes=(GLOBAL, PROJECT, REPO)),
+    "broad_project_rag": ProfileConfig(
+        [COGNEE], 8, include_handoff=False,
+        scopes=(GLOBAL, PROJECT, REPO)),
+    "hard_policy": ProfileConfig(
+        [WIKIBRAIN], 6, include_handoff=False,
+        scopes=(GLOBAL, PROJECT, REPO)),
 }
 
 DEFAULT_PROFILE = "manager_brief"
@@ -98,6 +160,9 @@ class MemoryConfig:
     #: Hard preferences that affect routing/privacy/cost/safety (§3). These are
     #: policy, not memory: they are never ranked away and never expire.
     hard_policies: list[str] = field(default_factory=list)
+    #: Deployment-wide fallbacks for scope ids a task does not name itself,
+    #: e.g. ``{"project": "fascia", "repo": "mcp-agentconnect"}``.
+    default_scopes: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MemoryConfig":
@@ -114,6 +179,7 @@ class MemoryConfig:
                 include_superseded=bool(
                     spec.get("include_superseded", base.include_superseded)
                 ),
+                scopes=tuple(spec.get("scopes", base.scopes)),
             )
         return cls(
             enabled=bool(memory.get("enabled", True)),
@@ -126,6 +192,7 @@ class MemoryConfig:
             ),
             profiles=profiles,
             hard_policies=list(memory.get("hard_policies", [])),
+            default_scopes=dict(memory.get("default_scopes") or {}),
         )
 
     def profile(self, name: str) -> ProfileConfig:
@@ -146,12 +213,98 @@ class ContextPack(BaseModel):
     handoff: Optional[Any] = None
     memory: RecallPack
     backends_queried: list[str] = []
+    #: `["global", "project:fascia", "repo:mcp-agentconnect", "task:task_1"]`.
+    #: Visible so a caller can see *why* a claim did or did not surface.
+    scopes_queried: list[str] = []
     warnings: list[str] = []
     memory_is_external_context: bool = True
 
 
 #: Back-compat name from the previous handoff. Same object.
 TaskContextPack = ContextPack
+
+
+@dataclass
+class ScopeResolution:
+    """The scopes a request will carry, plus the ones it wanted and could not find.
+
+    `missing` is not an error — a task with no repo is a normal task. It is a
+    *warning*, because "no repo-scoped claim surfaced" and "this deployment never
+    told us which repo" are indistinguishable from inside the pack, and the second
+    is the one that silently loses knowledge.
+    """
+
+    scopes: list[MemoryScope] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+
+    def as_strings(self) -> list[str]:
+        # `global`, not `global:` — the authority's own rendering.
+        return [
+            s.scope_type if not s.scope_id else f"{s.scope_type}:{s.scope_id}"
+            for s in self.scopes
+        ]
+
+
+def resolve_scopes(
+    profile_cfg: ProfileConfig,
+    detail: Any,
+    config: MemoryConfig,
+    manager_id: Optional[str] = None,
+    worker_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> ScopeResolution:
+    """Turn a profile's declared scope kinds into concrete, ordered scopes.
+
+    Ids come from the task first (`metadata["project_id"]`, `metadata["repo_id"]`),
+    then from `MemoryConfig.default_scopes`. A scope kind that resolves to nothing
+    is dropped and reported, never sent as an empty id — `repo:` matches nothing,
+    but it looks like it matched nothing *because there was nothing to find*.
+    """
+    task = detail.task
+    metadata = task.metadata or {}
+    unknown = set(profile_cfg.scopes) - VALID_SCOPE_TYPES
+    if unknown:
+        # Filtering it out silently would be the same bug one layer up: a profile
+        # that asks at a scope nobody indexes returns a plausible, narrower pack.
+        raise ValueError(
+            f"unknown scope type {sorted(unknown)[0]!r} in profile config; "
+            f"expected one of {', '.join(sorted(VALID_SCOPE_TYPES))}"
+        )
+    wanted = [k for k in SCOPE_ORDER if k in profile_cfg.scopes]
+
+    resolved: dict[str, Optional[str]] = {
+        GLOBAL: GLOBAL_SCOPE_ID,
+        PROJECT: metadata.get(PROJECT_KEY) or config.default_scopes.get(PROJECT),
+        REPO: metadata.get(REPO_KEY) or config.default_scopes.get(REPO),
+        TASK: task.id,
+        MANAGER: manager_id or task.current_manager,
+        WORKER: worker_id,
+        MODEL: model_id,
+    }
+
+    scopes: list[MemoryScope] = []
+    missing: list[str] = []
+    for kind in wanted:
+        if kind == GLOBAL:
+            scopes.append(MemoryScope(GLOBAL, GLOBAL_SCOPE_ID))
+            continue
+        value = resolved.get(kind)
+        if value:
+            scopes.append(MemoryScope(kind, str(value)))
+        elif kind != MANAGER:
+            # An unclaimed task having no manager scope is unremarkable; a repo or
+            # project we simply never recorded is knowledge we are failing to reach.
+            missing.append(kind)
+    return ScopeResolution(scopes=scopes, missing=missing)
+
+
+def _scope_warning(missing: list[str], profile: str) -> list[str]:
+    if not missing:
+        return []
+    return [
+        f"{profile}: no {', '.join(missing)} scope is known for this task, so claims "
+        f"filed at that scope cannot surface (set task.metadata or memory.default_scopes)"
+    ]
 
 
 class MemoryRouter:
@@ -344,6 +497,8 @@ class ContextBuilder:
         max_items: Optional[int] = None,
         manager_id: Optional[str] = None,
         include_pending: bool = False,
+        worker_id: Optional[str] = None,
+        model_id: Optional[str] = None,
     ) -> ContextPack:
         profile_cfg = self.config.profile(profile)
         budget = max_items or profile_cfg.max_items
@@ -355,6 +510,12 @@ class ContextBuilder:
             if profile_cfg.include_handoff else None
         )
         query = query or f"{detail.task.title}\n{detail.task.goal}".strip()
+
+        resolution = resolve_scopes(
+            profile_cfg, detail, self.config,
+            manager_id=manager_id, worker_id=worker_id, model_id=model_id,
+        )
+        warnings.extend(_scope_warning(resolution.missing, profile))
 
         packs: list[RecallPack] = []
         if profile_cfg.include_ledger:
@@ -374,7 +535,7 @@ class ContextBuilder:
             is_authority = getattr(adapter, "role", None) == TRUSTED_AUTHORITY
             request = RecallRequest(
                 query=query, task_id=task_id, profile=profile,  # type: ignore[arg-type]
-                scopes=[MemoryScope("task", task_id)],
+                scopes=list(resolution.scopes),
                 max_items=budget,
                 # Only the trusted authority is asked to enforce trust: a retrieval
                 # engine has no notion of promotion, and filtering it on
@@ -392,5 +553,6 @@ class ContextBuilder:
         merged.warnings = list(dict.fromkeys(merged.warnings + warnings))
         return ContextPack(
             task_id=task_id, profile=profile, handoff=handoff, memory=merged,
-            backends_queried=backends, warnings=merged.warnings,
+            backends_queried=backends, scopes_queried=resolution.as_strings(),
+            warnings=merged.warnings,
         )
