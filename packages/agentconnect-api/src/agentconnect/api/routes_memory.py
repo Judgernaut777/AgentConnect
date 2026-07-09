@@ -65,7 +65,10 @@ def _pack(pack) -> dict[str, Any]:
         "items": [
             {"text": i.text, "status": i.status, "confidence": i.confidence,
              "source_id": i.source_id, "source_url": i.source_url,
-             "superseded_by": i.superseded_by}
+             "superseded_by": i.superseded_by,
+             "backend": (i.metadata or {}).get("backend"),
+             "role": (i.metadata or {}).get("role"),
+             "trusted": (i.metadata or {}).get("trusted", False)}
             for i in pack.items
         ],
     }
@@ -103,6 +106,24 @@ def feedback(body: FeedbackBody, request: Request) -> dict[str, Any]:
     return {"recorded": True}
 
 
+class PromoteBody(BaseModel):
+    candidate_id: str
+    promoted_by: str
+
+
+@router.get("/memory/pending")
+def pending(request: Request, limit: int = 50) -> dict[str, Any]:
+    """The librarian's queue: candidates awaiting a human promotion decision."""
+    return {"candidates": service(request).list_pending_memory(limit)}
+
+
+@router.post("/memory/promote")
+def promote(body: PromoteBody, request: Request) -> dict[str, Any]:
+    """Human/librarian only. Deliberately absent from the MCP surface: an agent
+    must never be able to promote its own suggestion into trusted memory."""
+    return service(request).promote_memory_candidate(body.candidate_id, body.promoted_by)
+
+
 @router.get("/memory/health")
 def health(request: Request) -> dict[str, Any]:
     return service(request).memory_health()
@@ -111,7 +132,7 @@ def health(request: Request) -> dict[str, Any]:
 @router.get("/tasks/{task_id}/context-pack")
 def context_pack(
     task_id: str, request: Request, profile: str = "manager_brief",
-    max_memory_items: int = 8, manager_id: Optional[str] = None,
+    max_memory_items: Optional[int] = None, manager_id: Optional[str] = None,
     include_pending: bool = False,
 ) -> dict[str, Any]:
     pack = service(request).get_task_context_pack(
@@ -120,7 +141,11 @@ def context_pack(
     )
     return {
         "task_id": pack.task_id, "profile": pack.profile,
-        "handoff": pack.handoff.model_dump(mode="json"),
+        # worker_brief carries no handoff: a bounded worker gets its subtask and
+        # its constraints, never the manager's debate.
+        "handoff": pack.handoff.model_dump(mode="json") if pack.handoff else None,
+        "backends_queried": pack.backends_queried,
         "memory": _pack(pack.memory),
+        "warnings": pack.warnings,
         "memory_is_external_context": pack.memory_is_external_context,
     }

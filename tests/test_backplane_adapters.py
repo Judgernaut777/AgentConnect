@@ -128,7 +128,9 @@ def test_mcp_recall_is_bounded_and_labeled(svc, task):
     mcp = build_mcp_server(service=svc)
     pack = _call(mcp, "recall_memory", query="refresh token", task_id=task.id)
     assert [i["status"] for i in pack["items"]] == ["promoted"]
-    assert "not ledger truth" in pack["note"]
+    # The note is what a manager reads: it must say recalled memory is not truth.
+    assert "not recorded facts" in pack["note"] and "ledger truth" in pack["note"]
+    assert all("trusted" in i for i in pack["items"])
 
     captured = _call(mcp, "capture_memory_candidate", text="qwen is weak", task_id=task.id)
     assert captured["status"] == "pending"

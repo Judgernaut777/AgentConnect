@@ -30,6 +30,9 @@ WORKER_TIMEOUT = timedelta(minutes=30)
 WORKER_RETRY = RetryPolicy(maximum_attempts=3)
 #: Pure decisions are cheap and safe to retry hard.
 DECISION_RETRY = RetryPolicy(maximum_attempts=5)
+#: Memory is best effort — retry briefly, then continue without it rather than
+#: hold a subtask hostage to a knowledge backend.
+MEMORY_RETRY = RetryPolicy(maximum_attempts=2)
 
 
 @workflow.defn(name="SubtaskWorkflow")
@@ -37,6 +40,8 @@ class SubtaskWorkflow:
     def __init__(self) -> None:
         self._status = "starting"
         self._route: dict[str, Any] = {}
+        self._context: dict[str, Any] = {}
+        self._warnings: list[str] = []
         self._wait_reason: Optional[str] = None
         self._approval: Optional[str] = None  # granted | denied
         self._approved_by: Optional[str] = None
@@ -65,7 +70,13 @@ class SubtaskWorkflow:
             "wait_reason": self._wait_reason,
             "selected_worker": self._route.get("selected_worker"),
             "notes": len(self._notes),
+            "context_items": len(self._context.get("items", [])),
+            "warnings": self._warnings,
         }
+
+    @workflow.query
+    def context_pack(self) -> dict[str, Any]:
+        return self._context
 
     # ------------------------------------------------------------- signals
     @workflow.signal
@@ -90,6 +101,25 @@ class SubtaskWorkflow:
     # ----------------------------------------------------------------- run
     @workflow.run
     async def run(self, subtask_id: str) -> dict[str, Any]:
+        # 1. Recall bounded context BEFORE routing, and push it to the subtask so a
+        #    worker with no MCP client still receives its worker_brief. Memory is
+        #    never queried from workflow code — only through this activity.
+        self._status = "recalling_context"
+        subtask = await workflow.execute_activity(
+            "load_subtask", subtask_id,
+            start_to_close_timeout=SHORT, retry_policy=DECISION_RETRY,
+        )
+        try:
+            self._context = await workflow.execute_activity(
+                "recall_context",
+                args=[subtask["task_id"], "worker_brief", None, None, subtask_id],
+                start_to_close_timeout=SHORT, retry_policy=MEMORY_RETRY,
+            )
+            self._warnings.extend(self._context.get("warnings", []))
+        except Exception:  # noqa: BLE001 - §11: memory outage degrades, never fails
+            workflow.logger.warning("context recall failed for subtask %s", subtask_id)
+            self._warnings.append("memory recall failed; continuing without external context")
+
         self._status = "routing"
         self._route = await workflow.execute_activity(
             "route_subtask", subtask_id,
@@ -145,6 +175,7 @@ class SubtaskWorkflow:
             start_to_close_timeout=WORKER_TIMEOUT, retry_policy=WORKER_RETRY,
         )
         self._status = result.get("status", "unknown")
+        result["warnings"] = self._warnings
 
         # Mirroring to Linear is best effort: the ledger already has the truth,
         # and a tracker outage must not fail the subtask.

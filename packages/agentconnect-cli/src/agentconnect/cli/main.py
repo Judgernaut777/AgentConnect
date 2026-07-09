@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agentconnect.core.bootstrap import service_from_env
+from agentconnect.core.context import PROFILES
 from agentconnect.core.errors import AgentConnectError
 from agentconnect.core.models import (
     ActorType,
@@ -264,17 +265,30 @@ def _cmd_memory_health(svc: AgentConnectService, a: argparse.Namespace) -> None:
     _emit(svc.memory_health())
 
 
+def _cmd_memory_pending(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit({"candidates": svc.list_pending_memory(a.limit)})
+
+
+def _cmd_memory_promote(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Human/librarian only. There is no MCP tool for this, on purpose."""
+    _emit(svc.promote_memory_candidate(a.candidate_id, a.by))
+
+
 def _cmd_tasks_context_pack(svc: AgentConnectService, a: argparse.Namespace) -> None:
     pack = svc.get_task_context_pack(
         a.task_id, profile=a.profile, max_memory_items=a.max_items, manager_id=a.manager
     )
     _emit({
         "task_id": pack.task_id, "profile": pack.profile,
-        "handoff": pack.handoff.model_dump(mode="json"),
+        "handoff": pack.handoff.model_dump(mode="json") if pack.handoff else None,
+        "backends_queried": pack.backends_queried,
         "memory": {
-            "backend": pack.memory.backend, "warnings": pack.memory.warnings,
+            "backend": pack.memory.backend, "warnings": pack.warnings,
             "items": [
-                {"text": i.text, "status": i.status, "confidence": i.confidence}
+                {"text": i.text, "status": i.status, "confidence": i.confidence,
+                 "source_id": i.source_id,
+                 "backend": (i.metadata or {}).get("backend"),
+                 "trusted": (i.metadata or {}).get("trusted", False)}
                 for i in pack.memory.items
             ],
         },
@@ -340,8 +354,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = tasks.add_parser("context-pack", help="handoff + labeled external memory")
     p.add_argument("task_id")
-    p.add_argument("--profile", default="manager_brief")
-    p.add_argument("--max-items", dest="max_items", type=int, default=8)
+    p.add_argument("--profile", default="manager_brief", choices=sorted(PROFILES))
+    p.add_argument("--max-items", dest="max_items", type=int, default=None)
     p.add_argument("--manager")
     p.set_defaults(func=_cmd_tasks_context_pack)
 
@@ -501,6 +515,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = memory.add_parser("health")
     p.set_defaults(func=_cmd_memory_health)
+
+    p = memory.add_parser("pending", help="candidates awaiting a human promotion decision")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=_cmd_memory_pending)
+
+    p = memory.add_parser(
+        "promote", help="promote a candidate to a trusted claim (human/librarian only)")
+    p.add_argument("candidate_id")
+    p.add_argument("--by", required=True, help="the human or librarian promoting it")
+    p.set_defaults(func=_cmd_memory_promote)
 
     # linear
     linear = top.add_parser("linear", help="Linear mirror").add_subparsers(

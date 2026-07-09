@@ -55,7 +55,8 @@ class BackplaneActivities:
             self.save_artifact, self.record_attempt, self.update_linear,
             self.load_review, self.complete_review, self.load_approval,
             self.notify_manager, self.recall_memory, self.capture_memory_candidate,
-            self.record_memory_feedback,
+            self.record_memory_feedback, self.load_subtask, self.recall_context,
+            self.index_promoted_memory,
         ]
 
     # ------------------------------------------------------------- decisions
@@ -149,6 +150,12 @@ class BackplaneActivities:
         ))
         return {"attempt_id": attempt.id}
 
+    @activity.defn(name="load_subtask")
+    async def load_subtask(self, subtask_id: str) -> dict[str, Any]:
+        subtask = self.service.get_subtask(subtask_id).subtask
+        return {"subtask_id": subtask.id, "task_id": subtask.parent_task_id,
+                "title": subtask.title, "status": subtask.status.value}
+
     @activity.defn(name="load_review")
     async def load_review(self, review_id: str) -> dict[str, Any]:
         return self.service.get_review(review_id).model_dump(mode="json")
@@ -226,6 +233,53 @@ class BackplaneActivities:
                 for i in pack.items
             ],
         }
+
+    @activity.defn(name="recall_context")
+    async def recall_context(
+        self, task_id: str, profile: str = "manager_brief", query: Optional[str] = None,
+        max_items: Optional[int] = None, subtask_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build a bounded context pack and, for a subtask, push it to the worker.
+
+        A worker harness usually has no MCP client, so it cannot *pull* context.
+        Attaching the pack to the subtask is how a bounded worker receives its
+        `worker_brief` — the push half of the read path.
+
+        Memory failure degrades the pack; it never fails the workflow (§11).
+        """
+        try:
+            pack = self.service.get_task_context_pack(
+                task_id, profile=profile, query=query, max_memory_items=max_items
+            )
+        except Exception as exc:
+            _log.warning("context recall failed for %s: %s", task_id, exc)
+            return {"task_id": task_id, "profile": profile, "items": [],
+                    "warnings": [f"context recall failed: {exc}"], "backends_queried": []}
+        if subtask_id:
+            try:
+                self.service.attach_context_to_subtask(subtask_id, pack)
+            except Exception as exc:
+                _log.warning("attaching context to %s failed: %s", subtask_id, exc)
+        return {
+            "task_id": task_id, "profile": pack.profile,
+            "backends_queried": pack.backends_queried, "warnings": pack.warnings,
+            "items": [
+                {"text": i.text, "status": i.status, "confidence": i.confidence,
+                 "source_id": i.source_id, "backend": (i.metadata or {}).get("backend"),
+                 "trusted": (i.metadata or {}).get("trusted", False)}
+                for i in pack.memory.items
+            ],
+        }
+
+    @activity.defn(name="index_promoted_memory")
+    async def index_promoted_memory(self, claim_id: str, promoted_by: str = "librarian") -> None:
+        """Fan a promoted claim out to the retrieval indexes. Human-gated upstream:
+        the claim only exists because a librarian promoted it."""
+        try:
+            self.service.promote_memory_candidate(claim_id, promoted_by)
+        except Exception as exc:
+            _log.warning("indexing promoted memory %s failed: %s", claim_id, exc)
+        return None
 
     @activity.defn(name="capture_memory_candidate")
     async def capture_memory_candidate(

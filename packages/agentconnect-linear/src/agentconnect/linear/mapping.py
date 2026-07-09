@@ -192,6 +192,24 @@ def subtask_comment(subtask: Subtask, withheld: bool = False) -> str:
     return body
 
 
+def memory_comment(kind: str, **detail: object) -> str:
+    """One line, never a backend dump (memory-stack §13).
+
+    Linear shows a human that *something happened to memory*; the pack itself
+    lives behind AgentConnect, where trust and scope are enforced.
+    """
+    if kind == "captured":
+        return "**Memory candidate captured** for review — not yet trusted."
+    if kind == "promoted":
+        return f"**Promoted memory:** {detail.get('text', '(claim)')}"
+    if kind == "conflict":
+        return (
+            f"**Potential contradiction detected** between promoted claims "
+            f"`{detail.get('a')}` and `{detail.get('b')}`."
+        )
+    return f"**Memory update:** {kind}"
+
+
 def approval_request_comment(subtask: Subtask, explanation: RouteExplanation) -> str:
     """§15 step 5: the human must see the price, the tier, and *why local lost*."""
     rejected = "\n".join(

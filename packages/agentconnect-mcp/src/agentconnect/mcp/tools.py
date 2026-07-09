@@ -141,17 +141,22 @@ def compact_subtask(subtask: Subtask, handle: Optional[Any] = None) -> dict[str,
 
 
 def compact_recall(pack: Any) -> dict[str, Any]:
-    """Bounded. A raw backend search dump must never reach a manager (§MCP)."""
+    """Bounded and *trust-labeled*. A raw backend search dump must never reach a
+    manager, and a Cognee hit must never look like a promoted claim."""
     return {
         "backend": pack.backend,
         "profile": pack.profile,
         "items": [
             {"text": _clip(i.text), "status": i.status, "confidence": i.confidence,
-             "source_id": i.source_id}
+             "source_id": i.source_id,
+             "backend": (i.metadata or {}).get("backend"),
+             "role": (i.metadata or {}).get("role"),
+             "trusted": (i.metadata or {}).get("trusted", False)}
             for i in pack.items
         ],
         "warnings": pack.warnings,
-        "note": "external recalled context — not ledger truth; verify before relying on it",
+        "note": "items with trusted=false are retrieval leads, not recorded facts; "
+                "only trusted=true items are promoted claims or ledger truth",
     }
 
 

@@ -349,8 +349,11 @@ def build_mcp_server(
             return _err(exc)
         return tools.dumps({
             "task_id": pack.task_id,
-            "handoff": tools.compact_handoff(pack.handoff),
+            "profile": pack.profile,
+            "handoff": tools.compact_handoff(pack.handoff) if pack.handoff else None,
             "memory": tools.compact_recall(pack.memory),
+            "backends_queried": pack.backends_queried,
+            "warnings": pack.warnings,
             "memory_is_external_context": pack.memory_is_external_context,
         })
 

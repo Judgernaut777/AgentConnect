@@ -1,0 +1,58 @@
+# Memory stack configuration (docs/BACKPLANE_SPEC_MEMORY_STACK.md §14).
+#
+#   AgentConnect controls access.  WikiBrain controls trust.
+#   Cognee improves breadth.       Graphiti improves temporal reasoning.
+#
+# Every backend is optional. With none enabled, AgentConnect still runs: context
+# packs contain task state only, and no workflow fails for want of memory.
+memory:
+  enabled: true
+
+  # The ONLY backend that can confer trust. Promotion happens here, by a human.
+  trusted_authority: wikibrain
+
+  backends:
+    wikibrain:
+      enabled: true
+      base_url: http://localhost:8787
+    cognee:
+      enabled: true
+      base_url: http://localhost:8001
+    graphiti:
+      enabled: true
+      base_url: http://localhost:8002
+
+  defaults:
+    trusted_only: true
+    include_pending: false
+    include_superseded: false
+    max_items: 8
+
+  # Hard preferences: they affect routing, privacy, cost, or safety, so they are
+  # policy rather than memory. They are never ranked away and never expire.
+  # Soft preferences (tone, formatting, "user likes tables") are deliberately
+  # NOT represented here — see §3 and §15.
+  hard_policies:
+    - "Repo-sensitive code must stay local."
+    - "Paid cloud execution requires explicit human approval."
+    - "Do not send secrets to external workers."
+
+  profiles:
+    manager_brief:
+      backends: [wikibrain, cognee, graphiti]
+      max_items: 8
+    worker_brief:
+      backends: [wikibrain, cognee]
+      max_items: 5
+    reviewer_brief:
+      backends: [wikibrain, graphiti]
+      max_items: 8
+    implementation_constraints:
+      backends: [wikibrain]
+      max_items: 6
+    model_performance:
+      backends: [wikibrain, graphiti]
+      max_items: 8
+    project_evolution:
+      backends: [wikibrain, graphiti]
+      max_items: 8

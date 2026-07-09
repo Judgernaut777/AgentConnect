@@ -128,6 +128,10 @@ class LinearSync:
             mapping.subtask_comment(subtask, mapping.is_withheld(detail)),
         )
 
+    def post_memory_update(self, task_id: str, kind: str, **detail: object) -> bool:
+        """Compact memory notice: captured / promoted / conflict. Never a dump."""
+        return self._comment(task_id, mapping.memory_comment(kind, **detail))
+
     def post_approval_request(self, subtask_id: str) -> bool:
         """§15 steps 4-5. Also re-syncs the issue so the `needs-approval` label lands."""
         subtask = self.service.get_subtask(subtask_id).subtask
