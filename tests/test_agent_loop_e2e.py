@@ -8,8 +8,15 @@ are real subprocesses, launched by the real `agentconnect shell`, that speak to
 the ledger only through the tools that survive environment sanitization. They are
 given no database handle, no backend credentials, and no arguments — everything
 they need arrives in the environment, the way a real Claude Code or Codex session
-receives it. WikiBrain is a real HTTP server on a real port, so the adapter's
-httpx path runs for once instead of a transport double.
+receives it.
+
+The one thing that *is* a double is WikiBrain. `_WikiBrainHandler` is a real HTTP
+server on a real port — so the adapter's httpx path runs for once, rather than a
+transport double — but it serves canned responses and never touches WikiBrain. Its
+job is to prove the wire works, not the ledger. Real WikiBrain semantics are pinned
+in `test_wikibrain_integration.py`, which drives `wiki.api` in-process through a
+transport shim. Neither test has both halves at once: nothing here exercises real
+WikiBrain over real HTTP, and nothing will until WikiBrain ships `wiki serve`.
 
 The twelve steps of the loop, in order:
 

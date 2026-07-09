@@ -1143,27 +1143,40 @@ class AgentConnectService:
             worker_id=worker_id, model_id=model_id,
         )
 
-    def prepare_worker_context(self, subtask_id: str) -> Optional[ContextPack]:
+    def prepare_worker_context(
+        self,
+        subtask_id: str,
+        *,
+        profile: str = "worker_brief",
+        query: Optional[str] = None,
+        max_memory_items: Optional[int] = None,
+    ) -> Optional[ContextPack]:
         """Build a `worker_brief` and push it onto the subtask before the worker runs.
 
-        Both execution backends call this, because a worker's memory must not
-        depend on which one is installed. `SubtaskWorkflow` reaches it through the
-        `recall_context` activity; `DirectExecutionBackend` calls it here. Without
-        the second, `pip install agentconnect-core` — the shipped default — gives
-        every worker an empty context and nothing says so.
+        This is the *only* path by which a subtask acquires context, because a
+        worker's memory must not depend on which execution backend is installed.
+        `DirectExecutionBackend` — the shipped default — calls it directly, and
+        `SubtaskWorkflow` reaches it through the `recall_context` activity. When
+        the activity built its own pack instead, the two paths could drift: a fix
+        to one silently left the other alone, and `pip install agentconnect-core`
+        gave every worker an empty context with nothing saying so.
 
         Memory failure degrades the subtask, it never fails it (§11).
         """
         subtask = self._require_subtask(subtask_id)
         try:
             pack = self.get_task_context_pack(
-                subtask.parent_task_id, profile="worker_brief"
+                subtask.parent_task_id, profile=profile, query=query,
+                max_memory_items=max_memory_items,
             )
-            self.attach_context_to_subtask(subtask_id, pack)
-            return pack
         except Exception as exc:  # noqa: BLE001 — a worker runs without memory
             _log.warning("worker context for %s failed: %s", subtask_id, exc)
             return None
+        try:
+            self.attach_context_to_subtask(subtask_id, pack)
+        except Exception as exc:  # noqa: BLE001 — the pack is still worth returning
+            _log.warning("attaching context to %s failed: %s", subtask_id, exc)
+        return pack
 
     def attach_context_to_subtask(self, subtask_id: str, pack: ContextPack) -> None:
         """Push a bounded pack down to a worker that cannot call MCP.
