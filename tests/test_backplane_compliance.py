@@ -12,6 +12,7 @@ environment variable is absent is to ask a child process to look for it.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -161,6 +162,76 @@ def test_launch_generates_only_agentconnect_md_for_an_unknown_harness(svc, task)
     result = svc.launch_session("some-new-agent", task_id=task.id)
     assert result["files"][0] == "AGENTCONNECT.md"
     assert "CLAUDE.md" not in result["files"] and "CODEX.md" not in result["files"]
+
+
+# ------------------------------------------------------------------- helpers
+# An agent whose harness has no MCP client records durable work *only* through
+# `bin/ac-*`. Nothing executed them until a manual dogfood run did, and both bugs
+# below had shipped: `ac-attempt` passed a flag the CLI does not have, and
+# `${@:2}` is a bashism that dies under dash. So run them for real, and check the
+# argv they produce against the real parser.
+
+def _run_helper(base, name, args, env_extra=None):
+    """Execute `bin/<name>` with a fake `agentconnect` that records its argv."""
+    fake_bin = base / "fakebin"
+    fake_bin.mkdir(exist_ok=True)
+    argv_file = base / "argv.json"
+    shim = fake_bin / "agentconnect"
+    shim.write_text(
+        f"#!{sys.executable}\nimport json,sys\n"
+        f"open({str(argv_file)!r},'w').write(json.dumps(sys.argv[1:]))\n"
+    )
+    shim.chmod(0o755)
+
+    env = {"PATH": f"{fake_bin}:/usr/bin:/bin", "AGENTCONNECT_TASK_ID": "task_1",
+           "AGENTCONNECT_MANAGER_ID": "claude", **(env_extra or {})}
+    proc = subprocess.run([str(base / "bin" / name), *args], env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, f"{name} failed: {proc.stderr}"
+    return json.loads(argv_file.read_text())
+
+
+@pytest.mark.parametrize("name,args,expected_head", [
+    ("ac-context", [], ["tasks", "context-pack", "task_1"]),
+    ("ac-context", ["task_9", "--profile", "worker_brief"],
+     ["tasks", "context-pack", "task_9", "--profile", "worker_brief"]),
+    ("ac-attempt", ["read session.py"],
+     ["attempts", "add", "task_1", "--actor", "claude", "--summary", "read session.py"]),
+    ("ac-audit", [], ["audit", "task_1"]),
+])
+def test_a_workspace_helper_calls_the_cli_the_way_the_cli_expects(
+        svc, task, name, args, expected_head):
+    """The argv a helper builds must parse under the *real* CLI parser. `ac-attempt`
+    sent `--by` where `attempts add` wants `--actor`, so every attempt an
+    MCP-less agent recorded failed — and the audit blamed the agent for it."""
+    from agentconnect.cli.main import build_parser
+
+    svc.launch_session("claude", task_id=task.id)
+    base = Path(svc.workspace_for(task_id=task.id).path)
+
+    argv = _run_helper(base, name, args)
+    assert argv == expected_head
+    build_parser().parse_args(argv)  # raises SystemExit if a flag is wrong
+
+
+def test_the_workspace_helpers_are_posix_sh_not_bash(svc, task):
+    """They carry a `#!/bin/sh` shebang. Where `/bin/sh` is dash — Debian, Ubuntu,
+    most containers — `${@:2}` is a fatal `Bad substitution`. Where it is bash, as
+    on the box these were written on, it works and the bug ships."""
+    svc.launch_session("claude", task_id=task.id)
+    base = Path(svc.workspace_for(task_id=task.id).path)
+
+    for name in ("ac-context", "ac-attempt", "ac-audit"):
+        body = (base / "bin" / name).read_text()
+        assert body.startswith("#!/bin/sh"), name
+        assert "${@:" not in body, f"{name} uses a bash-only array slice"
+
+    dash = shutil.which("dash")
+    if dash:  # the real check, when the real shell is available
+        for name in ("ac-context", "ac-attempt", "ac-audit"):
+            proc = subprocess.run([dash, "-n", str(base / "bin" / name)],
+                                  capture_output=True, text=True)
+            assert proc.returncode == 0, f"{name} is not POSIX sh: {proc.stderr}"
 
 
 def test_launch_creates_a_manager_session(svc, task):
@@ -575,6 +646,117 @@ def test_audit_fails_when_no_attempt_was_recorded(svc, task):
     assert not report.passed
     assert "No record_attempt was made during this session." in report.problems
     assert "Task cannot be marked complete." in report.render()
+
+
+# ------------------------------------------- the CLI is the hole the token isn't
+# `complete_task` is in no mode's action list, so MCP and HTTP deny it structurally.
+# The CLI never sees the token: contract rule 2 hands the agent `AGENTCONNECT_DB_PATH`
+# so its tools reach the operator's ledger, and the CLI opens that ledger directly.
+# A dogfood run watched an agent complete its own task from inside its own shell.
+
+def _cli_main(argv, svc, mode=None, monkeypatch=None):
+    from agentconnect.cli.main import main
+
+    if mode is None:
+        monkeypatch.delenv("AGENTCONNECT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("AGENTCONNECT_MODE", mode)
+    return main(argv, service=svc)
+
+
+def test_an_agent_shell_cannot_complete_its_own_task(svc, task, monkeypatch, capsys):
+    _work(svc, task)
+    svc.get_handoff_summary(task.id)
+    assert svc.audit_task(task.id).passed  # the evidence is all there
+
+    assert _cli_main(["complete", task.id], svc, mode="manager", monkeypatch=monkeypatch) == 2
+    assert "forbidden_action" in capsys.readouterr().err
+    assert svc.get_task(task.id).task.status is not TaskStatus.succeeded
+
+
+def test_the_operator_completes_the_same_task_outside_a_managed_session(svc, task, monkeypatch):
+    """The refusal is about *who is asking*, not about the evidence."""
+    _work(svc, task)
+    svc.get_handoff_summary(task.id)
+
+    assert _cli_main(["complete", task.id, "--by", "matthew"], svc, monkeypatch=monkeypatch) == 0
+    assert svc.get_task(task.id).task.status is TaskStatus.succeeded
+
+
+def test_an_agent_shell_cannot_promote_memory(svc, monkeypatch, capsys):
+    assert _cli_main(["memory", "promote", "candidate_1", "--by", "codex"],
+                     svc, mode="manager", monkeypatch=monkeypatch) == 2
+    assert "forbidden_action" in capsys.readouterr().err
+
+
+def test_a_reviewer_may_still_complete_its_own_review(svc, task, monkeypatch):
+    """Completing a review is a reviewer action; completing a task is not."""
+    artifact = svc.create_artifact(task.id, CreateArtifactRequest(
+        type=ArtifactType.patch, content="diff", created_by="claude"))
+    review = svc.request_review(task.id, ReviewRequest(
+        requested_by="claude", assigned_to="codex", artifact_refs=[artifact.id]))
+    svc.launch_session("codex", review_id=review.id, claim=True)
+    svc.record_attempt(task.id, RecordAttemptRequest(
+        actor_id="codex", actor_type=ActorType.manager, summary="read the diff"))
+
+    code = _cli_main(["complete", "--review", review.id, "--by", "codex", "--summary", "ok"],
+                     svc, mode="reviewer", monkeypatch=monkeypatch)
+    assert code == 0
+
+    # ...but a *manager* session may not use the same command to close a review.
+    review2 = svc.request_review(task.id, ReviewRequest(
+        requested_by="claude", assigned_to="codex", artifact_refs=[artifact.id]))
+    assert _cli_main(["complete", "--review", review2.id, "--by", "codex"],
+                     svc, mode="manager", monkeypatch=monkeypatch) == 2
+
+
+def test_agent_read_and_record_commands_stay_open_inside_a_session(svc, task, monkeypatch):
+    """The guard must not break the work the agent is *supposed* to do."""
+    svc.launch_session("codex", task_id=task.id, claim=True)
+    for argv in (["tasks", "context-pack", task.id],
+                 ["attempts", "add", task.id, "--actor", "codex", "--summary", "s"],
+                 ["audit", task.id]):
+        assert _cli_main(argv, svc, mode="manager", monkeypatch=monkeypatch) in (0, 2)
+    # `audit` may legitimately report FAIL (2); the others must succeed.
+    assert _cli_main(["tasks", "context-pack", task.id], svc,
+                     mode="manager", monkeypatch=monkeypatch) == 0
+
+
+def test_reviewing_a_task_does_not_make_it_uncompletable(svc, task, tmp_path):
+    """A reviewer's session and workspace both carry the parent `task_id`, and both
+    are created *after* the manager's. `latest_session(task_id=…)` therefore handed
+    back the reviewer's session, every attempt the manager had recorded now predated
+    it, and the audit reported that the agent recorded nothing. Requesting a review —
+    the ordinary path to completion — made a task impossible to complete.
+
+    Found by a manual dogfood run, not by the suite: every prior audit test reviews
+    through the service without ever launching a reviewer session.
+    """
+    source = git_repo(tmp_path / "src")
+    svc.launch_session("claude", task_id=task.id, claim=True, repo_source=str(source))
+    svc.record_attempt(task.id, RecordAttemptRequest(
+        actor_id="claude", actor_type=ActorType.manager, summary="did the work"))
+    svc.record_decision(task.id, RecordDecisionRequest(
+        made_by="claude", decision="Keep validation in session.py.", locked=True))
+    svc.create_artifact(task.id, CreateArtifactRequest(
+        type=ArtifactType.patch, content="diff", summary="rewrote auth.py",
+        created_by="claude", metadata={"files": ["auth.py"]}))
+    manager_workspace = svc.workspace_for(task_id=task.id)
+
+    review = svc.request_review(task.id, ReviewRequest(
+        requested_by="claude", assigned_to="reviewer-bot"))
+    svc.launch_session("reviewer-bot", review_id=review.id, claim=True)
+    svc.complete_review(review.id, ReviewResultRequest(
+        completed_by="reviewer-bot", summary="approved"))
+    svc.get_handoff_summary(task.id)
+
+    # The task's session and workspace are still the *manager's*, not the reviewer's.
+    assert svc.storage.latest_session(task_id=task.id).mode is SessionMode.manager
+    assert svc.workspace_for(task_id=task.id).id == manager_workspace.id
+    assert svc.workspace_for(review_id=review.id).review_id == review.id
+
+    report = svc.audit_task(task.id)
+    assert report.passed, report.problems
 
 
 def test_audit_fails_when_the_attempt_predates_the_session(svc, task):

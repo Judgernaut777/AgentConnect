@@ -183,6 +183,16 @@ def default_db_path() -> str:
     return str(Path.home() / ".agentconnect" / "agentconnect.db")
 
 
+def _scoped(column: str) -> str:
+    """Match an entity's own rows, not a child's that names it.
+
+    Sessions and workspaces created for a *review* store the parent `task_id` too.
+    Selecting on `task_id` alone therefore also selects the reviewer's rows, which
+    are newer — so `ORDER BY ... DESC LIMIT 1` returns the wrong one.
+    """
+    return f"{column}=?" + (" AND review_id IS NULL" if column == "task_id" else "")
+
+
 def _j(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -816,13 +826,18 @@ class SqliteStorage:
     def find_workspace(
         self, task_id: Optional[str] = None, review_id: Optional[str] = None
     ) -> Optional[Workspace]:
-        """The live workspace for an entity. A destroyed one never matches."""
+        """The live workspace for an entity. A destroyed one never matches.
+
+        A *review's* workspace also carries its parent `task_id`, and it is created
+        later — so a plain `task_id` match, newest first, hands back the reviewer's
+        empty checkout instead of the manager's worktree. `_scoped` excludes it.
+        """
         column, value = ("review_id", review_id) if review_id else ("task_id", task_id)
         if not value:
             return None
         with self._lock:
             row = self._conn.execute(
-                f"SELECT * FROM workspaces WHERE {column}=? AND destroyed_at IS NULL"
+                f"SELECT * FROM workspaces WHERE {_scoped(column)} AND destroyed_at IS NULL"
                 " ORDER BY created_at DESC LIMIT 1",
                 (value,),
             ).fetchone()
@@ -878,10 +893,18 @@ class SqliteStorage:
         self, task_id: Optional[str] = None, review_id: Optional[str] = None,
         statuses: Optional[tuple[str, ...]] = None,
     ) -> Optional[ManagerSession]:
+        """The newest session *on* an entity — never one that merely mentions it.
+
+        A reviewer's session stores the parent `task_id` alongside its `review_id`,
+        and it starts after the manager is done. Without `_scoped`, the task's
+        "current session" becomes the reviewer's, every attempt the manager
+        recorded now predates it, and `audit_task` reports that the agent recorded
+        nothing. Requesting a review would make a task uncompletable.
+        """
         column, value = ("review_id", review_id) if review_id else ("task_id", task_id)
         if not value:
             return None
-        sql = f"SELECT * FROM manager_sessions WHERE {column}=?"
+        sql = f"SELECT * FROM manager_sessions WHERE {_scoped(column)}"
         params: list[Any] = [value]
         if statuses:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
