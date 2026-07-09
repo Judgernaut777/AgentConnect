@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Callable, Optional
 
@@ -1142,6 +1143,28 @@ class AgentConnectService:
             worker_id=worker_id, model_id=model_id,
         )
 
+    def prepare_worker_context(self, subtask_id: str) -> Optional[ContextPack]:
+        """Build a `worker_brief` and push it onto the subtask before the worker runs.
+
+        Both execution backends call this, because a worker's memory must not
+        depend on which one is installed. `SubtaskWorkflow` reaches it through the
+        `recall_context` activity; `DirectExecutionBackend` calls it here. Without
+        the second, `pip install agentconnect-core` — the shipped default — gives
+        every worker an empty context and nothing says so.
+
+        Memory failure degrades the subtask, it never fails it (§11).
+        """
+        subtask = self._require_subtask(subtask_id)
+        try:
+            pack = self.get_task_context_pack(
+                subtask.parent_task_id, profile="worker_brief"
+            )
+            self.attach_context_to_subtask(subtask_id, pack)
+            return pack
+        except Exception as exc:  # noqa: BLE001 — a worker runs without memory
+            _log.warning("worker context for %s failed: %s", subtask_id, exc)
+            return None
+
     def attach_context_to_subtask(self, subtask_id: str, pack: ContextPack) -> None:
         """Push a bounded pack down to a worker that cannot call MCP.
 
@@ -1322,7 +1345,11 @@ class AgentConnectService:
         )
         files = self.workspaces.write_instructions(base, manager_id)
         self.workspaces.write_env_file(base, sessions_mod.render_env_file(env))
-        self.workspaces.write_mcp_config(base, resolved_api, env)
+        # The MCP server the agent spawns is an AgentConnect adapter: it must open
+        # the operator's ledger, not invent its own under $HOME.
+        self.workspaces.write_mcp_config(
+            base, resolved_api, {**env, **sessions_mod.forwarded_config(dict(os.environ))}
+        )
         metadata = {
             "workspace_id": workspace.id, "task_id": task_id, "review_id": review_id,
             "manager_id": manager_id, "repo_source": repo_source,

@@ -235,11 +235,17 @@ def audit_task(
         else "Durable changes were made but no decision was recorded.",
     ))
 
+    # Advisory, not blocking. The handoff is *derived*: a stale stored copy is a
+    # stale cache (Linear's issue body reads it), never lost work, and
+    # `complete_task` regenerates before it audits. Gating on it would fail a
+    # standalone `agentconnect audit` on a task where nothing is actually wrong.
     fresh = stored_handoff == handoff_text
     add(Check(
         "handoff_fresh", fresh,
         "Handoff summary fresh." if fresh
-        else "Handoff summary is stale; regenerate it before handing off.",
+        else "Handoff summary is stale; completion will regenerate it "
+             "(or run `agentconnect tasks handoff`).",
+        required=False,
     ))
 
     if linear_ref is None:

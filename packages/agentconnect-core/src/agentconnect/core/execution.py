@@ -114,6 +114,10 @@ class DirectExecutionBackend(ExecutionBackend):
 
     # ---------------------------------------------------------------- start
     def start_subtask(self, subtask_id: str) -> ExecutionHandle:
+        # Recall before routing, exactly as `SubtaskWorkflow` does: a bounded
+        # worker has no MCP client, so its context must be pushed onto the subtask
+        # before anything runs it.
+        self.service.prepare_worker_context(subtask_id)
         explanation = self.service.route_subtask(subtask_id)
         if explanation.needs_approval:
             return self._handle(

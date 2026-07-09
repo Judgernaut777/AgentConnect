@@ -10,7 +10,7 @@ what exists.**
 * `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
 * `docs/BACKPLANE_SPEC_COMPLIANCE.md` — easiest useful Level 4: launch, shell, audit
 
-Gate: `.venv/bin/python -m pytest -q` → **677 passed**, all offline.
+Gate: `.venv/bin/python -m pytest -q` → **684 passed**, all offline.
 
 ## The one rule
 
@@ -214,13 +214,29 @@ shell revokes it, so a leaked `.env.agentconnect` is inert.
 environment, and every MCP tool falls back to them. An agent that cannot mistype an
 id cannot record its work against the wrong task.
 
+*The agent's own tools must reach the operator's ledger.* `FORWARDED_CONFIG_VARS`
+(`AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`, `AGENTCONNECT_MEMORY_CONFIG`,
+…) survive sanitization and are written into `.mcp.json`. They are paths and knobs,
+not credentials: they grant no cloud spend, no model access, no backend write
+token. Without them the `agentconnect` CLI — the very interface `CODEX.md` tells
+the agent to use — falls back to `~/.agentconnect/agentconnect.db` and silently
+writes into a second ledger nobody reads, after which the audit blames the agent
+for recording nothing.
+
+*Worker context does not depend on the execution backend.*
+`service.prepare_worker_context` pushes the `worker_brief` onto the subtask before
+anything runs it. `SubtaskWorkflow` reaches it through the `recall_context`
+activity; `DirectExecutionBackend` — the shipped default — calls it directly.
+
 *Audit is the teeth.* `agentconnect audit task_123` asks one question several ways:
 *you did something — where is it in the ledger?* It checks the workspace, the
 session, the claim, an attempt recorded during **this** session, changed files
 registered as artifacts (structurally via `metadata["files"]`, or named in an
 artifact summary), resolved subtasks, completed reviews, a decision behind any
-durable change, a fresh handoff, Linear agreement, and status consistency. Memory
-capture is *advisory* — it warns, it never blocks, because memory is optional.
+durable change, Linear agreement, and status consistency. Memory capture and
+handoff freshness are *advisory* — they warn, they never block. Memory is optional;
+and the handoff is derived, so a stale stored copy is a stale cache, never lost
+work, and `complete_task` regenerates it before auditing anyway.
 
 The audit **writes nothing**. That is load-bearing: `get_handoff_summary` persists
 the summary as a side effect, so auditing through it would repair the staleness it

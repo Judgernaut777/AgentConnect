@@ -36,7 +36,12 @@ from agentconnect.core import (
     TaskStatus,
 )
 from agentconnect.core.errors import Conflict, PolicyViolation
-from agentconnect.core.sessions import SECRET_DENYLIST, mint_token, sanitize_env
+from agentconnect.core.sessions import (
+    SECRET_DENYLIST,
+    is_secretish,
+    mint_token,
+    sanitize_env,
+)
 from agentconnect.core.workspace import DENIED_MCP_TOOLS, EXPOSED_MCP_TOOLS
 
 CLI = [sys.executable, "-c",
@@ -672,24 +677,27 @@ def test_audit_fails_when_durable_work_has_no_recorded_decision(svc, task):
     assert "Durable changes were made but no decision was recorded." in report.problems
 
 
-def test_audit_fails_when_the_handoff_is_stale(svc, task):
+def test_a_stale_handoff_warns_but_does_not_block(svc, task):
+    """The handoff is derived. A stale stored copy is a stale cache, never lost
+    work, and `complete_task` regenerates before auditing."""
     _work(svc, task)
     report = svc.audit_task(task.id)
-    assert "Handoff summary is stale; regenerate it before handing off." in report.problems
+    assert report.passed
+    assert any("Handoff summary is stale" in w for w in report.warnings)
 
     # The audit must not have repaired what it reported: it is read-only, so a
     # second run says exactly the same thing.
-    assert svc.audit_task(task.id).problems == report.problems
+    assert svc.audit_task(task.id).warnings == report.warnings
 
     svc.get_handoff_summary(task.id)  # what a departing manager does
-    assert svc.audit_task(task.id).passed
+    assert not any("stale" in w for w in svc.audit_task(task.id).warnings)
 
 
 def test_complete_regenerates_the_handoff_before_auditing(svc, task):
     """A manager who did the work but never re-read the handoff is not punished;
     completing the task is what makes the handoff current."""
     _work(svc, task)
-    assert not svc.audit_task(task.id).passed  # stale handoff
+    assert any("stale" in w for w in svc.audit_task(task.id).warnings)
 
     result = svc.complete_task(task.id, "claude")
     assert result["status"] == "succeeded"
@@ -992,3 +1000,78 @@ def test_api_completing_twice_is_a_conflict(client, svc, task):
     assert client.post(f"/tasks/{task.id}/complete", json={}).status_code == 200
     again = client.post(f"/tasks/{task.id}/complete", json={})
     assert again.status_code == 409 and again.json()["error"] == "conflict"
+
+
+# ================================= 11. what the agent's own tools need to work
+def test_sanitize_env_forwards_the_ledger_pointers_but_no_credentials():
+    """`CODEX.md` tells the agent to run `agentconnect ...`. Without these the CLI
+    falls back to `~/.agentconnect/agentconnect.db` and silently writes its
+    attempts into a second ledger nobody reads — and the audit then blames the
+    agent for recording nothing."""
+    from agentconnect.core.sessions import FORWARDED_CONFIG_VARS, forwarded_config
+
+    dirty = {
+        "PATH": "/usr/bin",
+        "AGENTCONNECT_DB_PATH": "/srv/ledger.db",
+        "AGENTCONNECT_ARTIFACT_DIR": "/srv/artifacts",
+        "AGENTCONNECT_MEMORY_CONFIG": "/srv/memory.yaml",
+        "ANTHROPIC_API_KEY": "sk-real",
+        "WIKIBRAIN_ADMIN_TOKEN": "wb-admin",
+    }
+    clean = sanitize_env(dirty, {"AGENTCONNECT_TASK_ID": "task_1"})
+
+    assert clean["AGENTCONNECT_DB_PATH"] == "/srv/ledger.db"
+    assert clean["AGENTCONNECT_ARTIFACT_DIR"] == "/srv/artifacts"
+    assert clean["AGENTCONNECT_MEMORY_CONFIG"] == "/srv/memory.yaml"
+    # Paths and knobs, never credentials.
+    assert "ANTHROPIC_API_KEY" not in clean and "WIKIBRAIN_ADMIN_TOKEN" not in clean
+    assert not any(is_secretish(name) for name in FORWARDED_CONFIG_VARS)
+    assert forwarded_config({"PATH": "/usr/bin"}) == {}  # unset stays unset
+
+
+def test_the_injected_mcp_config_points_at_the_operators_ledger(svc, task, monkeypatch):
+    monkeypatch.setenv("AGENTCONNECT_DB_PATH", "/srv/ledger.db")
+    result = svc.launch_session("claude", task_id=task.id)
+    config = json.loads((Path(result["workspace"].path) / ".mcp.json").read_text())
+
+    server_env = config["mcpServers"]["agentconnect"]["env"]
+    assert server_env["AGENTCONNECT_DB_PATH"] == "/srv/ledger.db"
+    assert server_env["AGENTCONNECT_TASK_ID"] == task.id
+    assert all(k.startswith("AGENTCONNECT_") for k in server_env)
+
+
+def test_the_default_execution_backend_pushes_the_worker_brief(tmp_path):
+    """A worker's memory must not depend on which execution backend is installed.
+    `DirectExecutionBackend` is the shipped default; without this, every worker ran
+    with empty context and nothing said so."""
+    from agentconnect.core import MemoryConfig, MemoryItem
+
+    svc = AgentConnectService.create(
+        db_path=":memory:", artifact_dir=str(tmp_path / "a"), workers=[EchoWorker()],
+        memory=StaticMemoryAdapter([MemoryItem(
+            text="expiry", status="promoted", confidence="verified", source_id="claim_1")]),
+        memory_config=MemoryConfig(),
+    )
+    task = svc.create_task(CreateTaskRequest(title="expiry", goal=""))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    pack = svc.get_subtask(subtask.id).subtask.metadata["context_pack"]
+    assert pack["profile"] == "worker_brief"
+    assert pack["memory_is_external_context"] is True
+    assert [i["source_id"] for i in pack["items"]] == ["claim_1"]
+    # And it was pushed *before* the worker ran, not after.
+    assert subtask.status.value == "succeeded"
+
+
+def test_a_broken_memory_backend_does_not_stop_the_default_backend(tmp_path):
+    class Exploding(StaticMemoryAdapter):
+        def recall(self, request):
+            raise ConnectionError("wikibrain is down")
+
+    svc = AgentConnectService.create(
+        db_path=":memory:", artifact_dir=str(tmp_path / "a"), workers=[EchoWorker()],
+        memory=Exploding([]),
+    )
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+    assert subtask.status.value == "succeeded" and subtask.result_artifact_id

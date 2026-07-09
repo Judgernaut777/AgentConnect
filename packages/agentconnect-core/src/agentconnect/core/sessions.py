@@ -107,8 +107,28 @@ SESSION_VARS: tuple[str, ...] = (
     "AGENTCONNECT_SESSION_TOKEN", "AGENTCONNECT_MODE",
 )
 
+#: Where the *operator's* ledger lives. Without these an agent's `agentconnect`
+#: CLI — the very interface CODEX.md tells it to use — falls back to the default
+#: `~/.agentconnect/agentconnect.db`, silently creating a second ledger. Its
+#: attempts and decisions land somewhere nobody reads, and the audit then blames
+#: the agent for recording nothing.
+#:
+#: These are paths and knobs, not credentials. They grant no cloud spend, no model
+#: access, and no backend write token. They grant exactly what an AgentConnect
+#: adapter needs to *be* an AgentConnect adapter.
+FORWARDED_CONFIG_VARS: tuple[str, ...] = (
+    "AGENTCONNECT_DB_PATH", "AGENTCONNECT_ARTIFACT_DIR", "AGENTCONNECT_WORKSPACE_DIR",
+    "AGENTCONNECT_MEMORY_CONFIG", "AGENTCONNECT_WORKERS", "AGENTCONNECT_MAX_COST_USD",
+    "AGENTCONNECT_API_HOST", "AGENTCONNECT_API_PORT",
+)
+
 #: Opt-in extras, comma separated: `AGENTCONNECT_SHELL_ALLOW_ENV=NVM_DIR,PYENV_ROOT`.
 ALLOW_ENV_VAR = "AGENTCONNECT_SHELL_ALLOW_ENV"
+
+
+def forwarded_config(environ: dict[str, str]) -> dict[str, str]:
+    """The subset of `FORWARDED_CONFIG_VARS` this box actually sets."""
+    return {name: environ[name] for name in FORWARDED_CONFIG_VARS if environ.get(name)}
 
 
 def is_secretish(name: str) -> bool:
@@ -149,6 +169,8 @@ def sanitize_env(
         allowed.add(name)
 
     clean = {k: v for k, v in environ.items() if k in allowed and not is_secretish(k)}
+    # Point the agent's own AgentConnect tools at the operator's ledger.
+    clean.update(forwarded_config(environ))
     # The session's own vars are the point of the exercise; they are added last so
     # nothing in the ambient environment can shadow them.
     clean.update({k: v for k, v in session_env.items() if v})
