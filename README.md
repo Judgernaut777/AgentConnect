@@ -2,56 +2,146 @@
 
 > **Part of the [Fascia](https://github.com/Judgernaut777/Fascia-AI-OS) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) and a shared **guard** ([fascia-guard](https://github.com/Judgernaut777/fascia-guard)) into one self-hosted, privacy-first agent stack.
 
-A two-service agent infrastructure: Claude Code (or any agent) hands tasks off over MCP; a deterministic router classifies each task, keeps sensitive context out of the wrong models, routes to local GPU / free / paid cloud, and returns compact summaries + artifact references instead of flooding context. Runs end-to-end with no GPU (built-in stub); plug in one model server for real output.
+AgentConnect is a persistent **task, artifact, decision, review, routing, and handoff
+backplane** for interchangeable coding agents and workers. Work done by an agent enters a
+ledger; a deterministic router places bounded subtasks on the right worker; an audit
+decides whether the work is actually finished.
 
 Suggested topics/tags: mcp · claude · llm-routing · agent-infrastructure · local-llm · vllm · ollama · mtls · privacy
 
-**TL;DR** — Give **Claude Code** (or any agent) a set of MCP tools that hand tasks
-off to a control plane. It classifies each task, keeps sensitive context out of
-the wrong models, and routes to the cheapest capable model — your local GPU, a
-free cloud tier, or paid cloud — then returns a **compact summary + artifact
-references** instead of dumping everything back into context. Runs end-to-end
-**today with no GPU** (a built-in stub model); plug in one model server for real
-output.
+> Agents may think and work inside their own harness. But durable work must enter
+> AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
 
-## Get set up (≈2 minutes, no GPU)
+## Current stable path: the managed coding-agent loop
+
+If you are installing AgentConnect to run a coding agent — Codex, Claude Code, or
+anything else — **start with [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).** It walks
+the whole loop with the exact commands, and its failure-modes section lists what actually
+goes wrong.
+
+The short version:
 
 ```bash
 git clone <this-repo> && cd mcp-agentconnect
 python -m venv .venv && source .venv/bin/activate
+
+# The CLI is required. Core alone gives you the library, not the command.
+pip install -e packages/agentconnect-core -e packages/agentconnect-cli
+
+export AGENTCONNECT_DB_PATH=/srv/agentconnect/agentconnect.db
+agentconnect --help          # must work, and must be on PATH inside the agent's shell
+```
+
+Then:
+
+```bash
+agentconnect tasks create --title "…" --goal "…" --by you   # 1. create a task
+agentconnect launch codex --task "$TASK" --claim --repo .   # 2. workspace, claim, scoped token
+agentconnect shell --task "$TASK" -- <agent-command>        # 3. the agent runs here
+#    inside, the agent records its work:
+#      agentconnect tasks context-pack "$AGENTCONNECT_TASK_ID"
+#      agentconnect attempts add   … --actor "$AGENTCONNECT_MANAGER_ID" --summary "…"
+#      agentconnect decisions add  … --decision "…"
+#      agentconnect subtasks submit … --instructions "…"
+agentconnect audit "$TASK"                                  # 4. where is it in the ledger?
+agentconnect complete "$TASK" --by you                      # 5. operator only
+```
+
+`agentconnect launch` prepares a workspace, a git worktree, generated agent instructions,
+and a short-lived scoped session token. `agentconnect shell` runs the agent in a sanitized
+environment. The audit reads the ledger without writing to it. Completion updates
+AgentConnect first, and only then any tracker.
+
+**Installing only `agentconnect-core`, `agentconnect-router`, and
+`agentconnect-model-manager` is not enough for this loop** — you will not have the
+`agentconnect` command. Install `agentconnect-cli`.
+
+## Trust boundary
+
+**AgentConnect is not a sandbox.** It is a compliance and control layer. It makes
+AgentConnect the normal path and makes bypasses visible; it does not contain a hostile
+process. `AGENTCONNECT_DB_PATH` is forwarded into the agent's environment on purpose (so
+the agent's tools reach the operator's ledger rather than a private fallback), backend
+credentials never are, and `AGENTCONNECT_MODE` restricts what the CLI will do inside a
+managed session. Direct SQLite, filesystem, and environment tampering are out of scope
+and would need OS-level isolation.
+
+The full boundary — what the layer buys you and what it explicitly does not — is at the
+top of [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
+
+## Current checkpoint
+
+See **[docs/STATUS.md](docs/STATUS.md)** for the verified checkpoint, the gate count, and
+an honest account of what the test suite does *not* prove.
+
+The dogfood run behind the current checkpoint validated the managed-agent loop using
+`DirectExecutionBackend`, with **no Temporal, no Linear, and no configured external memory
+backends**. Adapters for WikiBrain, Cognee, and Graphiti exist and are exercised against
+transport doubles and in-process semantics; no real service has answered over the network.
+
+## Packages
+
+Independently-installable packages in one repo (a PEP 420 namespace, so every import path
+stays `agentconnect.*`):
+
+| Package | Role |
+|---|---|
+| `agentconnect-core` | The ledger, service layer, audit, workspace, sessions. Required. |
+| `agentconnect-cli` | The `agentconnect` command. **Required for the managed loop.** |
+| `agentconnect-mcp` | MCP adapter — the tools a managed agent sees. |
+| `agentconnect-api` | HTTP adapter. |
+| `agentconnect-linear` | Linear mirror (optional). |
+| `agentconnect-temporal` | Durable execution backend (optional). |
+| `agentconnect-router` | Advanced: deterministic model/worker routing control plane. |
+| `agentconnect-model-manager` | Advanced: local inference appliance. |
+| `agentconnect-runtime` | Advanced: LangGraph act/tool worker runtime. |
+
+## Optional integrations
+
+None of these is required, and none is configured by default. Linear (tracker mirror),
+Temporal (durable workflows), WikiBrain (trusted memory authority), Cognee (broad
+retrieval), Graphiti (temporal graph), and a local model manager. `wiki serve` — real
+WikiBrain over real HTTP — is deferred and belongs to the WikiBrain repository.
+
+---
+
+# Advanced: the routing / model-manager stack
+
+Everything below documents the deterministic **router** and **local model manager**: a
+two-service path where an agent hands tasks off over MCP, a router classifies each task,
+keeps sensitive context out of the wrong models, routes to local GPU / free / paid cloud,
+and returns compact summaries plus artifact references. It runs with no GPU (a built-in
+stub model); plug in one model server for real output.
+
+This stack is orthogonal to the managed coding-agent loop above. If you only want to run
+a coding agent under AgentConnect, you do not need any of it.
+
+## Try the router (no GPU)
+
+```bash
 pip install -e packages/agentconnect-core \
             -e packages/agentconnect-router \
             -e packages/agentconnect-model-manager \
             -e packages/agentconnect-runtime
-pytest -q          # 333 passing, fully offline — confirms the install works
-```
+pytest -q                           # fully offline; see docs/STATUS.md for the gate count
 
-That installs the `agentconnect-router` command. You're done — nothing else is
-required to try it.
-
-## Use it
-
-**1. See it work — no config, no GPU:**
-
-```bash
 python examples/demo.py             # submit tasks; watch classify → route → summarize
 python examples/federation_demo.py  # a friend's box drains a shared queue, privacy enforced
 ```
 
-**2. Wire it into Claude Code** — add to your `.mcp.json`:
+Wire the router into Claude Code by adding to your `.mcp.json`:
 
 ```json
 { "mcpServers": { "agentconnect": { "command": "agentconnect-router" } } }
 ```
 
-Claude Code now has tools like `submit_task`, `queue_add`, and
-`read_artifact_chunk` ([full list below](#mcp-tools-23)). Out of the box, tasks
-route to a **built-in stub model** (deterministic echo), so the entire pipeline
-works with zero infrastructure.
+Claude Code now has tools like `submit_task`, `queue_add`, and `read_artifact_chunk`
+([full list below](#mcp-tools-23)). Out of the box, tasks route to a **built-in stub
+model** (deterministic echo), so the pipeline works with zero infrastructure.
 
-**3. Get real model output** — point the Model Manager at any OpenAI-compatible
-server (Ollama, vLLM, llama.cpp, SGLang). On a single box the Router embeds the
-manager, so no TLS/second process is needed:
+**Get real model output** — point the Model Manager at any OpenAI-compatible server
+(Ollama, vLLM, llama.cpp, SGLang). On a single box the Router embeds the manager, so no
+TLS/second process is needed:
 
 ```bash
 export MODEL_MANAGER_BACKEND=openai
@@ -59,10 +149,9 @@ export MODEL_BACKEND_URL=http://localhost:11434/v1   # e.g. Ollama
 agentconnect-router
 ```
 
-That model server is the **only** external thing you supply. Free/paid cloud
-providers, a separate GPU box over mutual TLS, and remote-worker dispatch are all
-optional — see [Production](#production-two-machines-over-mutual-tls) and the
-sections below.
+That model server is the **only** external thing you supply. Free/paid cloud providers, a
+separate GPU box over mutual TLS, and remote-worker dispatch are all optional — see
+[Production](#production-two-machines-over-mutual-tls) and the sections below.
 
 ---
 
@@ -125,8 +214,7 @@ allowed) or queue the work.
 
 ## Repository layout
 
-Four independently-installable packages in one repo (a PEP 420 namespace, so
-every import path stays `agentconnect.*`):
+The routing-stack packages (see [Packages](#packages) above for the full set):
 
 ```
 config/                      # policy & registry (edit these, not code)
@@ -145,7 +233,7 @@ packages/
   agentconnect-runtime/      # worker runtime — LangGraph act/tool execution loop
     …/runtime/{agent,graph,tools,workspace,prompts,state,results,transport}.py
 
-tests/                       # 333 unit + e2e tests, run offline (stub backend + mTLS)
+tests/                       # unit + e2e tests, run offline (stub backend + mTLS)
 examples/demo.py             # end-to-end router walkthrough, no GPU required
 examples/federation_demo.py  # federated work queue: friend contributes compute, privacy enforced
 docs/ARCHITECTURE.md         # detailed design notes + section map
@@ -431,7 +519,7 @@ A **global spend budget** with even-burn pacing and a **direct-to-user spend
 authorizer** (mandatory budget, per-charge confirmation — money never rides on the
 agent) sit on top of all six phases.
 
-**All six phases implemented end-to-end (offline, tested — 333 tests):** the
+**All six phases implemented end-to-end (offline, tested):** the
 deterministic router (Phases 1 & 5), shared memory + context virtualization
 (Phase 2), residency + **real concurrency admission** (Phase 3), the provider
 gateway + secrets + quota ledger + privacy/redaction (Phase 4), and
