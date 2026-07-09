@@ -105,6 +105,18 @@ sentence three times never outranks a librarian promoting it once. Ledger truth
 memory live in one ranked list but are never confused: `memory_is_external_context`
 rides on every pack.
 
+> ### ⚠️ Only the trusted authority enforces `trusted_only`
+>
+> Retrieval backends such as Cognee and Graphiti may return untrusted breadth.
+> AgentConnect labels, ranks, and filters those results **after** retrieval.
+> Passing `trusted_only` directly to non-authoritative retrieval engines is
+> **incorrect**: they have no notion of promotion, so the flag silently erases
+> breadth and produces falsely reassuring empty context. This is deliberate, not
+> an oversight — do not "clean it up" into a bug.
+>
+> Enforced by `ContextBuilder` (`is_authority and not include_pending`) and pinned
+> by `test_trusted_only_is_never_pushed_down_to_a_retrieval_engine`.
+
 Write path: agent → `capture_memory_candidate` → **pending** in WikiBrain →
 human/librarian `promote_memory_candidate` → promoted claim → fanned out to
 Cognee and Graphiti. Capture **never promotes** — a backend that claims it did is

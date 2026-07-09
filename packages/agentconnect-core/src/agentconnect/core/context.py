@@ -71,7 +71,9 @@ PROFILES: dict[str, ProfileConfig] = {
     "implementation_constraints": ProfileConfig([WIKIBRAIN], 6, include_handoff=False),
     "known_failures": ProfileConfig([WIKIBRAIN, GRAPHITI], 8),
     "model_performance": ProfileConfig([WIKIBRAIN, GRAPHITI], 8, include_handoff=False),
-    "project_evolution": ProfileConfig([WIKIBRAIN, GRAPHITI], 8, include_superseded=True),
+    # Roomier than the rest: superseded claims rank last, so at a budget of 8 the
+    # ledger and the live claims would crowd out the very history this asks for.
+    "project_evolution": ProfileConfig([WIKIBRAIN, GRAPHITI], 10, include_superseded=True),
     "broad_project_rag": ProfileConfig([COGNEE], 8, include_handoff=False),
     "hard_policy": ProfileConfig([WIKIBRAIN], 6, include_handoff=False),
 }
