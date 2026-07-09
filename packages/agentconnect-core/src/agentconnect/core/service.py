@@ -23,14 +23,18 @@ from . import ids
 from . import memory as memory_mod
 from . import reviews as reviews_policy
 from . import subtasks as subtasks_policy
+from .context import ContextBuilder, ContextPack, MemoryConfig
 from .memory import (
+    TRUSTED_AUTHORITY,
     CaptureRequest,
     CaptureResult,
+    IndexingMemoryAdapter,
     MemoryAdapter,
     MemoryFeedbackRequest,
     NoopMemoryAdapter,
     RecallPack,
     RecallRequest,
+    TrustedMemoryAdapter,
 )
 from .artifacts import FilesystemArtifactStore
 from .errors import Conflict, InvalidRequest, NotFound
@@ -84,20 +88,9 @@ _log = logging.getLogger(__name__)
 DEFAULT_CLAIM_TTL_SECONDS = 3600
 
 
-class TaskContextPack(BaseModel):
-    """What a manager reads to pick up work: ledger truth + external context.
-
-    ``memory_is_external_context`` is not decoration. It is the contract that
-    stops a recalled hint from being mistaken for a recorded decision.
-    """
-
-    model_config = {"arbitrary_types_allowed": True}
-
-    task_id: str
-    profile: str
-    handoff: "HandoffSummary"
-    memory: RecallPack
-    memory_is_external_context: bool = True
+#: `ContextPack` is defined in `core.context`; re-exported here because it is the
+#: return type of a service method and callers should not need two imports.
+TaskContextPack = ContextPack
 
 #: Which statuses each transition is allowed to leave. Anything else is a no-op,
 #: so a running subtask never clears a `needs_review` task and a terminal task is
@@ -122,6 +115,8 @@ class AgentConnectService:
         clock: Callable[[], float] = time.time,
         execution: Optional[ExecutionBackend] = None,
         memory: Optional[MemoryAdapter] = None,
+        memory_backends: Optional[dict[str, MemoryAdapter]] = None,
+        memory_config: Optional[MemoryConfig] = None,
     ) -> None:
         self.storage = storage
         self.artifacts = artifact_store
@@ -129,7 +124,22 @@ class AgentConnectService:
         self.policy = policy or RoutePolicy()
         self._clock = clock
         # Memory off by default: the backplane is a task ledger, not a brain.
-        self.memory: MemoryAdapter = memory or NoopMemoryAdapter()
+        self.memory_config = memory_config or MemoryConfig()
+        self.memory_backends: dict[str, MemoryAdapter] = dict(memory_backends or {})
+        if not self.memory_backends and memory is not None:
+            self.memory_backends = {memory.backend_name: memory}
+        # The single-adapter path (`recall_memory`, `capture_memory_candidate`)
+        # answers from the trusted authority whenever one is configured, so a
+        # bare recall never returns a search hit dressed up as a claim.
+        self.memory: MemoryAdapter = (
+            memory
+            or self.memory_backends.get(self.memory_config.trusted_authority)
+            or next(iter(self.memory_backends.values()), None)
+            or NoopMemoryAdapter()
+        )
+        self.context_builder = ContextBuilder(
+            self, self.memory_backends, self.memory_config
+        )
         # Default to inline execution so `pip install agentconnect-core` is a
         # working backplane with no workflow server. Adapters that want
         # durability call `bind_execution(TemporalExecutionBackend(...))`.
@@ -139,7 +149,29 @@ class AgentConnectService:
         self.execution = backend
 
     def bind_memory(self, adapter: MemoryAdapter) -> None:
+        """Single-backend convenience. Prefer `bind_memory_stack` for the real stack."""
         self.memory = adapter
+        self.bind_memory_stack({adapter.backend_name: adapter}, self.memory_config)
+
+    def bind_memory_stack(
+        self, adapters: dict[str, MemoryAdapter], config: Optional[MemoryConfig] = None
+    ) -> None:
+        """Bind WikiBrain + Cognee + Graphiti (or any subset — each is optional)."""
+        self.memory_backends = dict(adapters)
+        if config is not None:
+            self.memory_config = config
+        authority = self.memory_config.trusted_authority
+        # `self.memory` remains the single-adapter recall path; point it at the
+        # trusted authority when one is present, so a bare `recall_memory` call
+        # never accidentally answers from a retrieval engine.
+        self.memory = adapters.get(authority) or next(
+            iter(adapters.values()), NoopMemoryAdapter()
+        )
+        self.context_builder = ContextBuilder(self, self.memory_backends, self.memory_config)
+
+    def trusted_authority(self) -> Optional[TrustedMemoryAdapter]:
+        adapter = self.memory_backends.get(self.memory_config.trusted_authority)
+        return adapter if isinstance(adapter, TrustedMemoryAdapter) else None
 
     @classmethod
     def create(
@@ -151,6 +183,8 @@ class AgentConnectService:
         clock: Callable[[], float] = time.time,
         execution: Optional[ExecutionBackend] = None,
         memory: Optional[MemoryAdapter] = None,
+        memory_backends: Optional[dict[str, MemoryAdapter]] = None,
+        memory_config: Optional[MemoryConfig] = None,
     ) -> "AgentConnectService":
         return cls(
             storage=SqliteStorage(db_path or default_db_path()),
@@ -160,6 +194,8 @@ class AgentConnectService:
             clock=clock,
             execution=execution,
             memory=memory,
+            memory_backends=memory_backends,
+            memory_config=memory_config,
         )
 
     # ------------------------------------------------------------ internals
@@ -1036,36 +1072,115 @@ class AgentConnectService:
             _log.warning("memory backend %r feedback failed: %s", self.memory.backend_name, exc)
 
     def memory_health(self) -> dict[str, Any]:
-        try:
-            return self.memory.health()
-        except Exception as exc:
-            return {"backend": self.memory.backend_name, "status": "unreachable",
-                    "detail": str(exc)}
+        """Health of every configured backend, plus which one confers trust."""
+        backends: dict[str, Any] = {}
+        for name, adapter in self.memory_backends.items():
+            try:
+                backends[name] = adapter.health()
+            except Exception as exc:
+                backends[name] = {"backend": name, "status": "unreachable", "detail": str(exc)}
+        if not backends:
+            try:
+                return self.memory.health()
+            except Exception as exc:
+                return {"backend": self.memory.backend_name, "status": "unreachable",
+                        "detail": str(exc)}
+        primary = backends.get(self.memory_config.trusted_authority)
+        return {
+            "backend": self.memory.backend_name,
+            "status": (primary or next(iter(backends.values()))).get("status", "unknown"),
+            "trusted_authority": self.memory_config.trusted_authority,
+            "enabled": self.memory_config.enabled,
+            "backends": backends,
+        }
 
     def get_task_context_pack(
         self,
         task_id: str,
         profile: str = "manager_brief",
-        max_memory_items: int = memory_mod.DEFAULT_MAX_ITEMS,
+        max_memory_items: Optional[int] = None,
         query: Optional[str] = None,
         manager_id: Optional[str] = None,
         include_pending: bool = False,
-    ) -> "TaskContextPack":
-        """Ledger truth plus clearly-labeled external recalled context.
+    ) -> ContextPack:
+        """The one way a manager or worker gets context (memory-stack §5).
 
-        The two are never merged into one list: a locked decision is law, a
-        recalled memory item is a hint that may be stale or wrong.
+        Ledger truth and recalled memory are never merged into one list: a locked
+        decision is law, a Cognee hit is a lead. The `ContextBuilder` bounds,
+        dedupes, orders by authority, and labels every item with its source.
         """
-        handoff = self.get_handoff_summary(task_id, manager_id)
-        detail = self.get_task(task_id)
-        recall = self.recall_memory(RecallRequest(
-            query=query or f"{detail.task.title}\n{detail.task.goal}",
-            task_id=task_id, profile=profile,  # type: ignore[arg-type]
-            scopes=[memory_mod.MemoryScope(scope_type="task", scope_id=task_id)],
-            max_items=max_memory_items, include_pending=include_pending,
-            trusted_only=not include_pending,
-        ))
-        return TaskContextPack(
-            task_id=task_id, profile=profile, handoff=handoff,
-            memory=recall, memory_is_external_context=True,
+        return self.context_builder.build_context_pack(
+            task_id, profile=profile, query=query, max_items=max_memory_items,
+            manager_id=manager_id, include_pending=include_pending,
         )
+
+    def attach_context_to_subtask(self, subtask_id: str, pack: ContextPack) -> None:
+        """Push a bounded pack down to a worker that cannot call MCP.
+
+        Managers *pull* context through the MCP tool; a bounded worker harness
+        often has no MCP client at all, so the `recall_context` activity attaches
+        the pack here and the harness reads `subtask.metadata["context_pack"]`.
+        """
+        subtask = self._require_subtask(subtask_id)
+        metadata = dict(subtask.metadata)
+        metadata["context_pack"] = {
+            "profile": pack.profile,
+            "warnings": pack.warnings,
+            "memory_is_external_context": True,
+            "items": [
+                {"text": i.text, "status": i.status, "confidence": i.confidence,
+                 "source_id": i.source_id, "backend": (i.metadata or {}).get("backend"),
+                 "trusted": (i.metadata or {}).get("trusted", False)}
+                for i in pack.memory.items
+            ],
+        }
+        self.storage.update_subtask(subtask_id, metadata=metadata, updated_at=self._now())
+
+    # ------------------------------------------------------ memory promotion
+    def promote_memory_candidate(self, candidate_id: str, promoted_by: str) -> dict[str, Any]:
+        """Human/librarian only (memory-stack §4). Never exposed as an MCP tool.
+
+        Promotion is the single act that turns an agent's suggestion into a
+        trusted claim, and it is the moment the claim is fanned out to the
+        retrieval indexes. Indexing failures do not undo the promotion — the
+        trusted authority is the record; Cognee and Graphiti are caches of it.
+        """
+        authority = self.trusted_authority()
+        if authority is None:
+            raise InvalidRequest(
+                f"no trusted memory authority configured "
+                f"(expected {self.memory_config.trusted_authority!r})"
+            )
+        claim = authority.promote_candidate(candidate_id, promoted_by)
+        claim.setdefault("claim_id", candidate_id)
+        indexed, failed = [], []
+        for name, adapter in self.memory_backends.items():
+            if name == self.memory_config.trusted_authority:
+                continue
+            if not isinstance(adapter, IndexingMemoryAdapter):
+                continue
+            try:
+                adapter.index_claim(claim)
+                indexed.append(name)
+            except Exception as exc:
+                _log.warning("indexing promoted claim into %s failed: %s", name, exc)
+                failed.append(name)
+        claim["indexed_into"] = indexed
+        if failed:
+            claim["index_failures"] = failed
+        self.record_event(
+            claim.get("task_id"), "memory_promoted", promoted_by,
+            {"claim_id": claim.get("claim_id"), "indexed_into": indexed,
+             "index_failures": failed},
+        )
+        return claim
+
+    def list_pending_memory(self, limit: int = 50) -> list[dict[str, Any]]:
+        authority = self.trusted_authority()
+        if authority is None:
+            return []
+        try:
+            return authority.list_pending(limit)
+        except Exception as exc:
+            _log.warning("listing pending memory failed: %s", exc)
+            return []

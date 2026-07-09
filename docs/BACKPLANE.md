@@ -1,14 +1,15 @@
 # AgentConnect backplane — as built
 
-Status of the three handoff specs against the code, as of 2026-07-10.
+Status of the four handoff specs against the code, as of 2026-07-10.
 Read this before trusting a spec: **the specs say what we intend, this file says
 what exists.**
 
 * `docs/BACKPLANE_SPEC.md` — protocol-neutral task ledger (27 sections)
 * `docs/BACKPLANE_SPEC_TEMPORAL.md` — Temporal-first durable execution (amends the above)
 * `docs/BACKPLANE_SPEC_ADAPTERS.md` — memory adapter + external local-model-manager boundary
+* `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
 
-Gate: `.venv/bin/python -m pytest -q` → **496 passed** (116 of them backplane tests, all offline).
+Gate: `.venv/bin/python -m pytest -q` → **527 passed** (147 of them backplane tests, all offline).
 
 ## The one rule
 
@@ -23,6 +24,12 @@ SQLite ledger + filesystem artifacts
 Temporal makes *execution* durable. AgentConnect makes *work state* durable.
 Linear makes work *visible*. Memory is *external context*, never truth. These
 layers do not collapse into each other.
+
+And within memory:
+
+> AgentConnect controls access. WikiBrain controls trust. Cognee improves
+> breadth. Graphiti improves temporal reasoning. Temporal runs workflows.
+> Linear shows humans what matters.
 
 ## Packages
 
@@ -79,14 +86,54 @@ match the approval against the route class routing actually chose, and signal th
 running workflow. A Linear status change is *recorded as an event and does not
 overwrite task status* — Linear is a mirror.
 
-**Memory (spec 3, Part A).** `MemoryAdapter` with `NoopMemoryAdapter` (default),
-`StaticMemoryAdapter`, `HttpMemoryAdapter`. `recall_memory`,
-`capture_memory_candidate`, `record_memory_feedback`, `get_task_context_pack` on
-the service, MCP, HTTP, and CLI. Capture **never promotes** — a backend that
-claims it did is downgraded and logged. Visibility policy (`trusted_only`,
-`include_pending`, `max_items`) is re-applied service-side, so a sloppy backend
-cannot smuggle pending items into a manager's context. Memory failure is a
-warning, never a failed task.
+**Memory (spec 3 Part A, spec 4).** `MemoryAdapter` with `NoopMemoryAdapter`
+(default), `StaticMemoryAdapter`, `HttpMemoryAdapter`, and the three real
+backends: `WikiBrainMemoryAdapter` (a `TrustedMemoryAdapter`),
+`CogneeMemoryAdapter` and `GraphitiMemoryAdapter` (both `IndexingMemoryAdapter`).
+Each carries a `role` — `trusted_authority`, `broad_retrieval`, `temporal_graph`
+— and every recalled item is stamped with `backend` / `role` / `trusted`, so a
+Cognee search hit can never be read as a recorded decision.
+
+`ContextBuilder` is the whole read path. `MemoryRouter` decides which backends a
+*profile* may even ask (nine profiles; `implementation_constraints` asks only the
+trusted authority, `worker_brief` never reaches the temporal graph).
+`MemoryRanker` merges, dedupes by normalized text, and orders by a fixed
+authority: ledger > WikiBrain verified > WikiBrain promoted > Graphiti tied to a
+promoted claim > Cognee > pending/unknown. A retrieval engine surfacing a
+sentence three times never outranks a librarian promoting it once. Ledger truth
+(task constraints, locked decisions, configured hard policies) and recalled
+memory live in one ranked list but are never confused: `memory_is_external_context`
+rides on every pack.
+
+Write path: agent → `capture_memory_candidate` → **pending** in WikiBrain →
+human/librarian `promote_memory_candidate` → promoted claim → fanned out to
+Cognee and Graphiti. Capture **never promotes** — a backend that claims it did is
+downgraded and logged; Cognee and Graphiti *refuse* agent writes outright.
+Promotion is deliberately absent from the MCP surface, so an agent cannot promote
+its own suggestion. An indexing failure does not undo a promotion: the trusted
+authority is the record, the indexes are caches of it.
+
+How each kind of agent gets memory:
+
+* **Managers** (Claude Code, Codex, Linear Agent — proprietary, unmodifiable)
+  **pull**: they call the `get_task_context_pack` MCP tool. They cannot see
+  WikiBrain, Cognee, or Graphiti at all; only the AgentConnect MCP server is
+  mounted for them. This is the entire reason the MCP adapter exists.
+* **Workers** (bounded, usually with no MCP client) get memory **pushed**: the
+  `recall_context` activity builds a `worker_brief` and attaches it to
+  `subtask.metadata["context_pack"]` before `run_worker` runs.
+
+Visibility policy (`trusted_only`, `include_pending`, `include_superseded`,
+`max_items`) is re-applied service-side, so a sloppy backend cannot smuggle
+pending items into a manager's context. Memory is queried only from Temporal
+*activities*, never workflow code, and a memory outage degrades the pack with a
+warning rather than failing the subtask. Soft user-preference memory is
+deliberately **not** in the core: hard preferences are AgentConnect config
+(`hard_policies`) or scoped WikiBrain claims.
+
+Config lives in `config/memory.yaml` (`AGENTCONNECT_MEMORY_CONFIG`), backend URLs
+in `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`. Absent config means memory is
+simply off and context packs are task state only.
 
 **Local compute (spec 3, Part B).** `LocalComputeProvider` +
 `HttpLocalComputeProvider` (speaking `/health`, `/models`, `/models/loaded`,
@@ -104,7 +151,10 @@ gate; it never crashes the API or MCP.
 * Real worker adapters beyond echo/raw-model: LiteLLM, OpenAI-compatible,
   Deep Agents, OpenClaw, sandboxed shell. `RawModelWorker` takes any
   `(prompt) -> text` callable, so these are adapters, not surgery.
-* `WikiBrainMemoryAdapter`, `CogneeMemoryAdapter`, `GraphitiMemoryAdapter`.
+* Mem0 / Supermemory adapters (spec 4 §15 — explicitly not in the core stack yet).
+* Soft user-preference memory (spec 4 §3 — deliberately excluded).
+* Contradiction *detection* between promoted claims. `memory_comment("conflict", ...)`
+  can render one; nothing raises one, for the same reason decisions do not.
 * A2A (spec 1 §22 — explicitly "do not implement until the rest is stable").
 * CLI remote mode (`--api-url`). The CLI runs against the DB directly.
 * Contradiction *detection* between decisions. Superseding is explicit
@@ -135,7 +185,14 @@ agentconnect linear sync TASK_ID
 
 Environment: `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`,
 `AGENTCONNECT_MAX_COST_USD`, `AGENTCONNECT_WORKERS`, `TEMPORAL_ADDRESS`,
-`AGENTCONNECT_TEMPORAL_TASK_QUEUE`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID`.
+`AGENTCONNECT_TEMPORAL_TASK_QUEUE`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID`,
+`AGENTCONNECT_MEMORY_CONFIG`, `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`.
+
+```bash
+# Memory is opt-in. With no config file and no *_URL set, packs are task state only.
+agentconnect memory pending                 # the librarian's queue
+agentconnect memory promote candidate_1 --by matthew   # human-only; not an MCP tool
+```
 
 The API server and the MCP server *start* workflows; the Temporal worker
 *executes* them. Without a worker process, subtasks sit in `running` forever.

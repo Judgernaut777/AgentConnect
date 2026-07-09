@@ -198,7 +198,12 @@ def test_context_pack_combines_ledger_truth_and_labeled_memory(tmp_path):
     pack = svc.get_task_context_pack(task.id, query="refresh token")
     assert pack.memory_is_external_context is True
     assert pack.handoff.constraints == ["No schema changes"]
-    assert [i.source_id for i in pack.memory.items] == ["decision_004"]
+
+    # Ledger truth (the task's own constraint) outranks recalled memory, and each
+    # item says where it came from.
+    by_backend = [(i.metadata["backend"], i.source_id) for i in pack.memory.items]
+    assert by_backend[0][0] == "agentconnect"
+    assert ("static", "decision_004") in by_backend
 
 
 def test_context_pack_excludes_pending_by_default(tmp_path):

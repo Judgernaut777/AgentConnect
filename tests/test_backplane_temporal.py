@@ -266,3 +266,115 @@ def test_run_worker_activity_is_idempotent_on_retry(tmp_path):
     again = svc.run_subtask(subtask.id)  # what the activity retry would do
     assert again.status is SubtaskStatus.succeeded
     assert len(svc.get_subtask(subtask.id).runs) == runs_before
+
+
+# ------------------------------------------------------------- memory in workflows
+def _null_backend(svc):
+    """Record subtasks without running them: the workflow owns execution."""
+    from agentconnect.core.execution import ExecutionBackend, ExecutionHandle, ExecutionState
+
+    class NullBackend(ExecutionBackend):
+        name = "null"
+
+        def start_subtask(self, subtask_id):
+            return ExecutionHandle(handle_id=f"null-{subtask_id}", backend="null",
+                                   entity_type="subtask", entity_id=subtask_id,
+                                   state=ExecutionState.running)
+
+        def start_review(self, review_id): ...
+        def start_approval(self, approval_id): ...
+        def get_status(self, handle_id): ...
+        def cancel(self, handle_id): ...
+        def signal(self, handle_id, name, payload): ...
+
+    svc.bind_execution(NullBackend())
+
+
+def _memory_service(tmp_path, transport):
+    from agentconnect.core import MemoryConfig, WikiBrainMemoryAdapter
+
+    svc = AgentConnectService.create(
+        db_path=":memory:", artifact_dir=str(tmp_path / "artifacts"), workers=[EchoWorker()],
+        memory_backends={"wikibrain": WikiBrainMemoryAdapter(transport=transport)},
+        memory_config=MemoryConfig(),
+    )
+    _null_backend(svc)
+    return svc
+
+
+def test_workflow_recalls_context_through_the_activity_and_pushes_it_to_the_worker(env, tmp_path):
+    """The workflow never touches a memory backend; it calls `recall_context`,
+    which attaches a `worker_brief` to the subtask a harness can read without MCP."""
+    seen = []
+
+    def transport(method, url, payload):
+        seen.append(url)
+        return {"items": [{"text": "Token expiry lives in session.py.", "status": "promoted",
+                           "confidence": "verified", "source_id": "claim_004"}]}
+
+    svc = _memory_service(tmp_path, transport)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="dedupe expiry"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    async def go():
+        async with _worker(env, svc):
+            handle = await env.client.start_workflow(
+                SubtaskWorkflow.run, subtask.id,
+                id=f"subtask-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            result = await handle.result()
+            return result, await handle.query(SubtaskWorkflow.context_pack)
+
+    result, pack = _run(go())
+    assert result["status"] == "succeeded"
+
+    # The pack really was built (not an empty degraded one) and is worker-scoped.
+    assert any(u.endswith("/recall") for u in seen)
+    assert pack["profile"] == "worker_brief"
+    assert [i["source_id"] for i in pack["items"]] == ["claim_004"]
+    assert pack["items"][0]["trusted"] is True
+
+    stored = svc.get_subtask(subtask.id).subtask.metadata["context_pack"]
+    assert stored["memory_is_external_context"] is True
+    assert stored["items"][0]["text"] == "Token expiry lives in session.py."
+
+
+def test_a_memory_backend_outage_does_not_fail_the_workflow(env, tmp_path):
+    def dead(method, url, payload):
+        raise ConnectionError("wikibrain is down")
+
+    svc = _memory_service(tmp_path, dead)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    async def go():
+        async with _worker(env, svc):
+            return await env.client.execute_workflow(
+                SubtaskWorkflow.run, subtask.id,
+                id=f"subtask-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+
+    result = _run(go())
+    assert result["status"] == "succeeded"
+    assert any("wikibrain recall failed" in w for w in result["warnings"])
+    assert svc.get_subtask(subtask.id).subtask.result_artifact_id
+
+
+def test_recall_context_activity_builds_a_real_pack(tmp_path):
+    """Guards the activity↔service call signature. It is wrapped in a broad
+    `except`, so a typo'd keyword would otherwise degrade to an empty pack in
+    silence rather than fail anything."""
+    from agentconnect.temporal.activities import BackplaneActivities
+
+    def transport(method, url, payload):
+        return {"items": [{"text": "a promoted claim", "status": "promoted",
+                           "confidence": "high", "source_id": "claim_1"}]}
+
+    svc = _memory_service(tmp_path, transport)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    pack = _run(BackplaneActivities(svc).recall_context(
+        task.id, "worker_brief", None, 3, subtask.id))
+    assert pack["warnings"] == [] and pack["backends_queried"] == ["wikibrain"]
+    assert [i["source_id"] for i in pack["items"]] == ["claim_1"]

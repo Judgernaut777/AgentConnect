@@ -16,13 +16,30 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
+from .context import MemoryConfig
+from .memory import (
+    CogneeMemoryAdapter,
+    GraphitiMemoryAdapter,
+    MemoryAdapter,
+    WikiBrainMemoryAdapter,
+)
 from .routing import RoutePolicy
 from .service import AgentConnectService
 from .workers import EchoWorker, WorkerAdapter
 
 _log = logging.getLogger(__name__)
+
+#: Backend name -> (adapter class, env var holding its base URL, default URL).
+_MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str]] = {
+    "wikibrain": (WikiBrainMemoryAdapter, "WIKIBRAIN_URL", "http://localhost:8787"),
+    "cognee": (CogneeMemoryAdapter, "COGNEE_URL", "http://localhost:8001"),
+    "graphiti": (GraphitiMemoryAdapter, "GRAPHITI_URL", "http://localhost:8002"),
+}
+
+MEMORY_CONFIG_PATH = "AGENTCONNECT_MEMORY_CONFIG"
 
 #: Built-in, dependency-free workers. Real harnesses (LiteLLM, local model
 #: manager, Deep Agents, sandboxed shell) register themselves at runtime — the
@@ -54,14 +71,57 @@ def policy_from_env() -> RoutePolicy:
         return RoutePolicy()
 
 
+def _load_memory_yaml() -> dict[str, Any]:
+    path = Path(os.environ.get(MEMORY_CONFIG_PATH, "config/memory.yaml"))
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        _log.warning("could not read %s (%s); memory stays disabled", path, exc)
+        return {}
+
+
+def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
+    """Build whichever of WikiBrain / Cognee / Graphiti are configured.
+
+    Every one of them is optional, and an absent config file means memory is
+    simply off — the backplane is a task ledger first (§17 acceptance 1-2).
+    """
+    raw = _load_memory_yaml()
+    config = MemoryConfig.from_dict(raw)
+    if not config.enabled:
+        return {}, config
+
+    declared = (raw.get("memory") or {}).get("backends") or {}
+    adapters: dict[str, MemoryAdapter] = {}
+    for name, (cls, env_var, default_url) in _MEMORY_BACKENDS.items():
+        spec = declared.get(name) or {}
+        if declared and not spec.get("enabled", False):
+            continue
+        if not declared and not os.environ.get(env_var):
+            continue  # nothing configured for this backend at all
+        base_url = os.environ.get(env_var) or spec.get("base_url") or default_url
+        adapters[name] = cls(base_url=base_url)  # type: ignore[call-arg]
+
+    if not adapters:
+        _log.info("no memory backends configured; context packs will be task state only")
+    return adapters, config
+
+
 def service_from_env(
     workers: Optional[list[WorkerAdapter]] = None,
     db_path: Optional[str] = None,
     artifact_dir: Optional[str] = None,
 ) -> AgentConnectService:
+    adapters, memory_config = memory_from_env()
     return AgentConnectService.create(
         db_path=db_path or os.environ.get("AGENTCONNECT_DB_PATH"),
         artifact_dir=artifact_dir or os.environ.get("AGENTCONNECT_ARTIFACT_DIR"),
         workers=workers if workers is not None else workers_from_env(),
         policy=policy_from_env(),
+        memory_backends=adapters,
+        memory_config=memory_config,
     )
