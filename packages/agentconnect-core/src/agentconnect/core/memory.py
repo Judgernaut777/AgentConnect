@@ -213,9 +213,16 @@ def apply_visibility(items: list[MemoryItem], request: RecallRequest) -> list[Me
         if status in ("rejected", "archived", "contradicted"):
             continue
         if request.trusted_only and status not in TRUSTED_STATUSES:
-            # `include_pending` is an explicit override of trusted_only for
-            # pending items only — everything else still has to be promoted.
-            if not (status == "pending" and request.include_pending):
+            # `include_pending` and `include_superseded` are explicit, per-status
+            # overrides of trusted_only. Without the superseded override the
+            # `project_evolution` profile could never see a superseded claim from
+            # the trusted authority — the one backend that knows what superseded
+            # what. Everything else still has to be promoted.
+            asked_for = (
+                (status == "pending" and request.include_pending)
+                or (status == "superseded" and request.include_superseded)
+            )
+            if not asked_for:
                 continue
         kept.append(item)
     return kept[: max(0, request.max_items)]
