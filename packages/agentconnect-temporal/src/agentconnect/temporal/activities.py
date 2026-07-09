@@ -245,21 +245,31 @@ class BackplaneActivities:
         Attaching the pack to the subtask is how a bounded worker receives its
         `worker_brief` — the push half of the read path.
 
+        A subtask goes through `service.prepare_worker_context`, the same call
+        `DirectExecutionBackend` makes, so that a worker's context never depends on
+        which execution backend is installed. Building the pack here instead would
+        let the two paths drift.
+
         Memory failure degrades the pack; it never fails the workflow (§11).
         """
+        pack = None
         try:
-            pack = self.service.get_task_context_pack(
-                task_id, profile=profile, query=query, max_memory_items=max_items
-            )
+            if subtask_id:
+                pack = self.service.prepare_worker_context(
+                    subtask_id, profile=profile, query=query, max_memory_items=max_items
+                )
+            else:
+                pack = self.service.get_task_context_pack(
+                    task_id, profile=profile, query=query, max_memory_items=max_items
+                )
         except Exception as exc:
             _log.warning("context recall failed for %s: %s", task_id, exc)
             return {"task_id": task_id, "profile": profile, "items": [],
                     "warnings": [f"context recall failed: {exc}"], "backends_queried": []}
-        if subtask_id:
-            try:
-                self.service.attach_context_to_subtask(subtask_id, pack)
-            except Exception as exc:
-                _log.warning("attaching context to %s failed: %s", subtask_id, exc)
+        if pack is None:  # prepare_worker_context swallowed the failure
+            return {"task_id": task_id, "profile": profile, "items": [],
+                    "warnings": ["context recall failed; see the service log"],
+                    "backends_queried": []}
         return {
             "task_id": task_id, "profile": pack.profile,
             "backends_queried": pack.backends_queried,

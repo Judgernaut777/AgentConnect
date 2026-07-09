@@ -252,6 +252,56 @@ records an event and changes nothing. The issue body says so:
 `**Canonical status:** AgentConnect-managed`.
 
 
+## The operational contract
+
+Five rules the loop depends on. Each was a bug before it was a rule — the e2e run
+in `tests/test_agent_loop_e2e.py` found the first three — so each names the code
+that enforces it and the test that keeps it enforced. Change the code, and the
+test should be what tells you.
+
+**1. `agentconnect shell` forwards safe config variables, never backend
+credentials.** `FORWARDED_CONFIG_VARS` in `core/sessions.py` lists what crosses:
+`AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`, `AGENTCONNECT_MEMORY_CONFIG`,
+and the rest — paths and knobs. Everything else must earn its way through the
+allowlist, and anything credential-shaped is refused even from the explicit opt-in.
+*Pinned by* `test_sanitize_env_forwards_the_ledger_pointers_but_no_credentials` and
+`test_sanitize_env_drops_every_denylisted_credential`.
+
+**2. Agent subprocesses write to the operator's ledger, never a fallback one.**
+Same mechanism, opposite failure. Drop `AGENTCONNECT_DB_PATH` and the agent's own
+`agentconnect` CLI — the interface `CODEX.md` instructs it to use — opens
+`~/.agentconnect/agentconnect.db` and writes into a second ledger nobody reads. It
+does not crash. It reports success. The audit then finds no attempts and blames the
+agent for recording nothing, which is the worst kind of bug: it accuses the
+innocent party. *Pinned by* `test_the_injected_mcp_config_points_at_the_operators_ledger`
+and `test_the_proprietary_agent_loop_forces_durable_work_through_agentconnect`.
+
+**3. Worker context is prepared through `service.prepare_worker_context`,
+independent of execution backend.** `DirectExecutionBackend.start_subtask` calls it;
+the Temporal `recall_context` activity calls it. Neither builds its own pack. When
+the activity did, the paths drifted — the workflow pushed a `worker_brief` and the
+shipped default pushed nothing, so `pip install agentconnect-core` gave every worker
+an empty context and nothing said so. *Pinned by*
+`test_the_default_execution_backend_pushes_the_worker_brief`,
+`test_the_activity_prepares_worker_context_through_the_service`, and
+`test_workflow_recalls_context_through_the_activity_and_pushes_it_to_the_worker`.
+
+**4. `complete_task` updates AgentConnect first, then Linear.** Regenerate the
+handoff, audit, mark the ledger succeeded — and only then fire the completion hooks
+that tell Linear. The order is the whole claim of the system: AgentConnect is where
+work becomes true, and the tracker is told afterward. A hook that raises is logged,
+never fatal, because a tracker outage must not be able to un-complete finished work.
+*Pinned by* `test_complete_marks_the_ledger_succeeded_then_updates_linear` and
+`test_a_linear_outage_does_not_undo_a_completion`.
+
+**5. Agent tokens cannot complete a task.** `complete_task` appears in no mode's
+action list — not manager, not reviewer, not readonly — so the denial is structural
+rather than a check somebody has to remember to write. Completion is an operator and
+control-plane action. An agent can do the work and record it; it cannot rule on
+whether it is done. *Pinned by* `test_completion_is_not_reachable_from_a_session_token`
+and `test_a_managed_agent_never_holds_a_credential_that_completes_its_own_task`.
+
+
 ## What is not built
 
 * `TaskWorkflow`, `ManagerHandoffWorkflow`, `WorkerPipelineWorkflow` — the spec

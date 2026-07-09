@@ -385,3 +385,51 @@ def test_recall_context_activity_builds_a_real_pack(tmp_path):
     # And the activity carries the scopes it asked at, so a worker harness can see
     # which claims were even reachable.
     assert pack["scopes_queried"] == ["global", f"task:{task.id}"]
+
+
+def test_the_activity_prepares_worker_context_through_the_service(tmp_path):
+    """Operational contract §3: worker context preparation happens through
+    `service.prepare_worker_context`, whichever execution backend is installed.
+
+    If the activity builds and attaches its own pack, the Temporal path and the
+    direct path drift: a fix to one leaves the other alone, and only a workflow
+    test — the slowest kind — would ever notice."""
+    from agentconnect.temporal.activities import BackplaneActivities
+
+    svc = _memory_service(tmp_path, lambda method, url, payload: {"items": []})
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    calls = []
+    original = svc.prepare_worker_context
+
+    def spy(subtask_id, **kwargs):
+        calls.append((subtask_id, kwargs))
+        return original(subtask_id, **kwargs)
+
+    svc.prepare_worker_context = spy  # type: ignore[method-assign]
+
+    _run(BackplaneActivities(svc).recall_context(task.id, "worker_brief", None, 3, subtask.id))
+    assert calls == [(subtask.id, {"profile": "worker_brief", "query": None,
+                                   "max_memory_items": 3})]
+
+    # Without a subtask there is no worker to prepare, so the task pack is built directly.
+    calls.clear()
+    _run(BackplaneActivities(svc).recall_context(task.id, "manager_brief"))
+    assert calls == []
+
+
+def test_a_worker_context_failure_degrades_the_activity_rather_than_the_workflow(tmp_path):
+    """`prepare_worker_context` swallows its own failure and returns None. The
+    activity must not then dereference it — a degraded pack is the contract."""
+    from agentconnect.temporal.activities import BackplaneActivities
+
+    svc = _memory_service(tmp_path, lambda method, url, payload: {"items": []})
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+    svc.prepare_worker_context = lambda *a, **k: None  # type: ignore[method-assign]
+
+    pack = _run(BackplaneActivities(svc).recall_context(
+        task.id, "worker_brief", None, None, subtask.id))
+    assert pack["items"] == []
+    assert any("context recall failed" in w for w in pack["warnings"])
