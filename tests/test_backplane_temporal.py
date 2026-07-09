@@ -378,5 +378,10 @@ def test_recall_context_activity_builds_a_real_pack(tmp_path):
 
     pack = _run(BackplaneActivities(svc).recall_context(
         task.id, "worker_brief", None, 3, subtask.id))
-    assert pack["warnings"] == [] and pack["backends_queried"] == ["wikibrain"]
+    assert pack["backends_queried"] == ["wikibrain"]
     assert [i["source_id"] for i in pack["items"]] == ["claim_1"]
+    # The pack really was built, not degraded: no backend reported a failure.
+    assert not any("failed" in w for w in pack["warnings"])
+    # And the activity carries the scopes it asked at, so a worker harness can see
+    # which claims were even reachable.
+    assert pack["scopes_queried"] == ["global", f"task:{task.id}"]

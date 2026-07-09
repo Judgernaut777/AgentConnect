@@ -1127,6 +1127,8 @@ class AgentConnectService:
         query: Optional[str] = None,
         manager_id: Optional[str] = None,
         include_pending: bool = False,
+        worker_id: Optional[str] = None,
+        model_id: Optional[str] = None,
     ) -> ContextPack:
         """The one way a manager or worker gets context (memory-stack §5).
 
@@ -1137,6 +1139,7 @@ class AgentConnectService:
         return self.context_builder.build_context_pack(
             task_id, profile=profile, query=query, max_items=max_memory_items,
             manager_id=manager_id, include_pending=include_pending,
+            worker_id=worker_id, model_id=model_id,
         )
 
     def attach_context_to_subtask(self, subtask_id: str, pack: ContextPack) -> None:
@@ -1150,6 +1153,7 @@ class AgentConnectService:
         metadata = dict(subtask.metadata)
         metadata["context_pack"] = {
             "profile": pack.profile,
+            "scopes_queried": pack.scopes_queried,
             "warnings": pack.warnings,
             "memory_is_external_context": True,
             "items": [

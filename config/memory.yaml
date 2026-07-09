@@ -28,6 +28,16 @@ memory:
     include_superseded: false
     max_items: 8
 
+  # Fallback scope ids for tasks that do not name their own in
+  # `task.metadata["project_id"]` / `["repo_id"]`. Without one of the two, claims
+  # filed at project or repo scope cannot surface in any context pack, and the
+  # pack says so in a warning rather than looking complete.
+  #
+  # `global` takes no id — that is WikiBrain's vocabulary, not ours.
+  default_scopes: {}
+  #  project: fascia
+  #  repo: mcp-agentconnect
+
   # Hard preferences: they affect routing, privacy, cost, or safety, so they are
   # policy rather than memory. They are never ranked away and never expire.
   # Soft preferences (tone, formatting, "user likes tables") are deliberately
@@ -37,6 +47,9 @@ memory:
     - "Paid cloud execution requires explicit human approval."
     - "Do not send secrets to external workers."
 
+  # Each profile overrides only what it names; `scopes` defaults to the built-in
+  # set in `core.context.PROFILES`. A worker never asks at manager scope, and
+  # `model_performance` is the only profile that reaches worker/model scope.
   profiles:
     manager_brief:
       backends: [wikibrain, cognee, graphiti]
@@ -55,4 +68,7 @@ memory:
       max_items: 8
     project_evolution:
       backends: [wikibrain, graphiti]
-      max_items: 8
+      # Roomier: superseded claims rank last, so a budget of 8 crowds out the very
+      # history this profile exists to show.
+      max_items: 10
+      scopes: [global, project, repo]

@@ -25,13 +25,17 @@ from .local_compute import (
     LocalRunResult,
 )
 from .context import (
+    GLOBAL_SCOPE_ID,
     PROFILES,
+    SCOPE_ORDER,
     ContextBuilder,
     ContextPack,
     MemoryConfig,
     MemoryRanker,
     MemoryRouter,
     ProfileConfig,
+    ScopeResolution,
+    resolve_scopes,
 )
 from .memory import (
     CaptureRequest,
@@ -146,6 +150,7 @@ __all__ = [
     "ExecutionBackend", "ExecutionHandle", "ExecutionState", "ExecutionStatus", "ExternalRef",
     "FORBIDDEN_ACTIONS",
     "FilesystemAccess", "FilesystemArtifactStore", "GraphitiMemoryAdapter", "HandoffSummary",
+    "GLOBAL_SCOPE_ID",
     "HttpLocalComputeProvider", "IndexingMemoryAdapter",
     "HttpMemoryAdapter", "InboxItem", "InboxKind", "InvalidRequest", "LocalComputeProvider",
     "LocalEstimate", "LocalEstimateRequest", "LocalModel", "LocalModelManagerWorkerAdapter",
@@ -160,7 +165,9 @@ __all__ = [
     "RecordDecisionRequest", "Review", "ReviewRequest", "ReviewResultRequest", "ReviewStatus",
     "RepoMode",
     "RouteExplanation", "RoutePolicy", "RunStatus", "SandboxSpec", "SqliteStorage",
+    "SCOPE_ORDER",
     "SECRET_DENYLIST",
+    "ScopeResolution",
     "SessionMode",
     "SessionStatus",
     "SessionToken",
@@ -177,6 +184,7 @@ __all__ = [
     "default_artifact_dir", "default_db_path",
     "mcp_config",
     "mode_for",
+    "resolve_scopes",
     "route",
     "sanitize_env",
     "session_env_vars",

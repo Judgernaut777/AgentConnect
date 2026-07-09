@@ -380,16 +380,20 @@ def build_mcp_server(
         profile: str = "manager_brief",
         max_memory_items: int = 8,
         manager_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        model_id: Optional[str] = None,
     ) -> str:
         """Everything you need to pick up a task: the deterministic handoff
         (ledger truth) plus clearly-labeled recalled memory (external context).
 
         Call this FIRST. Inside a managed session every argument is optional —
-        the task and your manager id come from the environment."""
+        the task and your manager id come from the environment. `worker_id` and
+        `model_id` only matter for the `model_performance` profile."""
         try:
             pack = svc.get_task_context_pack(
                 _task(task_id), profile=profile, max_memory_items=max_memory_items,
                 manager_id=_actor(manager_id, None) or None,
+                worker_id=worker_id, model_id=model_id,
             )
         except AgentConnectError as exc:
             return _err(exc)
@@ -399,6 +403,7 @@ def build_mcp_server(
             "handoff": tools.compact_handoff(pack.handoff) if pack.handoff else None,
             "memory": tools.compact_recall(pack.memory),
             "backends_queried": pack.backends_queried,
+            "scopes_queried": pack.scopes_queried,
             "warnings": pack.warnings,
             "memory_is_external_context": pack.memory_is_external_context,
         })

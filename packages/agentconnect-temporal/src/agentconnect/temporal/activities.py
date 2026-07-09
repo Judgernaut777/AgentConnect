@@ -262,7 +262,8 @@ class BackplaneActivities:
                 _log.warning("attaching context to %s failed: %s", subtask_id, exc)
         return {
             "task_id": task_id, "profile": pack.profile,
-            "backends_queried": pack.backends_queried, "warnings": pack.warnings,
+            "backends_queried": pack.backends_queried,
+            "scopes_queried": pack.scopes_queried, "warnings": pack.warnings,
             "items": [
                 {"text": i.text, "status": i.status, "confidence": i.confidence,
                  "source_id": i.source_id, "backend": (i.metadata or {}).get("backend"),
