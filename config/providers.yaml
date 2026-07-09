@@ -181,3 +181,37 @@ providers:
   #     reset: rolling
   #     window_seconds: 2592000
   #     max_requests: 2000
+
+  # --- OmniRoute local gateway (many-provider fan-out) ------------------------
+  # OmniRoute (github.com/diegosouzapw/OmniRoute) is a LOCAL OpenAI-compatible
+  # gateway that fans a request out across many upstream providers with its own
+  # fallback/compression. AgentConnect treats it like any other cloud provider:
+  # the ProviderGateway already speaks OpenAI-compatible via `endpoint`, so NO
+  # adapter code is needed — this is a config entry only.
+  #
+  # Privacy posture: `privacy: external` keeps it OUT of repo_sensitive /
+  # secret_sensitive / restricted automatically, so it only ever sees `public`
+  # or REDACTED `low_sensitive` text (service.py sends redacted_text to cloud).
+  # The value for low-sensitivity work is anti-aggregation: no single upstream
+  # sees all your traffic, and the one component that does (OmniRoute) runs on
+  # your box. Two caveats: (1) dispersion is across requests, not within one —
+  # each individual request is still fully seen by whichever upstream handles it,
+  # so this layers on top of redaction, it does not replace it; (2) the property
+  # is only real if OmniRoute disperses — set its routing strategy to
+  # round-robin / weighted (not cheapest-sticky) and expect lower prompt-cache
+  # hit rate from reduced session stickiness. Quota is light here because
+  # OmniRoute does its own downstream quota/fallback management.
+  #
+  # omniroute:
+  #   type: cloud
+  #   endpoint: "http://localhost:20128/v1"    # OmniRoute default port; confirm
+  #   secret_ref: "op://AI/omniroute/api-key"
+  #   privacy: external
+  #   capabilities: [coding, reasoning, summarization, review, classification]
+  #   litellm_model: "openai/auto"             # OmniRoute picks the provider/combo;
+  #                                            # `auto` = its own smart routing.
+  #   quota:
+  #     kind: subscription
+  #     reset: rolling
+  #     window_seconds: 3600
+  #     max_requests: 1000                     # a safety valve; OmniRoute meters below
