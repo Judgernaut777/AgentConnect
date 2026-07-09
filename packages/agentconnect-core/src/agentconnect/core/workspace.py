@@ -265,13 +265,32 @@ def harness_file(manager_id: str) -> Optional[tuple[str, str]]:
     return None
 
 
+#: Shell shims for an agent whose harness has no MCP client. They are the *only*
+#: way such an agent records durable work, so two rules apply to every line here:
+#:
+#: 1. **Real CLI flags.** `ac-attempt` passed `--by` for a year; `attempts add`
+#:    takes `--actor`. It failed every time it was called, and the audit then
+#:    reported that the agent had recorded nothing — blaming the agent for the
+#:    tool's bug.
+#: 2. **POSIX `sh`, not bash.** These carry a `#!/bin/sh` shebang. `${@:2}` is a
+#:    bashism: where `/bin/sh` is dash (Debian, Ubuntu, most containers) it is a
+#:    fatal `Bad substitution`, and where it is bash — as on the box this was
+#:    written on — it works, so the bug ships.
+#:
+#: `shift` needs the `if`: under `set -eu`, a bare `[ $# -gt 0 ] && shift` exits
+#: the script when there are no arguments.
+_ARG_THEN_REST = (
+    'target="${1:-$AGENTCONNECT_TASK_ID}"\n'
+    'if [ $# -gt 0 ]; then shift; fi\n'
+)
+
 _HELPERS = {
-    "ac-context": 'exec agentconnect tasks context-pack "${1:-$AGENTCONNECT_TASK_ID}" "${@:2}"\n',
+    "ac-context": _ARG_THEN_REST + 'exec agentconnect tasks context-pack "$target" "$@"\n',
     "ac-attempt": (
         'exec agentconnect attempts add "$AGENTCONNECT_TASK_ID" '
-        '--by "$AGENTCONNECT_MANAGER_ID" --summary "$*"\n'
+        '--actor "$AGENTCONNECT_MANAGER_ID" --summary "$*"\n'
     ),
-    "ac-audit": 'exec agentconnect audit "${1:-$AGENTCONNECT_TASK_ID}" "${@:2}"\n',
+    "ac-audit": _ARG_THEN_REST + 'exec agentconnect audit "$target" "$@"\n',
 }
 
 

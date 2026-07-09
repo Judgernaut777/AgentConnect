@@ -301,6 +301,18 @@ control-plane action. An agent can do the work and record it; it cannot rule on
 whether it is done. *Pinned by* `test_completion_is_not_reachable_from_a_session_token`
 and `test_a_managed_agent_never_holds_a_credential_that_completes_its_own_task`.
 
+The token was never the whole story, and a dogfood run proved it: the **CLI** does not
+consult the token. Rule 2 hands the agent `AGENTCONNECT_DB_PATH` so its tools reach the
+operator's ledger, and the CLI opens that ledger directly — so an agent inside its own
+shell ran `agentconnect complete` on its own task and the ledger agreed. The CLI now
+refuses `complete` and `memory promote` whenever `AGENTCONNECT_MODE` is set, which is
+exactly when it is a managed agent session; a reviewer may still complete its own
+*review*. This is a compliance guard, not a security control — an agent that edits its
+environment or opens the SQLite file is stopped by nothing here, which is the standing
+scope of the whole layer. *Pinned by* `test_an_agent_shell_cannot_complete_its_own_task`,
+`test_the_operator_completes_the_same_task_outside_a_managed_session`, and
+`test_a_reviewer_may_still_complete_its_own_review`.
+
 
 ## What is not built
 

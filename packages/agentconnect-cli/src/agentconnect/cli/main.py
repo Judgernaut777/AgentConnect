@@ -784,9 +784,55 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refuse_operator_command(args: argparse.Namespace) -> Optional[str]:
+    """Operator-only commands, refused inside a managed agent session.
+
+    A session token cannot reach `complete_task`: it is in no mode's action list,
+    so the MCP and HTTP adapters deny it structurally. The CLI is the hole. We hand
+    the agent `AGENTCONNECT_DB_PATH` so its own tools reach the operator's ledger
+    (contract rule 2) — and the CLI opens that ledger *directly*, never consulting
+    the token. A dogfood run found an agent completing its own task from inside its
+    own shell, with the ledger agreeing it was legitimate.
+
+    So the CLI reads the one thing it does have: `AGENTCONNECT_MODE`, set only by
+    `launch`/`shell`. Present means "you are the agent, not the operator."
+
+    This is a compliance guard, not a security control — the same standing caveat
+    the whole layer carries. An agent that edits its environment, or opens the
+    SQLite file itself, is not stopped by anything here. What it does stop is the
+    ordinary case: an agent that completes its own work because the command was
+    sitting right there.
+
+    A reviewer completing its *own* review is a reviewer action, not an operator
+    one, so `complete --review` stays open in reviewer mode.
+    """
+    mode = os.environ.get("AGENTCONNECT_MODE", "").strip()
+    if not mode:
+        return None
+    group = getattr(args, "group", None)
+    if group == "complete":
+        if getattr(args, "review", None) and mode == "reviewer":
+            return None
+        return (
+            f"completion is an operator action; this is a managed agent session "
+            f"(AGENTCONNECT_MODE={mode}). Ask the operator to run "
+            f"`agentconnect complete`, or `agentconnect audit` to see what is missing."
+        )
+    if group == "memory" and getattr(args, "cmd", None) == "promote":
+        return (
+            f"promoting memory is a human decision; this is a managed agent session "
+            f"(AGENTCONNECT_MODE={mode}). Capture a candidate instead."
+        )
+    return None
+
+
 def main(argv: Optional[list[str]] = None,
          service: Optional[AgentConnectService] = None) -> int:
     args = build_parser().parse_args(argv)
+    refusal = _refuse_operator_command(args)
+    if refusal:
+        print(f"forbidden_action: {refusal}", file=sys.stderr)
+        return EXIT_REFUSED
     svc = service or service_from_env()
     try:
         args.func(svc, args)
