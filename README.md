@@ -1,4 +1,4 @@
-# mcp-agentconnect
+# AgentConnect
 
 > **A control plane for managed coding-agent work.** Self-hosted, privacy-first, and
 > standalone — nothing else is required to run it. It can *optionally* integrate with
