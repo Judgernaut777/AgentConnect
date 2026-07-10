@@ -3,11 +3,12 @@
 **Status: design note. ToolConnect does not exist.** No code moves as a result of this
 document. AgentConnect exposes a fixed MCP tool set today and runs standalone.
 
-This is an inventory of AgentConnect's tool surface as it actually is — including three
-places where the code and the documentation disagree — followed by a proposed division of
-responsibility. An integration contract written against the documented behavior rather
-than the real behavior would be wrong on arrival, so the real behavior is what is written
-here.
+This is an inventory of AgentConnect's tool surface as it actually is, followed by a
+proposed division of responsibility. It was first written against a surface with three
+code-versus-docs disagreements (AC-1, AC-2, AC-3); those are now closed, and the sections
+below describe the reconciled state, keeping the history where it explains a design choice.
+An integration contract written against documented rather than real behavior would be
+wrong on arrival, so the real behavior is what is written here.
 
 ## The boundary in one sentence
 
@@ -21,15 +22,15 @@ There are **two** MCP servers in this repository, and they are not interchangeab
 
 | Server | Package | Entry point | Transport | Role |
 |---|---|---|---|---|
-| `agentconnect` | `agentconnect-mcp` | `mcp/server.py:432` | stdio (default), sse, streamable-http on `:8765` | The compliance surface a managed agent sees |
-| `agentconnect-router` | `agentconnect-router` | `router/mcp_server.py:540` | stdio, or shared on `:8760` | Routing, budget, federated work queue |
+| `agentconnect` | `agentconnect-mcp` | `mcp/server.py` (`main`) | stdio (default), sse, streamable-http on `:8765` | The compliance surface a managed agent sees |
+| `agentconnect-router` | `agentconnect-router` | `router/mcp_server.py` (`main`) | stdio, or shared on `:8760` | Routing, budget, federated work queue |
 
-Only the first is written into a managed workspace's `.mcp.json` (`core/workspace.py:297`).
+Only the first is written into a managed workspace's `.mcp.json` (`core/workspace.py`).
 The forbidden-tool guarantee below concerns that server.
 
-`build_mcp_server()` (`mcp/server.py:80`) registers **17** tools. Its own docstring says
-"exactly the thirteen tools a manager needs" (`server.py:3`). The docstring is wrong; the
-count is not load-bearing anywhere, but it is the first sign that this list has drifted.
+`build_mcp_server()` (`mcp/server.py`) registers **17** tools, and its docstring now
+points at `core.tools.MCP_TOOLS` as the source of truth rather than naming a count. (It
+once claimed "thirteen"; that drift is gone — see AC-3, closed.)
 
 Mutating (write to the ledger): `create_task`, `claim_task`, `release_task`,
 `record_decision`, `record_attempt`, `request_review`, `submit_subtask`,
@@ -48,8 +49,9 @@ the service is the only door.
 
 `temporal_signal`, `wikibrain_promote`, `cognee_write`, `graphiti_write`,
 `local_model_generate`, `secrets_read` must never be exposed. They are listed in
-`DENIED_MCP_TOOLS` (`workspace.py:53`), written into `.mcp.json` as `deniedTools` so the
-denial is auditable, and independently listed in `FORBIDDEN_ACTIONS` (`sessions.py:64`).
+`DENIED_MCP_TOOLS` (`core/tools.py`), written into `.mcp.json` as `deniedTools` so the
+denial is auditable, and independently listed in `AGENT_FORBIDDEN_ACTIONS` /
+`NEVER_TOKEN_ACTIONS` (`core/sessions.py`).
 
 Verified: none of the six is registered by either MCP server. The denial is **structural**
 — no server offers them — and the denylist is a statement of intent, not the mechanism.
@@ -59,27 +61,26 @@ become an enforced filter at registration time, not a hint in a config file.
 
 ## 2. Tool discovery
 
-Static registration only. Tools are `@mcp.tool()`-decorated functions resolved at
-server-build time; there is no registry table and no plugin path. Adding a tool means
-editing `server.py`.
+Static registration, single-sourced. There is one catalog — `MCP_TOOLS` in
+`core/tools.py` — and everything else is derived from it: the server registers exactly
+it, `workspace.EXPOSED_MCP_TOOLS` is generated from it, and `.mcp.json`'s `allowedTools`
+comes from that. Adding a tool means editing `core/tools.py`, not `server.py`. There is
+no registry table beyond that catalog and no dynamic/plugin discovery.
 
 An agent learns the tool set three ways, all static: the MCP `tools/list` response, the
-per-workspace `.mcp.json` (`workspace.py:297`), and the injected `AGENTCONNECT.md` /
-`CLAUDE.md` / `CODEX.md` instruction files (`workspace.py:394`).
+per-workspace `.mcp.json`, and the injected `AGENTCONNECT.md` / `CLAUDE.md` / `CODEX.md`
+instruction files (all written by `core/workspace.py`).
 
-**Defect (verified).** `EXPOSED_MCP_TOOLS` (`workspace.py:46`) is what `.mcp.json` advertises
-as `allowedTools`. It does not match the server:
-
-* It names `get_subtask_status`, **which is not a registered tool.** The real tool is
-  `get_status`. The same phantom name appears in `MANAGER_ACTIONS` and `READONLY_ACTIONS`
-  (`sessions.py:36`).
-* It omits eight tools the server does register, including `recall_memory`,
-  `get_handoff_summary`, `capture_memory_candidate`, and `create_task`.
-
-So a harness that honors `allowedTools` denies a manager the memory tools, and the
-allowlist grants one tool that cannot be called. This is exactly the kind of drift a
-catalog owner exists to prevent, and it is the strongest argument in this document for
-ToolConnect owning the catalog. See [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
+**Why single-sourcing matters — the drift it ended.** `EXPOSED_MCP_TOOLS` used to be a
+hand-written list that advertised `get_subtask_status`, a tool no server registered, and
+omitted eight that were, every memory tool among them — so a harness honoring
+`allowedTools` denied a manager its memory and granted a tool it could not call. That was
+AC-3, now **CLOSED**: the catalog is the source of truth and `tests/test_mcp_catalog.py`
+asserts the server, `.mcp.json`, and the action table all agree. That two hand-written
+lists drifted silently for months is the strongest argument in this document for
+ToolConnect owning the catalog — and the reason any dynamic registration it introduces
+must enforce the denylist at registration time rather than trust a config file. See
+[INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
 
 ## 3. Permissions
 
@@ -101,14 +102,14 @@ The **CLI still does not authenticate**: it opens `AGENTCONNECT_DB_PATH` directl
 guarded only by `AGENTCONNECT_MODE`. A ToolConnect that mediates tool calls must account
 for it.
 
-**Environment sanitization — wired.** `sanitize_env` (`sessions.py:145`) is
+**Environment sanitization — wired.** `sanitize_env` (`core/sessions.py`) is
 **allowlist-wins**: `BASE_ALLOWLIST` (PATH, HOME, SHELL, TERM, LANG, LC_ALL, USER,
 LOGNAME, TMPDIR, TZ), plus `SESSION_VARS`, plus `FORWARDED_CONFIG_VARS` (paths and knobs:
 `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`, …). Everything else is dropped
-because it was never on the list. `SECRET_DENYLIST` (`sessions.py:80`) and the
+because it was never on the list. `SECRET_DENYLIST` (`core/sessions.py`) and the
 `_SECRETISH` regex only police the `AGENTCONNECT_SHELL_ALLOW_ENV` opt-in path.
 
-**CLI mode refusal — wired.** `_refuse_operator_command` (`cli/main.py:787`) reads
+**CLI mode refusal — wired.** `_refuse_operator_command` (`cli/main.py`) reads
 `AGENTCONNECT_MODE`, which `launch` and `shell` set. Under it, `complete` and
 `memory promote` are refused with `forbidden_action` and exit code 2; a reviewer may still
 run `complete --review`. Empty mode means operator, and nothing is refused.
@@ -116,7 +117,7 @@ run `complete --review`. Empty mode means operator, and nothing is refused.
 **Operator-only vs agent-allowed.** Operator: `complete`, `memory promote`, `subtasks
 approve|deny`, `launch`, `shell`, session/workspace management, `linear sync`.
 Agent: the mode's action list, plus the `bin/ac-context`, `bin/ac-attempt`, `bin/ac-audit`
-helper shims (`workspace.py:287`) for harnesses with no MCP client.
+helper shims (`core/workspace.py`) for harnesses with no MCP client.
 
 ## 4. Invocation
 
@@ -150,7 +151,7 @@ was claimed, an attempt was recorded, changed files in the worktree are register
 artifacts, subtasks are resolved, reviews completed, decisions recorded, status
 consistent. It **writes nothing** (`audit.py:18`), and the service takes care to compute a
 fresh handoff without persisting it, because auditing through `get_handoff_summary` would
-repair the very staleness it measures (`service.py:1556`).
+repair the very staleness it measures (`service.get_handoff_summary`).
 
 If ToolConnect wants a tool-invocation trail, that is a **new** ledger table, not a
 reinterpretation of the existing one.
@@ -162,7 +163,7 @@ Definitive: the safety pipeline scans exactly two surfaces, `artifact_ingest`
 are not scanned.** A `submit_subtask.instructions`, a `record_decision.decision`, a
 `record_attempt.summary`, a `request_review.criteria`, or a `capture_memory_candidate.text`
 flows to the ledger unscanned. `subtask_instruction`, `review_input`, and
-`attempt_decision_notes` are named in `safety/policies.py:26` with no policy table, and
+`attempt_decision_notes` are named in `safety/policies.py` with no policy table, and
 `policy()` refuses them rather than guessing.
 
 Tool text is therefore the obvious next safety surface, and it is the natural place for
