@@ -2,13 +2,7 @@
 
 > **Part of the [Fascia](https://github.com/Judgernaut777/Fascia-AI-OS) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) and a shared **guard** ([fascia-guard](https://github.com/Judgernaut777/fascia-guard)) into one self-hosted, privacy-first agent stack.
 
-AgentConnect is a persistent **task, artifact, decision, review, routing, and handoff
-backplane** for interchangeable coding agents and workers. Work done by an agent enters a
-ledger; a deterministic router places bounded subtasks on the right worker; an audit
-decides whether the work is actually finished.
-
-Suggested topics/tags: mcp · claude · llm-routing · agent-infrastructure · local-llm · vllm · ollama · mtls · privacy
-
+AgentConnect is a task, artifact, decision, review, routing, and handoff backplane for coding agents. It provides a managed launch / shell workflow for tools like Codex or Claude Code, records agent work in an operator ledger, injects bounded context into workers, supports review and audit, and prevents normal managed-agent sessions from completing their own tasks. It is a compliance/control layer, not a security sandbox.
 > Agents may think and work inside their own harness. But durable work must enter
 > AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
 
