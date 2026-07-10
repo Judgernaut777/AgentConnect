@@ -441,6 +441,7 @@ class ContextBuilder:
         config: Optional[MemoryConfig] = None,
         ranker: Optional[MemoryRanker] = None,
         safety_enabled: bool = True,
+        safety_pipeline: Optional[Any] = None,
     ) -> None:
         self.service = service
         self.adapters = adapters
@@ -449,6 +450,8 @@ class ContextBuilder:
         self.ranker = ranker or MemoryRanker()
         #: Scan recalled items before they leave for an agent. See `_apply_safety`.
         self.safety_enabled = safety_enabled
+        #: `None` means the default pipeline (baseline engine only).
+        self.safety_pipeline = safety_pipeline
 
     # ------------------------------------------------------------- ledger
     def _ledger_items(self, detail: Any) -> list[MemoryItem]:
@@ -591,7 +594,7 @@ class ContextBuilder:
             batch = safety.scan_items(
                 [safety.SafetyItem(id=str(i), text=item.text)
                  for i, item in enumerate(items)],
-                policy=safety.CONTEXT_OUTPUT,
+                policy=safety.CONTEXT_OUTPUT, pipeline=self.safety_pipeline,
             )
         except Exception as exc:  # noqa: BLE001 — never hand back unscanned context
             _log.warning("context safety scan failed: %s", exc)

@@ -58,21 +58,65 @@ def highest(levels: list[RiskLevel]) -> RiskLevel:
 
 class Category(str, Enum):
     secret = "secret"
+    pii = "pii"
     prompt_injection = "prompt_injection"
     tool_instruction = "tool_instruction"
     encoding = "encoding"
-    #: A rule raised. Never `allow`: a scanner that failed has not said the
-    #: content is clean, and must not be read as if it had.
+    #: A rule or an engine raised. Never `allow`: a scanner that failed has not
+    #: said the content is clean, and must not be read as if it had.
     scanner_error = "scanner_error"
+
+
+class Capability(str, Enum):
+    """What an engine claims it can detect. Policy selects engines by capability,
+    so adding an engine never means editing a surface."""
+
+    secrets = "secrets"
+    pii = "pii"
+    prompt_injection = "prompt_injection"
+    tool_control = "tool_control"
+    encoded_content = "encoded_content"
+    repository_secrets = "repository_secrets"
+
+
+#: The category an engine's finding lands in, per capability it claims.
+CATEGORY_OF_CAPABILITY: dict[Capability, Category] = {
+    Capability.secrets: Category.secret,
+    Capability.repository_secrets: Category.secret,
+    Capability.pii: Category.pii,
+    Capability.prompt_injection: Category.prompt_injection,
+    Capability.tool_control: Category.tool_instruction,
+    Capability.encoded_content: Category.encoding,
+}
+
+
+class EngineStatus(str, Enum):
+    """Five distinct states. They are not interchangeable, and collapsing any two
+    of them is how a scanner starts reporting unread content as clean.
+
+    * `ok` — the engine ran. It may have found nothing; that is a *result*.
+    * `unavailable` — not installed, no binary, no model. It never looked.
+    * `failed` — present, and it raised. It looked and we do not know what it saw.
+    * `skipped` — disabled by configuration, or lacks a capability this surface wants.
+    * `timeout` — an external tool exceeded its budget. A `failed` with a cause.
+    """
+
+    ok = "ok"
+    unavailable = "unavailable"
+    failed = "failed"
+    skipped = "skipped"
+    timeout = "timeout"
 
 
 @dataclass(frozen=True)
 class Finding:
-    """One match. It deliberately does **not** carry the matched text.
+    """One normalized detection, whichever engine produced it.
 
-    A finding travels into artifact metadata, into logs, and into a context pack's
-    warnings. Putting the secret in it would move the secret to three new places
-    while announcing that it had been removed from one.
+    It deliberately does **not** carry the matched text. A finding travels into
+    artifact metadata, into logs, and into a context pack's warnings. Putting the
+    secret in it would move the secret to three new places while announcing that it
+    had been removed from one. Third-party engines hand us their raw match; the
+    adapter converts it to a span and drops the value.
     """
 
     rule_id: str
@@ -80,17 +124,74 @@ class Finding:
     risk_level: RiskLevel
     message: str
     #: Half-open `[start, end)` into the scanned text. Redaction consumes these.
+    #: `(0, 0)` means "no span": a whole-text classifier score, for instance, which
+    #: can be warned about but never redacted.
     start: int = 0
     end: int = 0
+    #: Which engine said so, and at what version. Attribution survives aggregation:
+    #: two engines agreeing is evidence, and one engine's false positive is a bug
+    #: report for that engine, not for the pipeline.
+    engine: str = "baseline"
+    engine_version: str = ""
+    #: `[0, 1]`. Deterministic rules assert 1.0; a classifier reports its score.
+    confidence: float = 1.0
+    metadata: dict[str, Any] = field(default_factory=dict, compare=False)
 
     @property
     def span(self) -> tuple[int, int]:
         return (self.start, self.end)
 
+    @property
+    def has_span(self) -> bool:
+        return self.end > self.start
+
+    @property
+    def severity(self) -> str:
+        """The handoff's name for `risk_level`. Same value, one vocabulary."""
+        return self.risk_level.value
+
+    @property
+    def rule(self) -> str:
+        return self.rule_id
+
     def to_dict(self) -> dict[str, Any]:
         return {"rule_id": self.rule_id, "category": self.category.value,
                 "risk_level": self.risk_level.value, "message": self.message,
-                "start": self.start, "end": self.end}
+                "start": self.start, "end": self.end,
+                "engine": self.engine, "engine_version": self.engine_version,
+                "confidence": self.confidence,
+                **({"metadata": self.metadata} if self.metadata else {})}
+
+
+@dataclass
+class EngineOutcome:
+    """What one engine did on one scan. The pipeline reasons over these, not over
+    exceptions, so `required` failure and `optional` absence stay distinguishable."""
+
+    name: str
+    status: EngineStatus
+    required: bool = False
+    findings: list[Finding] = field(default_factory=list)
+    error: str = ""
+    version: str = ""
+
+    @property
+    def looked(self) -> bool:
+        """Did this engine actually read the content? `ok` alone qualifies."""
+        return self.status is EngineStatus.ok
+
+    @property
+    def broke(self) -> bool:
+        return self.status in (EngineStatus.failed, EngineStatus.timeout)
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {"engine": self.name, "status": self.status.value,
+               "required": self.required, "findings": len(self.findings)}
+        if self.error:
+            out["error"] = self.error
+        if self.version:
+            out["version"] = self.version
+        return out
 
 
 @dataclass
@@ -105,9 +206,24 @@ class SafetyResult:
     labels: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     policy_version: str = POLICY_VERSION
-    #: True when a rule raised. The decision is already fail-closed; this exists so
-    #: a caller can tell "we looked and found nothing" from "we could not look."
+    #: True when a rule or engine raised. The decision is already fail-closed; this
+    #: exists so a caller can tell "we looked and found nothing" from "we could not
+    #: look."
     scanner_failed: bool = False
+    #: One entry per engine the surface's policy asked for.
+    engines: list[EngineOutcome] = field(default_factory=list)
+
+    @property
+    def engines_run(self) -> list[str]:
+        return [e.name for e in self.engines if e.looked]
+
+    @property
+    def engines_unavailable(self) -> list[str]:
+        return [e.name for e in self.engines if e.status is EngineStatus.unavailable]
+
+    @property
+    def engines_failed(self) -> list[str]:
+        return [e.name for e in self.engines if e.broke]
 
     @property
     def redacted(self) -> bool:
@@ -128,6 +244,7 @@ class SafetyResult:
             "safety_redacted": self.redacted,
             "safety_warnings": list(self.warnings),
             "safety_scanner_failed": self.scanner_failed,
+            "safety_engines": [e.to_dict() for e in self.engines],
         }
 
 

@@ -42,6 +42,7 @@ _MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str]] = {
 }
 
 MEMORY_CONFIG_PATH = "AGENTCONNECT_MEMORY_CONFIG"
+SAFETY_CONFIG_PATH = "AGENTCONNECT_SAFETY_CONFIG"
 
 #: Built-in, dependency-free workers. Real harnesses (LiteLLM, local model
 #: manager, Deep Agents, sandboxed shell) register themselves at runtime — the
@@ -84,6 +85,36 @@ def _load_memory_yaml() -> dict[str, Any]:
     except Exception as exc:
         _log.warning("could not read %s (%s); memory stays disabled", path, exc)
         return {}
+
+
+def safety_from_env() -> Optional["safety.SafetyPipeline"]:
+    """Build the configured engine pipeline, or `None` for the default.
+
+    `None` means the standard-library baseline and nothing else, which is what a
+    default install should get: no heavy dependency, no subprocess, no model.
+
+    A **malformed** safety config raises. Memory degrades to "off" when its YAML is
+    unreadable, because a missing brain is a smaller problem than a wrong one. Safety
+    is the opposite: an operator who wrote `detect_secrests:` believes an engine is
+    running, and starting up quietly without it is the failure this whole layer
+    exists to prevent.
+    """
+    from .. import safety
+
+    path = Path(os.environ.get(SAFETY_CONFIG_PATH, "config/safety.yaml"))
+    if not path.exists():
+        return None
+    import yaml
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    config = safety.SafetyConfig.from_dict(raw)  # unknown engine -> ValueError
+    pipeline = safety.SafetyPipeline(config)
+    for row in pipeline.status():
+        if row["enabled"] and not row["available"]:
+            _log.warning(
+                "safety engine %s is enabled but unavailable (not installed, or its "
+                "model or binary is missing)", row["engine"])
+    return pipeline
 
 
 def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
@@ -132,4 +163,5 @@ def service_from_env(
         memory_config=memory_config,
         workspace_dir=workspace_dir or os.environ.get("AGENTCONNECT_WORKSPACE_DIR"),
         api_url=os.environ.get("AGENTCONNECT_API_URL", DEFAULT_API_URL),
+        safety_pipeline=safety_from_env(),
     )

@@ -9,8 +9,8 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `.venv/bin/python -m pytest -q` — **764 passing** |
-| Safety | baseline local scanning on artifact ingest and context output ([SAFETY.md](SAFETY.md)) |
+| Gate | `.venv/bin/python -m pytest -q` — **821 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
+| Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for WikiBrain, Cognee, Graphiti |
 | Temporal | optional; `agentconnect-core` installs and runs with no workflow server |
@@ -71,18 +71,24 @@ Worth stating plainly, because a green suite invites more confidence than it has
   makes bypasses visible. It does not contain a hostile process. An agent that edits its
   own environment, or opens the SQLite file directly, is stopped by nothing here. That is
   the documented scope, not an oversight.
-* **The safety scanner is pattern-based.** It catches the credential formats and injection
-  phrasings it has rules for. It is not an adversarial defense: an attacker who knows the
-  rules can write around them. It reduces the ordinary case — a key pasted into an
-  artifact, an injected instruction sitting in a retrieved document — and claims nothing
-  more.
+* **The default safety engine is pattern-based.** The `baseline` engine catches the
+  credential formats and injection phrasings it has rules for. It is a floor, not an
+  adversarial defense: an attacker who knows the rules can write around them. Maintained
+  engines (detect-secrets, TruffleHog, Gitleaks, Presidio) are opt-in.
+* **Three safety adapters are untested against their real libraries.** `presidio`,
+  `gliner`, and `prompt_guard` are implemented and covered by fake-backed tests; neither
+  Presidio, GLiNER, nor transformers is installed in this gate. `detect_secrets`,
+  `gitleaks`, and `trufflehog` *are* exercised against the real library and binaries.
+* **There is no PII detection by default.** The baseline abstains deliberately; partial
+  PII coverage reads as coverage. Enable Presidio.
 
 ## Known deferred work
 
-* **Safety scanning beyond the first two surfaces.** `artifact_ingest` and
-  `context_output` are implemented ([SAFETY.md](SAFETY.md)). `subtask_instruction`,
-  `review_input`, and `attempt_decision_notes` are named and have no policy. There is **no
-  PII rule**.
+* **Safety surfaces beyond the first two.** `artifact_ingest` and `context_output` are
+  implemented ([SAFETY.md](SAFETY.md)). `subtask_instruction`, `review_input`, and
+  `attempt_decision_notes` are named and have no policy.
+* **Containment / spotlighting** for `context_output` — deferred, with reasoning in
+  SAFETY.md.
 * `wiki serve` — WikiBrain's HTTP transport. **Deferred, and not AgentConnect's task.**
   Tracked here only as a known integration gap. Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is

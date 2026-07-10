@@ -131,6 +131,7 @@ class AgentConnectService:
         workspace_dir: Optional[str] = None,
         api_url: str = "http://localhost:8790",
         safety_enabled: bool = True,
+        safety_pipeline: Optional["safety.SafetyPipeline"] = None,
     ) -> None:
         self.storage = storage
         self.artifacts = artifact_store
@@ -142,6 +143,10 @@ class AgentConnectService:
         #: so — which is why the off switch is a constructor argument rather than a
         #: config file: it should be hard to do by accident.
         self.safety_enabled = safety_enabled
+        #: Which engines run. `None` means the default pipeline: the standard-library
+        #: baseline and nothing else. A deployment that wants detect-secrets, Presidio,
+        #: or an external tool builds a `SafetyPipeline` and passes it here.
+        self.safety_pipeline = safety_pipeline
         #: Called with a task id *after* the ledger marks it succeeded. Linear
         #: registers here, which is what makes AgentConnect the upstream of the
         #: tracker rather than the other way round (compliance §13).
@@ -165,7 +170,7 @@ class AgentConnectService:
         )
         self.context_builder = ContextBuilder(
             self, self.memory_backends, self.memory_config,
-            safety_enabled=self.safety_enabled,
+            safety_enabled=self.safety_enabled, safety_pipeline=self.safety_pipeline,
         )
         # Default to inline execution so `pip install agentconnect-core` is a
         # working backplane with no workflow server. Adapters that want
@@ -199,7 +204,8 @@ class AgentConnectService:
             iter(adapters.values()), NoopMemoryAdapter()
         )
         self.context_builder = ContextBuilder(self, self.memory_backends, self.memory_config,
-                                              safety_enabled=self.safety_enabled)
+                                              safety_enabled=self.safety_enabled,
+                                              safety_pipeline=self.safety_pipeline)
 
     def trusted_authority(self) -> Optional[TrustedMemoryAdapter]:
         adapter = self.memory_backends.get(self.memory_config.trusted_authority)
@@ -220,6 +226,7 @@ class AgentConnectService:
         workspace_dir: Optional[str] = None,
         api_url: str = "http://localhost:8790",
         safety_enabled: bool = True,
+        safety_pipeline: Optional["safety.SafetyPipeline"] = None,
     ) -> "AgentConnectService":
         return cls(
             storage=SqliteStorage(db_path or default_db_path()),
@@ -234,6 +241,7 @@ class AgentConnectService:
             workspace_dir=workspace_dir,
             api_url=api_url,
             safety_enabled=safety_enabled,
+            safety_pipeline=safety_pipeline,
         )
 
     # ------------------------------------------------------------ internals
@@ -465,7 +473,8 @@ class AgentConnectService:
             return content, {}
         try:
             result = safety.scan_text(
-                content, surface=safety.ARTIFACT_INGEST, policy=safety.ARTIFACT_INGEST)
+                content, surface=safety.ARTIFACT_INGEST, policy=safety.ARTIFACT_INGEST,
+                pipeline=self.safety_pipeline)
         except Exception as exc:  # noqa: BLE001 — never store unscanned content as clean
             _log.warning("artifact safety scan failed: %s", exc)
             return content, {
@@ -476,6 +485,7 @@ class AgentConnectService:
                 "safety_redacted": False,
                 "safety_warnings": [f"safety scanning failed: {exc}"],
                 "safety_scanner_failed": True,
+                "safety_engines": [],
             }
         if result.decision is safety.Decision.allow:
             return result.redacted_content, {}

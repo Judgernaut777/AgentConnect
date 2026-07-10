@@ -1,0 +1,62 @@
+# AgentConnect safety engines.
+#
+# Copy to `config/safety.yaml` (or point AGENTCONNECT_SAFETY_CONFIG at it) to enable
+# engines. With no file, AgentConnect runs the standard-library `baseline` engine and
+# nothing else — deterministic, offline, and a lightweight floor rather than
+# enterprise-grade detection.
+#
+# An unknown engine name is a startup error, not a warning: a typo must not silently
+# disable the engine you believe is protecting you.
+safety:
+  enabled: true
+  engines:
+    # Always available. Required, so a bug inside it fails a scan closed.
+    baseline:
+      enabled: true
+      required: true
+
+    # pip install "agentconnect-core[safety-secrets]"
+    detect_secrets:
+      enabled: false
+      # Entropy plugins fire on ordinary identifiers. Worth it on config files and
+      # `.env` dumps; noisy on recalled prose.
+      use_entropy_plugins: false
+
+    # An installed binary, not a pip dependency.
+    # `allow_network_verification` sends candidate credentials to the service that
+    # issued them. That is exfiltration performed by the scanner. Leave it off.
+    trufflehog:
+      enabled: false
+      executable: trufflehog
+      timeout_seconds: 20
+      allow_network_verification: false
+
+    gitleaks:
+      enabled: false
+      executable: gitleaks
+      timeout_seconds: 20
+
+    # pip install "agentconnect-core[safety-pii]" + a spaCy model.
+    # AgentConnect has no PII rules of its own; this is the PII engine.
+    presidio:
+      enabled: false
+      threshold: 0.5
+
+    # pip install "agentconnect-core[safety-pii-gliner]". Needs a pinned model, and
+    # never downloads one implicitly.
+    gliner:
+      enabled: false
+      model: null
+      local_files_only: true
+
+    # pip install "agentconnect-core[safety-injection]". Needs a pinned model.
+    prompt_guard:
+      enabled: false
+      model: null
+      threshold: 0.5
+      local_files_only: true
+
+  # Optional. Overrides capability-based selection for one surface.
+  # surfaces:
+  #   artifact_ingest: [baseline, detect_secrets, gitleaks]
+  #   context_output:  [baseline, presidio]
