@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from agentconnect.core.models import Review, ReviewRequest, ReviewResultRequest
 
+from .authz import assert_actor
 from .routes_tasks import service
 
 router = APIRouter(tags=["reviews"])
@@ -28,9 +29,10 @@ def get_review(review_id: str, request: Request) -> Review:
 
 @router.post("/reviews/{review_id}/claim", response_model=Review)
 def claim_review(review_id: str, body: ClaimReviewBody, request: Request) -> Review:
-    return service(request).claim_review(review_id, body.manager_id)
+    return service(request).claim_review(review_id, assert_actor(request, body.manager_id))
 
 
 @router.post("/reviews/{review_id}/result", response_model=Review)
 def complete_review(review_id: str, body: ReviewResultRequest, request: Request) -> Review:
+    assert_actor(request, body.completed_by)
     return service(request).complete_review(review_id, body)

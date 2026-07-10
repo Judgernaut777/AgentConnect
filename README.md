@@ -64,6 +64,14 @@ credentials never are, and `AGENTCONNECT_MODE` restricts what the CLI will do in
 managed session. Direct SQLite, filesystem, and environment tampering are out of scope
 and would need OS-level isolation.
 
+The **HTTP and MCP transports authenticate**: every route but `GET /health` and every MCP
+tool call resolves the agent's scoped `act_` token through one `authorize()` rule. A
+managed agent cannot complete its own task, promote memory, or act on a task it was not
+launched for. Ordinary completion cannot skip the audit; an administrative override is a
+separate operator-only endpoint that demands a written reason and records it. The **CLI**
+is the exception — it consults no token, and `AGENTCONNECT_MODE` is all that stands
+between an agent and `agentconnect complete`.
+
 AgentConnect does include **local content scanning** at two surfaces it owns: artifacts
 are scanned on ingest (probable secrets redacted before the body is written), and context
 packs are scanned before an agent receives them (secrets redacted, high-risk prompt

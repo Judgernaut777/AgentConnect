@@ -1,6 +1,7 @@
 """AgentConnect MCP server — the manager-facing adapter (spec §13).
 
-Exactly the thirteen tools a *manager* needs. Administration (approve/deny spend,
+Exactly the tools in `core.tools.MCP_TOOLS` — that catalog is the source of
+truth, and a test asserts this server registers it exactly. Administration (approve/deny spend,
 inbox drain, Linear sync, task listing) deliberately lives on the HTTP API and
 CLI: a manager agent should not be able to approve its own spend.
 
@@ -10,6 +11,8 @@ all at the same ``AGENTCONNECT_DB_PATH`` and they share one ledger.
 """
 
 from __future__ import annotations
+
+import functools
 
 import logging
 import os
@@ -37,6 +40,7 @@ from agentconnect.core.models import (
     SubtaskRequest,
 )
 from agentconnect.core.service import DEFAULT_CLAIM_TTL_SECONDS, AgentConnectService
+from agentconnect.core.tools import ACTION_FOR_TOOL
 
 from . import tools
 
@@ -93,7 +97,34 @@ def build_mcp_server(
         kwargs["port"] = port
     mcp = FastMCP("agentconnect", **kwargs)
 
-    @mcp.tool()
+    # The token an agent actually holds. `launch` writes it into the session
+    # environment; an operator running this server by hand has none, and enforcement
+    # is then the operator's own shell. When it *is* present, every tool call is
+    # checked against the same `authorize()` the HTTP adapter calls — one rule, two
+    # transports. Previously the token was scoped, hashed, and never consulted.
+    session_token = os.environ.get("AGENTCONNECT_SESSION_TOKEN")
+
+    def tool():
+        """Register a tool, authorizing it first against the catalog's action."""
+
+        def decorate(fn):
+            action = ACTION_FOR_TOOL[fn.__name__]
+
+            @functools.wraps(fn)
+            def guarded(*args: Any, **kwargs: Any) -> str:
+                if session_token:
+                    try:
+                        svc.authorize(session_token, action,
+                                      task_id=kwargs.get("task_id") or None)
+                    except AgentConnectError as exc:
+                        return _err(exc)
+                return fn(*args, **kwargs)
+
+            return mcp.tool()(guarded)
+
+        return decorate
+
+    @tool()
     def create_task(
         title: str,
         goal: str = "",
@@ -114,7 +145,7 @@ def build_mcp_server(
             "next_action": f"claim_task({task.id})",
         })
 
-    @mcp.tool()
+    @tool()
     def open_task(task_id: Optional[str] = None) -> str:
         """Compact task state: locked decisions, artifact ids, open reviews and
         subtasks. Bodies are never inlined — page them with read_artifact_chunk.
@@ -124,7 +155,7 @@ def build_mcp_server(
         except AgentConnectError as exc:
             return _err(exc)
 
-    @mcp.tool()
+    @tool()
     def get_handoff_summary(
         task_id: Optional[str] = None, manager_id: Optional[str] = None
     ) -> str:
@@ -137,7 +168,7 @@ def build_mcp_server(
         except AgentConnectError as exc:
             return _err(exc)
 
-    @mcp.tool()
+    @tool()
     def claim_task(
         task_id: Optional[str] = None,
         manager_id: Optional[str] = None,
@@ -157,7 +188,7 @@ def build_mcp_server(
             "next_action": f"get_handoff_summary({task_id})",
         })
 
-    @mcp.tool()
+    @tool()
     def release_task(
         task_id: Optional[str] = None, manager_id: Optional[str] = None
     ) -> str:
@@ -169,7 +200,7 @@ def build_mcp_server(
             return _err(exc)
         return tools.dumps({"released": task_id, "manager_id": manager_id})
 
-    @mcp.tool()
+    @tool()
     def record_decision(
         decision: str,
         task_id: Optional[str] = None,
@@ -194,7 +225,7 @@ def build_mcp_server(
             if result.locked else "",
         })
 
-    @mcp.tool()
+    @tool()
     def record_attempt(
         summary: str,
         task_id: Optional[str] = None,
@@ -214,7 +245,7 @@ def build_mcp_server(
             return _err(exc)
         return tools.dumps({"attempt_id": attempt.id})
 
-    @mcp.tool()
+    @tool()
     def request_review(
         assigned_to: str,
         task_id: Optional[str] = None,
@@ -239,7 +270,7 @@ def build_mcp_server(
             "next_action": f"poll get_status({task_id}) until the review completes",
         })
 
-    @mcp.tool()
+    @tool()
     def submit_subtask(
         title: str,
         instructions: str,
@@ -271,7 +302,7 @@ def build_mcp_server(
         handles = svc.executions_for("subtask", subtask.id)
         return tools.dumps(tools.compact_subtask(subtask, handles[-1] if handles else None))
 
-    @mcp.tool()
+    @tool()
     def get_status(task_id: Optional[str] = None) -> str:
         """One-line task state: status, manager, open review/subtask counts, and
         anything awaiting human approval."""
@@ -280,7 +311,7 @@ def build_mcp_server(
         except AgentConnectError as exc:
             return _err(exc)
 
-    @mcp.tool()
+    @tool()
     def list_artifacts(task_id: Optional[str] = None) -> str:
         """Artifact ids, types, sizes, and one-line summaries. Never bodies."""
         try:
@@ -293,7 +324,7 @@ def build_mcp_server(
             for a in artifacts
         ])
 
-    @mcp.tool()
+    @tool()
     def read_artifact_chunk(artifact_id: str, offset: int = 0, limit: int = 8000) -> str:
         """Read a bounded slice of an artifact body. Follow `next_offset` to page;
         `eof: true` means you have the whole thing."""
@@ -307,7 +338,7 @@ def build_mcp_server(
             "size_bytes": chunk.size_bytes,
         })
 
-    @mcp.tool()
+    @tool()
     def explain_route(subtask_id: str) -> str:
         """Why a subtask went where it went: the winning worker's score terms and
         the workers that were rejected, with the gate each one failed."""
@@ -317,7 +348,7 @@ def build_mcp_server(
             return _err(exc)
 
     # ---------------------------------------------------------------- memory
-    @mcp.tool()
+    @tool()
     def recall_memory(
         query: str,
         task_id: Optional[str] = None,
@@ -337,7 +368,7 @@ def build_mcp_server(
         ))
         return tools.dumps(tools.compact_recall(pack))
 
-    @mcp.tool()
+    @tool()
     def capture_memory_candidate(
         text: str,
         task_id: Optional[str] = None,
@@ -357,7 +388,7 @@ def build_mcp_server(
             "status": result.status, "message": result.message, "backend": result.backend,
         })
 
-    @mcp.tool()
+    @tool()
     def record_memory_feedback(
         feedback: str,
         task_id: Optional[str] = None,
@@ -374,7 +405,7 @@ def build_mcp_server(
         ))
         return tools.dumps({"recorded": True})
 
-    @mcp.tool()
+    @tool()
     def get_task_context_pack(
         task_id: Optional[str] = None,
         profile: str = "manager_brief",

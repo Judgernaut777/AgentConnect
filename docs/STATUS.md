@@ -9,7 +9,7 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `.venv/bin/python -m pytest -q` — **821 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
+| Gate | `.venv/bin/python -m pytest -q` — **876 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
@@ -91,7 +91,9 @@ Worth stating plainly, because a green suite invites more confidence than it has
 * **The compliance layer is not a sandbox.** It makes AgentConnect the normal path and
   makes bypasses visible. It does not contain a hostile process. An agent that edits its
   own environment, or opens the SQLite file directly, is stopped by nothing here. That is
-  the documented scope, not an oversight.
+  the documented scope, not an oversight. In particular the **CLI** still opens
+  `AGENTCONNECT_DB_PATH` directly and is guarded only by `AGENTCONNECT_MODE`; the HTTP and
+  MCP transports now authenticate, the CLI does not.
 * **The default safety engine is pattern-based.** The `baseline` engine catches the
   credential formats and injection phrasings it has rules for. It is a floor, not an
   adversarial defense: an attacker who knows the rules can write around them. Maintained
@@ -120,20 +122,32 @@ Worth stating plainly, because a green suite invites more confidence than it has
 
 ## Open defects
 
-Found by validating the integrations, reproduced, and not yet fixed. Full detail and
-reproductions in [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
+Found by validating the integrations. Full detail and reproductions in
+[INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
 
-* **AC-1 (high)** — the HTTP adapter is unauthenticated, and `POST /tasks/{id}/complete`
-  with `force: true` skips the audit. `AGENTCONNECT_API_*` is forwarded into agent shells.
-  Do not run `agentconnect-api` on an agent's network path.
-* **AC-2 (medium)** — `service.authorize()` is defined and tested but called by no
-  adapter. Session-token scopes are data, not enforcement.
-* **AC-3 (medium)** — `.mcp.json`'s `allowedTools` advertises a tool that does not exist
-  (`get_subtask_status`) and omits eight that do, including every memory tool.
-* **AC-4 (medium)** — BrainConnect's `b128e65` added a promotion safety gate raising
-  `SafetyRefused`, plus a `safety_override` path. AgentConnect's adapter models neither.
-* **AC-5 / AC-6 / AC-7 (low)** — capture with no origin actor raises `TypeError`; two
-  services documented on port 8787; BrainConnect still ships no HTTP server.
+**Closed:**
+
+* **AC-1 (was high)** — the HTTP adapter is authenticated. Every route but `GET /health`
+  requires a session token, `force` is gone from the ordinary completion route, and the
+  override is an operator-only endpoint that demands a written reason. A test drives a
+  real HTTP server on a real port and replays the original bypass.
+* **AC-2 (was medium)** — `service.authorize()` is now called by the HTTP adapter on every
+  route and by the MCP server on every tool. The session token is enforcement, not
+  metadata.
+* **AC-3 (was medium)** — the MCP catalog is generated from `core.tools.MCP_TOOLS`. One
+  list, and a test asserts the server, `.mcp.json`, and the action table agree.
+* **AC-4 (was medium)** — BrainConnect's `SafetyRefused` surfaces as `MemorySafetyRefused`,
+  distinct from an unreachable backend, a server fault, a bad candidate, and an
+  authorization failure. Per-item `safety`, and capture's `safety` + `quarantined`, are
+  preserved.
+* **AC-5 (was low)** — capture without an `origin_actor_id` is refused by name, before the
+  call. No default actor is invented; provenance is not guessed.
+* **AC-6 (was low)** — the documented API port no longer collides with `WIKIBRAIN_URL`.
+
+**Open:**
+
+* **AC-7 (low)** — BrainConnect still ships no HTTP server, and the adapter still defaults
+  to `:8787`. Nothing exercises the memory contract on the wire. Not AgentConnect's task.
 
 ## What would reopen work
 

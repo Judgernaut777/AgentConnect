@@ -16,13 +16,18 @@ from agentconnect.core.errors import (
     InvalidRequest,
     NotFound,
     PolicyViolation,
+    Unauthenticated,
 )
 from agentconnect.core.service import AgentConnectService
 
 #: Backplane error -> HTTP status. Adapters translate; the service never knows.
+#:
+#: `Unauthenticated` precedes `PolicyViolation` in intent: 401 means the credential
+#: could not be established, 403 means it was and the answer is still no.
 STATUS_FOR: dict[type[AgentConnectError], int] = {
     NotFound: 404,
     Conflict: 409,
+    Unauthenticated: 401,
     PolicyViolation: 403,
     InvalidRequest: 400,
 }

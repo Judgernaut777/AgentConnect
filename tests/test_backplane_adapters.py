@@ -27,6 +27,8 @@ pytest.importorskip("mcp")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from conftest import operator_client  # noqa: E402
+
 from agentconnect.api.app import create_app  # noqa: E402
 from agentconnect.cli.main import main as cli_main  # noqa: E402
 from agentconnect.mcp.server import build_mcp_server  # noqa: E402
@@ -142,7 +144,7 @@ def test_mcp_recall_is_bounded_and_labeled(svc, task):
 
 # ----------------------------------------------------------------------- HTTP
 def test_http_endpoints_drive_the_service(svc):
-    client = TestClient(create_app(service=svc, linear_sync=None))
+    client = operator_client(svc, linear_sync=None)
 
     assert client.get("/health").json()["execution_backend"] == "direct"
 
@@ -173,7 +175,7 @@ def test_http_endpoints_drive_the_service(svc):
 
 
 def test_http_review_and_inbox_flow(svc, task):
-    client = TestClient(create_app(service=svc, linear_sync=None))
+    client = operator_client(svc, linear_sync=None)
     artifact = client.post(f"/tasks/{task.id}/artifacts", json={
         "type": "patch", "content": "diff", "summary": "the patch"}).json()
 
@@ -196,7 +198,7 @@ def test_http_review_and_inbox_flow(svc, task):
 
 
 def test_http_memory_and_workflow_routes(svc, task):
-    client = TestClient(create_app(service=svc, linear_sync=None))
+    client = operator_client(svc, linear_sync=None)
     assert client.get("/memory/health").json()["backend"] == "static"
 
     pack = client.post("/memory/recall", json={"query": "refresh token"}).json()
@@ -223,7 +225,7 @@ def test_http_approval_gate(tmp_path):
     svc = AgentConnectService.create(
         db_path=":memory:", artifact_dir=str(tmp_path / "a"), workers=[cloud],
         policy=RoutePolicy(max_cost_usd=10.0))
-    client = TestClient(create_app(service=svc, linear_sync=None))
+    client = operator_client(svc, linear_sync=None)
     task_id = client.post("/tasks", json={"title": "t"}).json()["id"]
     subtask = client.post(f"/tasks/{task_id}/subtasks", json={
         "title": "t", "instructions": "i", "privacy_tier": "public"}).json()

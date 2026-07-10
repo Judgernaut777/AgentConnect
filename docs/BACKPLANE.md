@@ -203,19 +203,36 @@ credential by name; anything matching `*_API_KEY`, `*_SECRET`, `*_TOKEN` and
 friends is refused there with an error rather than quietly obeyed.
 
 *Credentials.* An agent gets exactly one: a short-lived `act_…` session token,
-scoped to its session, entity, and mode. Manager mode names ten actions, reviewer
-mode six, readonly four. `promote_memory_candidate`, `temporal_signal`,
-`secrets_read`, `grant_approval`, and `complete_task` are in **no** mode's list.
-Only the token's SHA-256 is stored; the plaintext exists just long enough to write
-the env file. Ending the shell revokes it, so a leaked `.env.agentconnect` is inert.
+scoped to its session, entity, and mode. Manager mode buys ten-odd actions,
+reviewer mode fewer, readonly fewer still. `complete_task`, `force_complete_task`,
+`promote_memory_candidate`, `temporal_signal`, and `grant_approval` are in **no**
+managed mode's list, so the deny is structural rather than a special case. Only the
+token's SHA-256 is stored; the plaintext exists just long enough to write the env
+file. Ending the shell revokes it, so a leaked `.env.agentconnect` is inert.
 
-Read that scope as *data*, not as enforcement. `service.authorize(token, action)`
-exists and is tested, but **no adapter calls it** — not MCP, not the CLI, not the
-HTTP API. What actually denies `complete_task` today is that no MCP tool exposes it
-and the CLI refuses it under `AGENTCONNECT_MODE`. The deny is structural; the token
-is not currently the thing doing it. Tracked as AC-2 in
-[INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md), together with AC-1: the HTTP adapter
-is unauthenticated and its `force` flag skips the audit.
+*One authorization rule.* `service.authorize(token, action, task_id=…, review_id=…)`
+is the only place a permission is decided, and every transport calls it: the HTTP
+adapter on every route, the MCP server on every tool. Three gates, in order —
+`NEVER_TOKEN_ACTIONS` (backend-shaped actions no token reaches, operator included),
+`AGENT_FORBIDDEN_ACTIONS` (denied to every managed-agent mode), then the mode's own
+action list and the token's task binding. A manager token minted for task A cannot
+record an attempt against task B: the *action* is permitted, the *target* is not.
+
+*The operator is a principal, not an assumption.* Completion, approval, and memory
+promotion need an operator token — `agentconnect tokens issue --actor you`, minted
+out of band, never by `launch`, and refused inside a managed session. It is unscoped
+by design: it is the credential that completes tasks.
+
+*The audit cannot be skipped by an ordinary caller.* `POST /tasks/{id}/complete` has
+no `force` field. An administrative override is a separate endpoint, needs its own
+action, demands a written reason, and records that reason as a locked decision in
+the ledger **before** the task is touched. An override that left no trace would be
+indistinguishable from an audit that passed.
+
+*The CLI remains the soft spot,* and knowingly. It opens `AGENTCONNECT_DB_PATH`
+directly and consults no token; `AGENTCONNECT_MODE` is what refuses `complete`,
+`memory promote`, and `tokens issue` inside a managed session. That is a compliance
+guard, not a security control. This is still not a sandbox.
 
 *Ids are inferred.* `AGENTCONNECT_TASK_ID` and `AGENTCONNECT_MANAGER_ID` are in the
 environment, and every MCP tool falls back to them. An agent that cannot mistype an

@@ -4,11 +4,13 @@ Defects found while validating AgentConnect's integrations against real BrainCon
 against its own MCP/HTTP surface. Every entry below was **reproduced**, not inferred; the
 reproduction is given so it can be re-run or disputed.
 
-No fix is applied in this document. Three of these involve a design decision that is the
-maintainer's to make, and the handoff that produced this file was documentation-scoped.
+**AC-1 through AC-6 are now closed**, each with a test that fails against the old code.
+AC-7 remains open and belongs to BrainConnect. Status is recorded per issue below rather
+than by deleting the entry: a defect register that forgets what was wrong cannot tell you
+whether the fix still holds.
 
 **None of these were filed as GitHub issues** — the `gh` CLI is not installed in this
-environment and no API token is available. This file is the register until they are.
+environment and no API token is available. This file is the register.
 
 BrainConnect defects are **reported, not patched.** BrainConnect is a separate repository.
 
@@ -16,7 +18,15 @@ BrainConnect defects are **reported, not patched.** BrainConnect is a separate r
 
 ## AC-1 — Unauthenticated HTTP completion bypasses the audit and the operator gate
 
-**Severity: high.** Defeats operational-contract rules 4 and 5.
+**Severity: high. Status: CLOSED.** Defeated operational-contract rules 4 and 5.
+
+**Fix.** `enforce` is an app-level dependency: every route but `GET /health` resolves a
+bearer token and calls `service.authorize()`. `force` was removed from `CompleteBody`
+entirely; `POST /tasks/{id}/complete/override` is a separate operator-only action that
+requires a reason and records it as a locked decision before completing. Completion is
+attributed to the authenticated principal, never to a body field.
+`tests/test_http_authorization.py` runs a real `uvicorn` server on a real port, holds a
+real managed-session token, and replays every step of the original bypass.
 
 `POST /tasks/{task_id}/complete` (`packages/agentconnect-api/.../routes_compliance.py:104`)
 has no authentication. The HTTP adapter has none at all — no token check, no dependency,
@@ -54,7 +64,16 @@ environment cannot reach; or stop forwarding `AGENTCONNECT_API_*` into agent she
 
 ## AC-2 — `authorize()` is defined, tested, and called by nothing
 
-**Severity: medium (documentation asserts a guarantee that no code provides).**
+**Severity: medium. Status: CLOSED.** Documentation asserted a guarantee no code provided.
+
+**Fix.** The HTTP adapter calls `authorize()` on every route; the MCP server wraps every
+tool registration and calls it with the tool's declared action. `authorize()` gained scope
+binding (`task_id` / `review_id`) and a mode-aware denial: `NEVER_TOKEN_ACTIONS` refuses
+every token including the operator's, `AGENT_FORBIDDEN_ACTIONS` refuses every managed
+agent. Unknown, expired, and revoked tokens now raise `Unauthenticated` (401) rather than
+`PolicyViolation` (403) — *who are you* and *you may not* are different failures.
+
+The CLI still does not authenticate, by design, and `docs/BACKPLANE.md` says so.
 
 `AgentConnectService.authorize(token, action)` (`core/service.py:1531`) validates a session
 token against its scoped action list and raises `PolicyViolation`. Outside `tests/`, it has
@@ -80,7 +99,13 @@ next person, and is the more dangerous of the two states.
 
 ## AC-3 — `.mcp.json` `allowedTools` does not match the registered tools
 
-**Severity: medium (functional).**
+**Severity: medium (functional). Status: CLOSED.**
+
+**Fix.** `core/tools.py` is now the single catalog. `workspace.EXPOSED_MCP_TOOLS` is
+generated from it, `agentconnect-mcp` imports it, and `tests/test_mcp_catalog.py` asserts
+the server registers exactly the catalog, that every advertised name resolves to a real
+tool, and that every tool's action is one a manager actually holds. The parallel
+`phantom_routes()` check does the same job for the HTTP route table.
 
 `EXPOSED_MCP_TOOLS` (`core/workspace.py:46`) is written into every workspace's `.mcp.json`
 as `allowedTools` (`workspace.py:312`). The MCP server registers 17 tools. The lists differ:
@@ -106,7 +131,24 @@ there are 17.
 
 ## AC-4 — BrainConnect's promotion safety gate is invisible to AgentConnect's adapter
 
-**Severity: medium. Contract drift, introduced by BrainConnect `b128e65`.**
+**Severity: medium. Status: CLOSED.** Contract drift, introduced by BrainConnect `b128e65`.
+
+**Fix.** `MemorySafetyRefused` carries BrainConnect's audit-safe summary and is raised for
+both transports — the in-process shim's `SafetyRefused` is recognized structurally (it
+cannot be imported: `wiki` is an optional peer), and the HTTP path by its error code.
+`MemoryUnavailable`, `MemoryServerError`, `MemoryAuthorizationError`, and `InvalidRequest`
+cover the rest; an unrecognized failure is re-raised untouched rather than relabelled.
+`promote_candidate` accepts `safety_override` + `override_reason` and refuses the first
+without the second. AgentConnect never sets the override on its own behalf.
+
+Per-item `safety` survives recall on `MemoryItem.safety`; `quarantined` and `safety`
+survive capture on `CaptureResult`. Quarantine is a field, never inferred from `message`.
+Safety cannot set `trusted`: `tests/test_memory_safety_metadata.py` pins a flagged-but-
+trusted claim and a clean-but-untrusted one.
+
+The dead `status == "promoted"` downgrade in `capture_candidate` was left in place: it
+cannot fire against real BrainConnect, but it is the adapter's contract with *any* backend
+that claims a capture promoted something.
 
 BrainConnect grew a second safety gate at promotion, after AgentConnect's adapter was
 written. Its `promote` now raises `wiki.candidates.SafetyRefused` when a candidate carries
@@ -144,7 +186,11 @@ never fire against real BrainConnect.
 
 ## AC-5 — Capture with no origin actor raises `TypeError` instead of a clean error
 
-**Severity: low.**
+**Severity: low. Status: CLOSED.**
+
+**Fix.** `WikiBrainMemoryAdapter.capture_candidate` refuses an empty `origin_actor_id`
+with `InvalidRequest`, naming its own field, before the call leaves the process. No
+default actor is invented — that would forge the provenance of a memory claim.
 
 AgentConnect's `CaptureRequest.origin_actor_id` defaults to `None`
 (`core/memory.py:186`) and the adapter forwards it verbatim (`memory.py:434`).
@@ -167,7 +213,7 @@ name. Do **not** invent a default actor — that forges provenance on a memory c
 
 ## AC-6 — Two services documented on the same port
 
-**Severity: low (documentation).**
+**Severity: low (documentation). Status: CLOSED** — the example now uses `:8130`.
 
 `docs/BACKPLANE_SPEC_COMPLIANCE.md:146` tells operators to set
 `AGENTCONNECT_API_URL=http://localhost:8787`. `core/bootstrap.py:39` defaults `WIKIBRAIN_URL`
@@ -180,7 +226,7 @@ Moot today only because BrainConnect ships no HTTP server (below).
 
 ## AC-7 — BrainConnect still has no HTTP server; the adapter still defaults to one
 
-**Severity: low. Known, long-standing, not new drift.**
+**Severity: low. Status: OPEN, and not AgentConnect's to close.**
 
 `WikiBrainMemoryAdapter` defaults to `http://localhost:8787` (`core/memory.py:362`,
 `bootstrap.py:39`). BrainConnect ships **no HTTP server**: its only `serve` is
@@ -214,7 +260,19 @@ Adding the name to the denylist would be defense in depth, not a fix.
 
 ---
 
+## New: the tests that keep these closed
+
+* `tests/test_http_authorization.py` — 21 tests. Missing/malformed/unknown/revoked tokens,
+  cross-task scope, manager and reviewer completion denial, `force` unavailable to managed
+  tokens, override reason required and recorded, impersonation refused, and the original
+  bypass replayed against a real HTTP server on a real port.
+* `tests/test_mcp_catalog.py` — 11 tests. The catalog is the source of truth; the token
+  gates MCP tool calls; a revoked token stops a tool mid-session; a tool cannot reach
+  another task.
+* `tests/test_memory_safety_metadata.py` — 22 tests. Safety survives; trust is untouched;
+  the four failure modes are told apart.
+
 ## Reproduction environment
 
-`origin/main`, gate `821 passed, 3 skipped` (`824 passed` with the `safety-secrets`
+`origin/main`, gate `876 passed, 3 skipped` (`879 passed` with the `safety-secrets`
 extra installed). BrainConnect checked out at `b128e65`.

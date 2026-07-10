@@ -402,6 +402,24 @@ def _cmd_audit(svc: AgentConnectService, a: argparse.Namespace) -> None:
         raise SystemExit(EXIT_REFUSED)
 
 
+def _cmd_tokens_issue(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Mint an operator credential for the HTTP adapter.
+
+    Printed once. Only the SHA-256 is stored, so a lost token is re-minted, never
+    recovered. Anyone holding one can complete tasks and promote memory, which is
+    why `_refuse_operator_command` will not let a managed session run this.
+    """
+    token = svc.mint_operator_token(a.actor, ttl_seconds=a.ttl)
+    _emit({
+        "token": token.plaintext,
+        "actor": a.actor,
+        "mode": "operator",
+        "expires_at": token.expires_at,
+        "usage": f'curl -H "Authorization: Bearer {token.plaintext}" ...',
+        "warning": "shown once; store it as you would a password",
+    })
+
+
 def _cmd_complete(svc: AgentConnectService, a: argparse.Namespace) -> None:
     if a.review:
         result = svc.complete_review_audited(
@@ -506,6 +524,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_audit)
+
+    p = top.add_parser("tokens", help="operator credentials for the HTTP adapter")
+    tokens = p.add_subparsers(dest="cmd", required=True)
+    q = tokens.add_parser("issue", help="mint an operator token (shown once)")
+    q.add_argument("--actor", required=True,
+                   help="who this credential speaks for; recorded on every action")
+    q.add_argument("--ttl", type=int, default=12 * 3600, help="seconds (default 12h)")
+    q.set_defaults(func=_cmd_tokens_issue, group="tokens")
 
     p = top.add_parser("complete", help="mark complete — only if the audit passes")
     p.add_argument("task_id", nargs="?")
@@ -787,12 +813,13 @@ def build_parser() -> argparse.ArgumentParser:
 def _refuse_operator_command(args: argparse.Namespace) -> Optional[str]:
     """Operator-only commands, refused inside a managed agent session.
 
-    A session token cannot reach `complete_task`: it is in no mode's action list,
-    so the MCP and HTTP adapters deny it structurally. The CLI is the hole. We hand
-    the agent `AGENTCONNECT_DB_PATH` so its own tools reach the operator's ledger
-    (contract rule 2) — and the CLI opens that ledger *directly*, never consulting
-    the token. A dogfood run found an agent completing its own task from inside its
-    own shell, with the ledger agreeing it was legitimate.
+    A session token cannot reach `complete_task`: `authorize()` refuses it to every
+    managed-agent mode, and the MCP and HTTP adapters both call `authorize()`. The
+    CLI is the remaining hole. We hand the agent `AGENTCONNECT_DB_PATH` so its own
+    tools reach the operator's ledger (contract rule 2) — and the CLI opens that
+    ledger *directly*, never consulting the token. A dogfood run found an agent
+    completing its own task from inside its own shell, with the ledger agreeing it
+    was legitimate.
 
     So the CLI reads the one thing it does have: `AGENTCONNECT_MODE`, set only by
     `launch`/`shell`. Present means "you are the agent, not the operator."
@@ -822,6 +849,12 @@ def _refuse_operator_command(args: argparse.Namespace) -> Optional[str]:
         return (
             f"promoting memory is a human decision; this is a managed agent session "
             f"(AGENTCONNECT_MODE={mode}). Capture a candidate instead."
+        )
+    if group == "tokens":
+        return (
+            f"minting an operator token is an operator action; this is a managed "
+            f"agent session (AGENTCONNECT_MODE={mode}). An operator token would "
+            f"grant exactly the authority this session is denied."
         )
     return None
 

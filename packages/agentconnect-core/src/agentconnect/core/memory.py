@@ -27,7 +27,55 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
+from .errors import AgentConnectError, InvalidRequest
+
 _log = logging.getLogger(__name__)
+
+
+class MemoryBackendError(AgentConnectError):
+    """The memory authority refused, or could not answer.
+
+    Subclassed rather than flattened because the four ways this fails need four
+    different responses. A safety refusal wants a human to look at the content; an
+    unreachable backend wants a retry; a bad candidate wants a fix; an authorization
+    failure wants a credential. A caller that catches one broad exception treats a
+    live credential inside a claim exactly like a dropped TCP connection.
+    """
+
+    code = "memory_backend_error"
+
+
+class MemorySafetyRefused(MemoryBackendError):
+    """The authority's safety policy refused the operation. Not a transport failure.
+
+    `summary` is audit-safe — the authority guarantees it carries no matched text.
+    Overriding is a human judgement made deliberately, with a reason; nothing here
+    ever retries with `safety_override=True`.
+    """
+
+    code = "memory_safety_refused"
+
+    def __init__(self, message: str, summary: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.summary = summary or {}
+
+
+class MemoryUnavailable(MemoryBackendError):
+    """The backend could not be reached. Retryable, and says nothing about content."""
+
+    code = "memory_unavailable"
+
+
+class MemoryServerError(MemoryBackendError):
+    """The backend was reached and failed. Retryable, and also a bug report."""
+
+    code = "memory_server_error"
+
+
+class MemoryAuthorizationError(MemoryBackendError):
+    """The backend rejected our credential. Never retry with the same one."""
+
+    code = "memory_authorization_error"
 
 MemoryProfile = Literal[
     "manager_brief",
@@ -161,6 +209,14 @@ class MemoryItem:
     valid_from: Optional[str] = None
     valid_until: Optional[str] = None
     superseded_by: Optional[str] = None
+    #: The authority's own safety verdict for *the text returned here* — why it was
+    #: masked, or what it was flagged for. Audit-safe: it never carries matched text.
+    #:
+    #: Safety and trust are orthogonal and must stay that way. A clean scan does not
+    #: make a claim true, and a flagged one does not make it false. Nothing in this
+    #: field may set `trusted`; see `label()`, which takes the authority's verdict as
+    #: a separate argument and can only ever downgrade it.
+    safety: Optional[dict[str, Any]] = None
     metadata: dict[str, Any] = field(default_factory=dict)
     #: The authority's id for this item (e.g. WikiBrain `claim_4`). Feedback and
     #: supersession both need to name a claim; without it a manager can report
@@ -197,6 +253,12 @@ class CaptureResult:
     status: MemoryStatus = "pending"
     message: Optional[str] = None
     backend: str = "unknown"
+    #: Stored, but barred from promotion by the authority's capture-time safety pass.
+    #: A structural flag, never inferred from `message`: prose is for humans, and a
+    #: caller that greps it for "quarantine" breaks the day the wording changes.
+    quarantined: bool = False
+    #: The authority's audit-safe capture verdict, when it found something.
+    safety: Optional[dict[str, Any]] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -246,7 +308,9 @@ class TrustedMemoryAdapter(MemoryAdapter):
     @abc.abstractmethod
     def promote_candidate(self, candidate_id: str, promoted_by: str,
                           confidence: Optional[str] = None,
-                          scope: Optional[str] = None) -> dict[str, Any]: ...
+                          scope: Optional[str] = None,
+                          safety_override: bool = False,
+                          override_reason: Optional[str] = None) -> dict[str, Any]: ...
 
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
         return []
@@ -349,6 +413,68 @@ def _http_call(
     return response.json() or {}
 
 
+def _safety_summary(exc: BaseException) -> Optional[dict[str, Any]]:
+    """Pull BrainConnect's audit-safe `SafetyResult` off the exception, if present."""
+    result = getattr(exc, "result", None)
+    if result is None:
+        return None
+    summary = getattr(result, "summary", None)
+    try:
+        return summary() if callable(summary) else (result if isinstance(result, dict) else None)
+    except Exception:  # noqa: BLE001 — a summary that raises must not mask the refusal
+        return None
+
+
+def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
+    """Run a backend call and give its failure a name.
+
+    Two transports reach BrainConnect and they fail in different vocabularies. The
+    in-process shim raises `wiki.candidates.SafetyRefused` directly; the HTTP path
+    raises `httpx.HTTPStatusError`. Neither type can be imported here — `wiki` is an
+    optional peer and `httpx` is a lazy dependency — so both are recognized
+    structurally. Anything unrecognized is re-raised untouched rather than
+    relabelled: guessing wrong about a failure is worse than not naming it.
+    """
+    try:
+        return call()
+    except AgentConnectError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — classify, then re-raise
+        name = type(exc).__name__
+        if name == "SafetyRefused":
+            raise MemorySafetyRefused(
+                f"the memory authority's safety policy refused to promote "
+                f"{candidate_id}: {exc}", _safety_summary(exc)) from exc
+
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            body: dict[str, Any] = {}
+            try:
+                body = response.json() or {}
+            except Exception:  # noqa: BLE001 — a non-JSON error body is still an error
+                body = {}
+            if body.get("error") in ("safety_refused", "memory_safety_refused"):
+                raise MemorySafetyRefused(
+                    f"the memory authority's safety policy refused to promote "
+                    f"{candidate_id}: {body.get('detail') or exc}",
+                    body.get("safety")) from exc
+            if status in (401, 403):
+                raise MemoryAuthorizationError(
+                    f"the memory authority rejected our credential: {exc}") from exc
+            if status in (400, 404, 409, 422):
+                raise InvalidRequest(
+                    f"the memory authority rejected candidate {candidate_id}: {exc}") from exc
+            if status >= 500:
+                raise MemoryServerError(f"the memory authority failed: {exc}") from exc
+
+        if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "TimeoutException",
+                    "TransportError", "NetworkError"):
+            raise MemoryUnavailable(
+                f"the memory authority is unreachable: {exc}") from exc
+        raise
+
+
 class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
     """The trusted authority: pending candidates, promotion, supersession, provenance.
 
@@ -398,6 +524,11 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
                 metadata["contradiction_status"] = contradiction
             if raw.get("validity"):
                 metadata["validity"] = raw["validity"]
+            # The authority's verdict on the representation it just handed us: why
+            # this text was masked, or what it was withheld for. Kept in a dedicated
+            # field, not folded into `metadata`, so a manager can be shown a reason
+            # rather than being handed a shorter pack with no explanation.
+            safety = raw.get("safety") or None
             # THE trust boundary. `trusted` is the authority's verdict and the only
             # authority signal; `status` is not. A missing `trusted` means UNTRUSTED
             # — never inferred from `status == "promoted"`, because a promoted claim
@@ -412,7 +543,7 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
                 superseded_by=raw.get("superseded_by"),
                 valid_from=raw.get("valid_from"), valid_until=raw.get("valid_until"),
                 scope=MemoryScope(scope["scope_type"], scope["scope_id"]) if scope else None,
-                metadata=metadata,
+                safety=safety, metadata=metadata,
             ), self.backend_name, self.role, authority_trusted=authority_trusted))
         visible = apply_visibility(items, request)
         kept = {id(i) for i in visible}
@@ -429,41 +560,75 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
         )
 
     def capture_candidate(self, request: CaptureRequest) -> CaptureResult:
-        body = self._call("POST", "/capture", {
+        # BrainConnect requires `proposed_by` and skips `None` values when building
+        # its request, so an unset origin actor died deep inside its constructor with
+        # a `TypeError` naming a field this side has never heard of. Refuse here,
+        # naming *our* field. Inventing a default actor would be worse than failing:
+        # it would forge the provenance of a memory claim.
+        if not (request.origin_actor_id or "").strip():
+            raise InvalidRequest(
+                "capturing a memory candidate requires origin_actor_id: "
+                "the authority records who proposed a claim, and it may not be guessed")
+        body = _classified(lambda: self._call("POST", "/capture", {
             "text": request.text, "task_id": request.task_id,
             "origin_actor_id": request.origin_actor_id,
             "origin_actor_type": request.origin_actor_type,
             "source_ref": request.source_ref, "tags": request.tags,
             "proposed_scopes": [{"scope_type": s.scope_type, "scope_id": s.scope_id}
                                 for s in request.proposed_scopes],
-        })
+        }), request.origin_actor_id or "<unknown>")
         status = body.get("status", "pending")
         if status == "promoted":
             _log.warning("wikibrain reported promotion on capture; recording as pending")
             status = "pending"
+        quarantined = bool(body.get("quarantined", False))
+        if quarantined:
+            _log.info("wikibrain quarantined candidate %s at capture",
+                      body.get("candidate_id"))
         return CaptureResult(
             accepted=bool(body.get("accepted", True)), candidate_id=body.get("candidate_id"),
             status=status, message=body.get("message"), backend=self.backend_name,
+            quarantined=quarantined, safety=body.get("safety") or None,
         )
 
     def promote_candidate(
         self, candidate_id: str, promoted_by: str,
         confidence: Optional[str] = None, scope: Optional[str] = None,
+        safety_override: bool = False, override_reason: Optional[str] = None,
     ) -> dict[str, Any]:
         """Promote a pending candidate. Human/librarian only.
 
         `confidence` and `scope` are the authority's, not ours, and it will refuse
         to guess either: confidence is what the profile filters compare against
         (`implementation_constraints` requires `high`), and a guessed scope is how a
-        repo-local fact leaks into global recall. We forward them and let WikiBrain
+        repo-local fact leaks into global recall. We forward them and let BrainConnect
         raise if they are missing and cannot be inherited.
+
+        BrainConnect runs its own safety gate here and may refuse. That refusal is
+        raised as `MemorySafetyRefused`, never as a generic backend error: the two
+        call for opposite responses, and a retry loop that cannot tell them apart
+        will hammer a backend that is working correctly and refusing on purpose.
+
+        `safety_override` is never set by AgentConnect on its own behalf. It is
+        forwarded only when a human passes it, and only with a reason.
         """
+        if safety_override and not (override_reason or "").strip():
+            raise InvalidRequest(
+                "overriding a memory safety refusal requires a written reason")
+
         payload: dict[str, Any] = {"promoted_by": promoted_by}
         if confidence is not None:
             payload["confidence"] = confidence
         if scope is not None:
             payload["scope"] = scope
-        body = self._call("POST", f"/candidates/{candidate_id}/promote", payload)
+        if safety_override:
+            payload["safety_override"] = True
+            payload["override_reason"] = override_reason
+
+        body = _classified(
+            lambda: self._call("POST", f"/candidates/{candidate_id}/promote", payload),
+            candidate_id,
+        )
         body.setdefault("claim_id", candidate_id)
         body.setdefault("status", "promoted")
         return body

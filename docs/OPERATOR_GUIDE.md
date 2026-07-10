@@ -62,6 +62,13 @@ Optional adapters: `agentconnect-mcp` (an MCP-speaking harness needs the
 `agentconnect-mcp` binary on `PATH` too), `agentconnect-api`, `agentconnect-linear`,
 `agentconnect-temporal`.
 
+If you run the HTTP adapter, mint yourself an operator credential first — every route but
+`GET /health` requires one:
+
+```sh
+agentconnect tokens issue --actor matthew
+```
+
 ## Configure the ledger
 
 Everything hangs off one environment variable. Set it before any command:
@@ -257,12 +264,30 @@ agentconnect shell --task "$TASK" -- agentconnect complete "$TASK"
 This is a compliance guard, not a security control. An agent that edits its environment
 or opens the SQLite file directly is stopped by nothing here.
 
-> **Do not expose the HTTP adapter to a managed agent.** `agentconnect-api` has no
-> authentication, and `POST /tasks/{id}/complete` accepts `force: true`, which skips the
-> audit. `AGENTCONNECT_API_HOST` and `AGENTCONNECT_API_PORT` are forwarded into the agent's
-> environment, so an agent on the same host is told where to knock. Bind it to loopback,
-> keep it off the agent's network path, or do not run it while agents run. Tracked as AC-1
-> in [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
+### The HTTP adapter
+
+`agentconnect-api` authenticates. Every route except `GET /health` requires a token, and
+the token decides — the same `authorize()` the MCP server calls.
+
+```sh
+agentconnect tokens issue --actor matthew      # printed once; store it like a password
+curl -H "Authorization: Bearer act_…" http://127.0.0.1:8130/tasks/$TASK
+# or: curl -H "X-AgentConnect-Token: $AGENTCONNECT_SESSION_TOKEN" …
+```
+
+A managed agent's own token works over HTTP for exactly what its mode allows, and for its
+own task only. It **cannot** complete a task, promote memory, or approve a subtask, and it
+cannot touch a task it was not launched for. Because that is now enforced rather than
+hoped for, forwarding `AGENTCONNECT_API_HOST` and `AGENTCONNECT_API_PORT` into the agent's
+environment is safe: the address was never the protection.
+
+Ordinary completion cannot skip the audit — there is no `force` field. An administrative
+override is a separate endpoint (`POST /tasks/{id}/complete/override`), operator-only,
+requires a written `reason`, and writes that reason into the ledger as a locked decision
+before the task is completed.
+
+Still true: **this is not a sandbox**, and the CLI is not authenticated. An agent that
+edits its environment or opens the SQLite file directly is stopped by nothing here.
 
 ## How Linear fits
 

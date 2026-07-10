@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from agentconnect.core.bootstrap import service_from_env
@@ -26,6 +26,7 @@ from . import (
     routes_tasks,
     routes_temporal,
 )
+from .authz import PUBLIC_ROUTES, ROUTE_ACTIONS, WEBHOOK_ROUTES, enforce
 from .deps import linear_sync_from_env, status_for
 
 
@@ -33,10 +34,18 @@ def create_app(
     service: Optional[AgentConnectService] = None,
     linear_sync: Optional[object] = None,
 ) -> FastAPI:
+    """Every route authenticates except `GET /health`.
+
+    `enforce` is an **app-level** dependency rather than a per-route decorator. A
+    decorator protects the routes someone remembered to decorate; this protects the
+    ones they did not, because a route with no declared action fails closed with a
+    500 instead of serving. `unmapped_routes()` turns that into a test.
+    """
     app = FastAPI(
         title="AgentConnect",
         description="Local-first task backplane for interchangeable agent managers and workers.",
         version="0.1.0",
+        dependencies=[Depends(enforce)],
     )
     svc = service or service_from_env()
     app.state.service = svc
@@ -65,6 +74,63 @@ def create_app(
     ):
         app.include_router(module.router)
     return app
+
+
+#: FastAPI's own surface, which carries no ledger state and no action.
+_INTROSPECTION = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
+
+
+def declared_routes(app: FastAPI) -> list[tuple[str, str]]:
+    """Every `(method, path)` the app serves, flattened.
+
+    Included routers are *nested* objects in this FastAPI version, not entries in
+    `app.routes`. Walking only the top level finds `/health` and nothing else — which
+    is precisely how a coverage check can pass while covering nothing. Recurse.
+    """
+    found: list[tuple[str, str]] = []
+
+    def walk(routes: object) -> None:
+        for route in routes or ():  # type: ignore[union-attr]
+            # FastAPI ≥0.116 wraps `include_router` results in `_IncludedRouter`,
+            # whose real `APIRoute`s hang off `original_router`. Older versions nest
+            # under `.routes`. Handle both, or a version bump silently empties this.
+            included = getattr(route, "original_router", None)
+            nested = getattr(included, "routes", None) or getattr(route, "routes", None)
+            if nested:
+                walk(nested)
+                continue
+            path = getattr(route, "path", None)
+            if not path or path in _INTROSPECTION:
+                continue
+            for method in getattr(route, "methods", None) or ():
+                if method not in ("HEAD", "OPTIONS"):
+                    found.append((method, path))
+
+    walk(app.routes)
+    return sorted(set(found))
+
+
+def unmapped_routes(app: FastAPI) -> list[tuple[str, str]]:
+    """Routes with no declared action, no public entry, and no webhook exemption.
+
+    Must be empty. A route that appears here is served without `enforce` having
+    anything to ask the service about, so it would be reachable with a token minted
+    for something else entirely.
+    """
+    return [key for key in declared_routes(app)
+            if key not in PUBLIC_ROUTES
+            and key not in WEBHOOK_ROUTES
+            and key not in ROUTE_ACTIONS]
+
+
+def phantom_routes(app: FastAPI) -> list[tuple[str, str]]:
+    """Declared actions for routes that do not exist. The `.mcp.json` bug, again.
+
+    A stale entry is not dangerous, but it is a lie about the surface, and lies about
+    the surface are how the `get_subtask_status` drift survived for months.
+    """
+    real = set(declared_routes(app))
+    return sorted((set(ROUTE_ACTIONS) | set(WEBHOOK_ROUTES)) - real)
 
 
 def main() -> None:
