@@ -8,15 +8,18 @@ read before proposing work.
 
 | | |
 |---|---|
-| Checkpoint | **`28048ed`** on `origin/main` |
-| Gate | `.venv/bin/python -m pytest -q` — **697 passing** |
+| Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
+| Gate | `.venv/bin/python -m pytest -q` — **764 passing** |
+| Safety | baseline local scanning on artifact ingest and context output ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for WikiBrain, Cognee, Graphiti |
 | Temporal | optional; `agentconnect-core` installs and runs with no workflow server |
 | Linear | optional; unconfigured means completion simply fires no hook |
 
-**Feature work is frozen.** Accept only bug fixes found by running the loop,
-documentation corrections, and the small CLI ergonomics needed to run it.
+**Feature work is frozen**, with one explicitly commissioned exception since the
+checkpoint: phase 1 of the local safety scanner. Otherwise accept only bug fixes found by
+running the loop, documentation corrections, and the small CLI ergonomics needed to run
+it.
 
 ## Memory boundary
 
@@ -68,13 +71,18 @@ Worth stating plainly, because a green suite invites more confidence than it has
   makes bypasses visible. It does not contain a hostile process. An agent that edits its
   own environment, or opens the SQLite file directly, is stopped by nothing here. That is
   the documented scope, not an oversight.
+* **The safety scanner is pattern-based.** It catches the credential formats and injection
+  phrasings it has rules for. It is not an adversarial defense: an attacker who knows the
+  rules can write around them. It reduces the ordinary case — a key pasted into an
+  artifact, an injected instruction sitting in a retrieved document — and claims nothing
+  more.
 
 ## Known deferred work
 
-* **AgentConnect-local safety scanning** — secrets, PII, prompt injection, unsafe tool
-  directives, and encoded blobs, checked on AgentConnect-owned surfaces before content is
-  injected into an agent or stored as evidence. Designed, not built; see
-  [SAFETY.md](SAFETY.md). There is **no content scanner today**.
+* **Safety scanning beyond the first two surfaces.** `artifact_ingest` and
+  `context_output` are implemented ([SAFETY.md](SAFETY.md)). `subtask_instruction`,
+  `review_input`, and `attempt_decision_notes` are named and have no policy. There is **no
+  PII rule**.
 * `wiki serve` — WikiBrain's HTTP transport. **Deferred, and not AgentConnect's task.**
   Tracked here only as a known integration gap. Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is

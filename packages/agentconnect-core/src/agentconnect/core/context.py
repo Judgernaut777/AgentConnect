@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
+from .. import safety
 from .memory import (
     BROAD_RETRIEVAL,
     DEFAULT_MAX_ITEMS,
@@ -439,12 +440,15 @@ class ContextBuilder:
         adapters: dict[str, MemoryAdapter],
         config: Optional[MemoryConfig] = None,
         ranker: Optional[MemoryRanker] = None,
+        safety_enabled: bool = True,
     ) -> None:
         self.service = service
         self.adapters = adapters
         self.config = config or MemoryConfig()
         self.router = MemoryRouter(self.config, adapters)
         self.ranker = ranker or MemoryRanker()
+        #: Scan recalled items before they leave for an agent. See `_apply_safety`.
+        self.safety_enabled = safety_enabled
 
     # ------------------------------------------------------------- ledger
     def _ledger_items(self, detail: Any) -> list[MemoryItem]:
@@ -550,9 +554,58 @@ class ContextBuilder:
 
         merged = self.ranker.merge_and_rank(packs, profile, budget)
         merged.query = query
-        merged.warnings = list(dict.fromkeys(merged.warnings + warnings))
+        merged.items, safety_warnings = self._apply_safety(merged.items)
+        merged.warnings = list(dict.fromkeys(merged.warnings + warnings + safety_warnings))
         return ContextPack(
             task_id=task_id, profile=profile, handoff=handoff, memory=merged,
             backends_queried=backends, scopes_queried=resolution.as_strings(),
             warnings=merged.warnings,
         )
+
+    # ------------------------------------------------------------- safety
+    def _apply_safety(self, items: list[MemoryItem]) -> tuple[list[MemoryItem], list[str]]:
+        """Scan recalled items before an agent sees them (safety `context_output`).
+
+        This is the surface prompt injection exists to attack: text retrieved from a
+        backend, about to be handed to an agent as context. A secret is redacted; a
+        high-confidence injection is withheld entirely.
+
+        **Nothing is dropped silently.** A withheld item returns a warning naming the
+        count, because a context pack that quietly got shorter is indistinguishable
+        from one that had nothing to say — and the second is the reading an agent
+        will make.
+
+        Only *recalled memory* is scanned. Ledger truth — locked decisions, hard
+        policy — is AgentConnect's own record, and redacting a decision would corrupt
+        the thing the audit relies on. Scanning attempts and decisions is a separate,
+        later surface (`attempt_decision_notes`).
+
+        Memory failure degrades a pack; a safety failure withholds an item. The two
+        are different: we know how to proceed without a memory backend, and we do not
+        know what is inside text we could not read.
+        """
+        if not self.safety_enabled or not items:
+            return items, []
+
+        try:
+            batch = safety.scan_items(
+                [safety.SafetyItem(id=str(i), text=item.text)
+                 for i, item in enumerate(items)],
+                policy=safety.CONTEXT_OUTPUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — never hand back unscanned context
+            _log.warning("context safety scan failed: %s", exc)
+            return [], [f"all {len(items)} context items were withheld: "
+                        f"AgentConnect safety scanning failed ({exc})."]
+
+        kept: list[MemoryItem] = []
+        for index, item in enumerate(items):
+            result = batch.results[str(index)]
+            if result.withheld:
+                continue
+            if result.redacted:
+                item.text = result.redacted_content
+            if result.labels:
+                item.metadata = {**(item.metadata or {}), "safety_labels": result.labels}
+            kept.append(item)
+        return kept, batch.warnings()

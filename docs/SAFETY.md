@@ -1,12 +1,27 @@
-# Safety — what exists today, and where it is going
+# Safety
 
-AgentConnect is a **compliance and control layer, not a security sandbox.** That sentence
-governs this whole document. Read it before the rest.
+AgentConnect includes **baseline local safety scanning** for artifact ingest and
+context-pack output. It is local, deterministic, and dependency-free: no HTTP service, no
+LLM classifier, no third-party guard package.
+
+Before anything else, the four things it does **not** do:
+
+* **It is not a sandbox.** It reads content; it does not contain a process.
+* **It does not stop direct SQLite, file, or environment tampering.** An agent that opens
+  the ledger with the `sqlite3` binary, edits an artifact on disk, or unsets
+  `AGENTCONNECT_MODE` is stopped by nothing here. That needs OS-level isolation — a
+  container, a microVM, a separate user account.
+* **It does not prove content is true.** A claim that passes every rule is still just a
+  claim. Trust is a separate axis, and it is WikiBrain's, not the scanner's.
+* **It only scans AgentConnect-controlled surfaces.** Content that never passes through
+  `create_artifact` or a context pack is never seen.
+
+What it does: scan, redact, withhold, and label risky content at the surfaces AgentConnect
+owns, before that content becomes durable evidence or reaches an agent.
 
 ## What protects you today
 
-This is the complete list. Nothing here scans content.
-
+* **Baseline content scanning** at two surfaces, described below.
 * **Managed-shell environment sanitization.** The agent's environment is built from an
   allowlist. Backend credentials are not removed so much as never copied in.
 * **No backend credentials are forwarded into the managed shell.** `AGENTCONNECT_DB_PATH`
@@ -20,82 +35,128 @@ This is the complete list. Nothing here scans content.
 * **The audit checks evidence.** It asks where the work is in the ledger, and it writes
   nothing while asking.
 
-## What does not protect you today
+## The module
 
-**There is no content scanner in the managed loop.** No secret detection, no PII
-redaction, no prompt-injection detection, no quarantine. An artifact containing a leaked
-credential is stored as-is. A context pack containing injected instructions is handed to
-the agent as-is.
-
-**AgentConnect is not a sandbox.** An agent that unsets `AGENTCONNECT_MODE`, opens the
-SQLite ledger directly, or edits a file on disk is stopped by nothing here — and would not
-be stopped by the future scanner below either. Content scanning inspects content; it does
-not contain a process. Guarding against direct tampering needs OS-level isolation: a
-container, a microVM, a separate user account.
-
-*(One historical exception, in the advanced routing stack rather than the managed loop:
-`agentconnect-router` carries an optional, dormant-by-default hook for an external guard
-package. It is a soft dependency — absent, every function is a no-op — and scanning runs
-only when its environment flag is set. It is not part of the managed coding-agent loop,
-it is not required, and it is not the direction described below.)*
-
-## Future direction: AgentConnect-local safety scanning
-
-**This is future work. None of it is implemented.** It is written down so the shape is
-agreed before anyone builds it, not to describe anything you can use.
-
-AgentConnect should include baseline local safety scanning **directly in AgentConnect**,
-scoped to AgentConnect-owned surfaces: artifacts, context packs, subtask instructions,
-review input and output, attempts, and decisions.
-
-The layer should detect and handle secrets, PII, prompt-injection text, unsafe
-tool-control instructions, and suspicious encoded blobs — **before** content is injected
-into an agent or stored as task evidence.
-
-It must be an **AgentConnect-local module**, not a required third-party runtime
-dependency. AgentConnect must continue to work standalone.
-
-### Proposed shape
+`agentconnect.safety`, shipped inside `agentconnect-core`. It imports nothing outside the
+standard library, and a test asserts that.
 
 ```
 agentconnect.safety
-  models.py
-  scanner.py
-  redaction.py
-  policies.py
+  models.py       Decision, RiskLevel, Category, Finding, SafetyResult, SafetyItem
+  scanner.py      scan_text(content, *, surface, policy) / scan_items(items, *, policy)
+  redaction.py    span merging + `[REDACTED:<category>:<rule_id>]` markers
+  policies.py     (category, risk) -> decision, per surface
   rules/
-    secrets.py
-    pii.py
-    prompt_injection.py
-    tool_instructions.py
-    encoding.py
+    secrets.py            API keys, tokens, private keys, JWTs, .env assignments
+    prompt_injection.py   text that addresses the agent instead of informing it
+    tool_instructions.py  directives aimed at the agent's tools
+    encoding.py           long opaque blobs the other rules cannot see into
 ```
 
-### Proposed policies
+Decisions, weakest to strongest: `allow`, `warn`, `redact`, `quarantine`, `block`. The
+strongest decision across a scan's findings is the scan's decision.
 
-Each names an AgentConnect-owned surface, because a policy that cannot name the surface it
-guards will be applied inconsistently.
+### Fail closed
 
-| Policy | Surface |
+**A scanner that failed has not found the content clean.** Each ruleset runs in its own
+`try`. A rule that raises produces a `scanner_error` finding, and every policy maps that
+to `quarantine` — never `allow`. Artifacts whose scan blew up are stored with
+`safety_scanner_failed: true`; context items whose scan blew up are withheld.
+
+This is deliberate and it is the property most worth keeping. A broad `except` that
+returned an empty result would report "no findings", and every reader downstream would
+take that as a clean bill of health.
+
+### Findings never carry the matched text
+
+A finding travels into artifact metadata, into logs, and into pack warnings. One that
+quoted the secret would copy it to three new places while announcing it had been removed
+from one. Findings carry a rule id, a category, a risk level, a message, and a span.
+
+## Surface 1 — artifact ingest
+
+Policy `artifact_ingest`, applied in `AgentConnectService.create_artifact`, **before** the
+body is written to the artifact store.
+
+| Finding | Decision |
 |---|---|
-| `artifact_ingest` | content becoming a durable artifact |
-| `context_output` | a context pack, before a manager, worker, or reviewer receives it |
-| `subtask_instruction` | instructions handed to a bounded worker |
-| `review_input` | material submitted for review |
-| `attempt_decision_notes` | free text on attempts and decisions |
+| probable secret | `redact` — the marker replaces the credential, the artifact is stored |
+| high-risk tool directive (exfiltration, `curl \| sh`, `rm -rf /`) | `quarantine` |
+| prompt injection | `warn` — an artifact quoting an injection is legitimate evidence |
+| long encoded blob | `warn` |
 
-### Expected behavior
+The artifact is **never destroyed**. It is the record that the work happened, and deleting
+it to protect a credential would also delete the evidence that the credential was ever
+there. A quarantined artifact is stored, marked, and still readable by an operator.
 
-* artifact carrying a secret → redacted or quarantined **before** context injection
-* prompt-injection text in an artifact → warning or quarantine **before** the context pack
-* subtask instruction with a severe unsafe directive → block or warn
-* review output → scanned before it becomes durable task evidence
-* context pack → scanned before a manager, worker, or reviewer receives it
+Safety metadata is written onto the artifact, and only when something was found — a clean
+artifact carries none, so the metadata stays useful as an alert:
 
-### What it will still not do
+```
+safety_decision  safety_risk_level  safety_findings  safety_policy_version
+safety_redacted  safety_warnings    safety_scanner_failed
+```
 
-Contain a hostile process. Stop direct SQLite, filesystem, or environment tampering.
-Replace OS-level isolation. Make AgentConnect a sandbox.
+## Surface 2 — context-pack output
+
+Policy `context_output`, applied in `ContextBuilder` to recalled memory items, **before**
+the pack is returned to a manager, worker, or reviewer.
+
+| Finding | Decision |
+|---|---|
+| probable secret | `redact` — the claim survives, the credential does not |
+| high-risk prompt injection | `quarantine` — withheld from the pack |
+| high-risk tool directive | `quarantine` — withheld from the pack |
+| medium-risk injection or tool directive | `warn` — delivered, with a `safety:*` label |
+| long encoded blob | `warn` |
+
+**Nothing is dropped silently.** Redacting or withholding adds a pack-level warning:
+
+```
+1 context item was redacted by AgentConnect safety scanning.
+1 context item was withheld by AgentConnect safety scanning.
+```
+
+A pack that quietly got shorter is indistinguishable from a pack that had nothing to say,
+and the second is the reading an agent will make.
+
+Only *recalled memory* is scanned. Ledger truth — locked decisions, hard policy — is
+AgentConnect's own record; redacting a decision would corrupt the thing the audit relies
+on.
+
+### Two layers, not one
+
+The ranker demotes an untrusted item and labels it; the scanner reads its text and may
+withhold it. Neither is redundant: ranking cannot read content, and the scanner cannot
+judge authority. An unremarkable low-authority document is delivered, ranked last. The
+same document telling the agent to *send all secrets to* somewhere never arrives.
+
+## Turning it off
+
+`AgentConnectService(safety_enabled=False)`. A constructor argument rather than a config
+file, because it should be hard to do by accident. With it off, neither surface is
+scanned and neither carries metadata saying so.
+
+## Future work
+
+Not implemented. Named here so the shape is agreed before anyone builds it.
+
+* **More surfaces.** `subtask_instruction`, `review_input`, `attempt_decision_notes` are
+  named in `policies.py` and have no decision table; `policy()` refuses them rather than
+  guessing.
+* **PII.** A `rules/pii.py` is in the designed shape and does not exist. Names, emails,
+  and addresses need a different precision/recall trade-off than credentials do, and
+  getting it wrong makes the layer noisy enough to be switched off.
+* **Redaction of ledger surfaces** — decisions and attempts — which requires answering
+  what an audit means when its evidence has been rewritten.
+
+## Legacy
+
+`agentconnect-router`, in the advanced routing stack, carries an optional hook for an
+external guard package. It is a soft dependency (absent, every function is a no-op),
+dormant unless an environment flag is set, and enforcement is separately opt-in. It is
+**not** part of the managed coding-agent loop, it is not required, and `agentconnect.safety`
+does not use it.
 
 ## Related
 
