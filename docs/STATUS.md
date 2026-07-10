@@ -12,7 +12,7 @@ read before proposing work.
 | Gate | `.venv/bin/python -m pytest -q` — **821 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
-| Memory backends | none wired by default; adapters exist for WikiBrain, Cognee, Graphiti |
+| Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
 | Temporal | optional; `agentconnect-core` installs and runs with no workflow server |
 | Linear | optional; unconfigured means completion simply fires no hook |
 
@@ -21,13 +21,34 @@ checkpoint: phase 1 of the local safety scanner. Otherwise accept only bug fixes
 running the loop, documentation corrections, and the small CLI ergonomics needed to run
 it.
 
+## AgentConnect is standalone
+
+Nothing below is required. AgentConnect runs, and its gate is green, with none of it:
+
+* **BrainConnect** (trusted memory) — optional. Without it, AgentConnect uses local task
+  state and the default no-op memory adapter.
+* **ComputeConnect** — **does not exist.** AgentConnect ships its own execution, routing,
+  and model seams. Contract: [COMPUTECONNECT_CONTRACT.md](COMPUTECONNECT_CONTRACT.md).
+* **ToolConnect** — **does not exist.** AgentConnect ships a fixed MCP tool set.
+  Contract: [TOOLCONNECT_CONTRACT.md](TOOLCONNECT_CONTRACT.md).
+* Linear, Temporal, Cognee, Graphiti, a local model manager — all optional, none
+  configured by default.
+
+Optional integrations add capability. None is a dependency, and none may become one
+without a decision recorded here.
+
+**On the name.** BrainConnect was renamed from *WikiBrain* on GitHub; its code was not.
+The package, the `wiki` CLI, `WikiBrainMemoryAdapter`, and `WIKIBRAIN_URL` /
+`WIKIBRAIN_WRITE_TOKEN` still say `wikibrain`, and those names are load-bearing. This
+documentation says BrainConnect for the product and `wikibrain` for identifiers.
+
 ## Memory boundary
 
-Implemented and validated. Every backend below is **optional**: WikiBrain is an optional
-trusted-memory ledger integration, and AgentConnect works without it, using local task
-state and the default no-op memory adapter.
+Implemented and validated. Every backend below is **optional**: BrainConnect is an
+optional trusted-memory ledger integration, and AgentConnect works without it, using local
+task state and the default no-op memory adapter.
 
-* When they are configured: AgentConnect controls **access**, WikiBrain controls
+* When they are configured: AgentConnect controls **access**, BrainConnect controls
   **trust**, Cognee adds breadth, Graphiti adds temporal reasoning. The `ContextBuilder`
   decides what a manager or worker actually sees.
 * `trusted` is the authority signal. `status == "promoted"` is **not** authority. A
@@ -57,12 +78,12 @@ enforced.
 
 Worth stating plainly, because a green suite invites more confidence than it has earned.
 
-* **No test exercises real WikiBrain over real HTTP.** `tests/test_agent_loop_e2e.py`
+* **No test exercises real BrainConnect over real HTTP.** `tests/test_agent_loop_e2e.py`
   runs a real HTTP server on a real port that serves *canned* responses — it proves the
   adapter's httpx path, not the ledger. `tests/test_wikibrain_integration.py` drives real
   `wiki.api` **in-process** through a transport shim — it proves the semantics, not the
   wire. Nothing has both halves. Closing that needs `wiki serve`, which belongs to
-  WikiBrain.
+  BrainConnect.
 * **Cognee and Graphiti are exercised only through transport doubles.** Field names and
   shapes are asserted; no real service has ever answered.
 * **Temporal is tested against the in-process time-skipping test server**, never a
@@ -89,7 +110,7 @@ Worth stating plainly, because a green suite invites more confidence than it has
   `attempt_decision_notes` are named and have no policy.
 * **Containment / spotlighting** for `context_output` — deferred, with reasoning in
   SAFETY.md.
-* `wiki serve` — WikiBrain's HTTP transport. **Deferred, and not AgentConnect's task.**
+* `wiki serve` — BrainConnect's HTTP transport. **Deferred, and not AgentConnect's task.**
   Tracked here only as a known integration gap. Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is
   designed for and deliberately unbuilt).
@@ -97,11 +118,28 @@ Worth stating plainly, because a green suite invites more confidence than it has
 * Mem0 / Supermemory adapters; soft user-preference memory. Both explicitly excluded.
 * Contradiction *detection* between promoted claims.
 
+## Open defects
+
+Found by validating the integrations, reproduced, and not yet fixed. Full detail and
+reproductions in [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
+
+* **AC-1 (high)** — the HTTP adapter is unauthenticated, and `POST /tasks/{id}/complete`
+  with `force: true` skips the audit. `AGENTCONNECT_API_*` is forwarded into agent shells.
+  Do not run `agentconnect-api` on an agent's network path.
+* **AC-2 (medium)** — `service.authorize()` is defined and tested but called by no
+  adapter. Session-token scopes are data, not enforcement.
+* **AC-3 (medium)** — `.mcp.json`'s `allowedTools` advertises a tool that does not exist
+  (`get_subtask_status`) and omits eight that do, including every memory tool.
+* **AC-4 (medium)** — BrainConnect's `b128e65` added a promotion safety gate raising
+  `SafetyRefused`, plus a `safety_override` path. AgentConnect's adapter models neither.
+* **AC-5 / AC-6 / AC-7 (low)** — capture with no origin actor raises `TypeError`; two
+  services documented on port 8787; BrainConnect still ships no HTTP server.
+
 ## What would reopen work
 
 Only these, and each needs a concrete reproduction:
 
 1. a bug found by running the loop;
-2. a field-shape mismatch against real WikiBrain;
+2. a field-shape mismatch against real BrainConnect;
 3. a trust or scope mismatch;
 4. a migration issue.

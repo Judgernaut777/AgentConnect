@@ -5,22 +5,24 @@ remote worker any way to read privileged memory back. Memory flows **one way, up
 trust gradient**, so the privacy problem is dissolved by topology instead of by a new
 per-tier access model.
 
-The memory store is [WikiBrain](https://github.com/Judgernaut777/WikiBrain) — a
+The memory store is [BrainConnect](https://github.com/Judgernaut777/BrainConnect) — a
 human-gated knowledge base exposed over MCP (`brain_capture` to write, `brain_recall` /
-`brain_search` / `brain_graph` / `brain_hybrid` to read).
+`brain_search` / `brain_graph` / `brain_hybrid` to read). It is **optional**; AgentConnect
+runs without it. BrainConnect was renamed from *WikiBrain* and its code still says
+`wikibrain` — the `wiki` CLI below is not a typo.
 
 ## The one-way rule
 
-- **Capture = write-only, any worker → WikiBrain.** A worker only ever sends data it
+- **Capture = write-only, any worker → BrainConnect.** A worker only ever sends data it
   *already holds*, so a write leaks nothing. Even a remote or untrusted worker may
   contribute its own findings. Each capture carries provenance (`task_id`,
   `agent_type`, `privacy_class`) embedded in the payload, and lands as **unvetted
-  pending material** behind WikiBrain's morning human gate — it never auto-promotes to
+  pending material** behind BrainConnect's morning human gate — it never auto-promotes to
   truth.
 - **Recall = the manager only.** The single highest-trust entity — the orchestrator that
   already sees every task — is the only reader. Peers and lower-tier workers have **no
   recall path**, so lateral or downward leakage is *structurally impossible*. No
-  `may_claim`-style tier check has to be built inside WikiBrain.
+  `may_claim`-style tier check has to be built inside BrainConnect.
 - **Re-injection uses the existing privacy pass.** When the manager hands remembered
   context *down* into a delegated subtask, it flows through the router's existing
   classify/redact-on-submit path. The manager, already the privacy authority, governs
@@ -32,7 +34,7 @@ the hardest part of a symmetric design.
 
 ## Two faces of the same brain
 
-WikiBrain gates its MCP tools by mode (`wiki mcp serve [--read-only|--contribute-only]`):
+BrainConnect gates its MCP tools by mode (`wiki mcp serve [--read-only|--contribute-only]`):
 
 | Face | Command | Tools exposed |
 |---|---|---|
@@ -59,7 +61,7 @@ other outbound capability:
   The prompt states plainly: *writes to shared memory; you cannot read it back.*
 - **`MemorySink` protocol** (`runtime/memory.py`). `capture(text, *, provenance) -> str`.
   Concrete implementations:
-  - `McpStdioMemorySink` — a persistent stdio MCP client to a contribute-only WikiBrain.
+  - `McpStdioMemorySink` — a persistent stdio MCP client to a contribute-only BrainConnect.
     One background event loop holds one session, so a long-lived worker pays the
     subprocess/handshake cost once and every `remember` reuses it.
   - `NullMemorySink` — the default when nothing is wired; `capture` returns an
@@ -90,5 +92,5 @@ runtime = LangGraphAgentRuntime(
 )
 ```
 
-The manager, separately, adds a **recall-capable** WikiBrain (`wiki mcp serve`) to its
+The manager, separately, adds a **recall-capable** BrainConnect (`wiki mcp serve`) to its
 own MCP client config — never exposed to workers.

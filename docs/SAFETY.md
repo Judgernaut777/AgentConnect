@@ -19,7 +19,7 @@ Before anything else, the four things this does **not** do:
   opens the ledger with the `sqlite3` binary, edits an artifact on disk, or unsets
   `AGENTCONNECT_MODE` is stopped by nothing here. That needs OS-level isolation.
 * **It does not prove content is true.** A claim that passes every rule is still a
-  claim. Trust is a separate axis, and it is WikiBrain's, not the scanner's.
+  claim. Trust is a separate axis, and it is BrainConnect's, not the scanner's.
 * **It only scans AgentConnect-controlled surfaces.** Content that never passes
   through `create_artifact` or a context pack is never seen.
 
@@ -227,19 +227,28 @@ config key, because it should be hard to do by accident.
 * **Redaction of ledger surfaces** — decisions and attempts — which requires deciding
   what an audit means when its evidence has been rewritten.
 
-## A known interaction: detect-secrets and WikiBrain
+## Scanning twice: AgentConnect and BrainConnect
 
-Installing `detect-secrets` into a shared environment changes WikiBrain's behavior.
-WikiBrain runs its own promotion-time safety check through detect-secrets **with the
-entropy plugins on**, and those plugins fire on ordinary English words — `token`,
-`Refresh`, `lives`, `validation` are all flagged as `Base64HighEntropyString`. The
-result is that WikiBrain refuses to promote plain-prose claims once the library is
-present.
+[BrainConnect](https://github.com/Judgernaut777/BrainConnect) (the memory ledger, still
+named `wikibrain` in code) grew its own safety layer in its commit `b128e65`. It now
+scans on recall and again at promotion. AgentConnect re-scans whatever BrainConnect
+returns, under `context_output`.
 
-That is why this repository's gate runs with the extra absent, and why AgentConnect's
-adapter disables the entropy plugins unless an operator asks for them. If you enable
-`safety-secrets` alongside WikiBrain, expect promotion refusals until WikiBrain's own
-plugin set is narrowed. WikiBrain is frozen; nothing here changes it.
+That double scan is deliberate, not an oversight. The two answer different questions:
+BrainConnect asks whether a claim may leave *its* ledger, and AgentConnect asks whether
+this text may reach *this* agent on this surface. AgentConnect cannot delegate the second
+question to a backend it does not control — an operator may swap the memory adapter for
+one with no scanner at all, and `context_output` must still hold.
+
+The cost is that a masked span may be masked twice, which is harmless, and that a
+BrainConnect recall warning arrives alongside an AgentConnect one. Both are surfaced.
+
+**A historical note, because it is easy to rediscover.** Before `b128e65`, installing
+`detect-secrets` into a shared environment made BrainConnect refuse to promote ordinary
+prose: its entropy plugins score short English words like `token` and `validation` as
+`Base64HighEntropyString`. BrainConnect fixed this itself with a minimum-length guard.
+AgentConnect's adapter had already reached the same conclusion independently and leaves
+the entropy plugins off unless an operator asks for them. Nothing here works around it.
 
 ## Notes on reuse
 

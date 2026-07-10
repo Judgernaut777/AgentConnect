@@ -143,7 +143,7 @@ final results only in chat or unregistered files.
 `launch` writes `.env.agentconnect`:
 
 ```
-AGENTCONNECT_API_URL=http://localhost:8787
+AGENTCONNECT_API_URL=http://localhost:8130   # not 8787: WIKIBRAIN_URL defaults there
 AGENTCONNECT_TASK_ID=task_123
 AGENTCONNECT_REVIEW_ID=
 AGENTCONNECT_MANAGER_ID=claude-code

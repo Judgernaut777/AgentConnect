@@ -203,12 +203,19 @@ credential by name; anything matching `*_API_KEY`, `*_SECRET`, `*_TOKEN` and
 friends is refused there with an error rather than quietly obeyed.
 
 *Credentials.* An agent gets exactly one: a short-lived `act_…` session token,
-scoped to its session, entity, and mode. Manager mode buys ten actions, reviewer
+scoped to its session, entity, and mode. Manager mode names ten actions, reviewer
 mode six, readonly four. `promote_memory_candidate`, `temporal_signal`,
-`secrets_read`, `grant_approval`, and `complete_task` are in **no** mode's list,
-so the deny is structural rather than a special case. Only the token's SHA-256 is
-stored; the plaintext exists just long enough to write the env file. Ending the
-shell revokes it, so a leaked `.env.agentconnect` is inert.
+`secrets_read`, `grant_approval`, and `complete_task` are in **no** mode's list.
+Only the token's SHA-256 is stored; the plaintext exists just long enough to write
+the env file. Ending the shell revokes it, so a leaked `.env.agentconnect` is inert.
+
+Read that scope as *data*, not as enforcement. `service.authorize(token, action)`
+exists and is tested, but **no adapter calls it** — not MCP, not the CLI, not the
+HTTP API. What actually denies `complete_task` today is that no MCP tool exposes it
+and the CLI refuses it under `AGENTCONNECT_MODE`. The deny is structural; the token
+is not currently the thing doing it. Tracked as AC-2 in
+[INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md), together with AC-1: the HTTP adapter
+is unauthenticated and its `force` flag skips the audit.
 
 *Ids are inferred.* `AGENTCONNECT_TASK_ID` and `AGENTCONNECT_MANAGER_ID` are in the
 environment, and every MCP tool falls back to them. An agent that cannot mistype an

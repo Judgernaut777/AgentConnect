@@ -2,7 +2,8 @@
 
 > **A control plane for managed coding-agent work.** Self-hosted, privacy-first, and
 > standalone — nothing else is required to run it. It can *optionally* integrate with
-> [WikiBrain](https://github.com/Judgernaut777/WikiBrain) for trusted long-term memory.
+> [BrainConnect](https://github.com/Judgernaut777/BrainConnect) for trusted long-term
+> memory.
 
 AgentConnect is a task, artifact, decision, review, routing, and handoff backplane for coding agents. It provides a managed launch / shell workflow for tools like Codex or Claude Code, records agent work in an operator ledger, injects bounded context into workers, supports review and audit, and prevents normal managed-agent sessions from completing their own tasks. It is a compliance/control layer, not a security sandbox.
 
@@ -83,8 +84,9 @@ an honest account of what the test suite does *not* prove.
 
 The dogfood run behind the current checkpoint validated the managed-agent loop using
 `DirectExecutionBackend`, with **no Temporal, no Linear, and no configured external memory
-backends**. Adapters for WikiBrain, Cognee, and Graphiti exist and are exercised against
-transport doubles and in-process semantics; no real service has answered over the network.
+backends**. Adapters for BrainConnect, Cognee, and Graphiti exist and are exercised
+against transport doubles and in-process semantics; no real service has answered over the
+network.
 
 ## Packages
 
@@ -107,11 +109,32 @@ stays `agentconnect.*`):
 
 AgentConnect is standalone. None of these is required, and none is configured by default.
 
-**WikiBrain** is an optional trusted-memory ledger integration. AgentConnect works without
-it, using local task state and the default no-op memory adapter. Also optional: Linear
-(tracker mirror), Temporal (durable workflows), Cognee (broad retrieval), Graphiti
-(temporal graph), and a local model manager. `wiki serve` — real WikiBrain over real
-HTTP — is deferred and belongs to the WikiBrain repository.
+**BrainConnect** is an optional trusted-memory ledger integration. AgentConnect works
+without it, using local task state and the default no-op memory adapter. Also optional:
+Linear (tracker mirror), Temporal (durable workflows), Cognee (broad retrieval), Graphiti
+(temporal graph), and a local model manager. `wiki serve` — real BrainConnect over real
+HTTP — is deferred and belongs to the BrainConnect repository.
+
+Two sibling projects are **planned, not built**. AgentConnect runs, today, with neither:
+
+* **ComputeConnect** would own model providers, local inference, and execution backends.
+  AgentConnect currently ships those seams itself. The contract it will publish is
+  [docs/COMPUTECONNECT_CONTRACT.md](docs/COMPUTECONNECT_CONTRACT.md).
+* **ToolConnect** would own tool discovery, permission, and invocation. AgentConnect
+  currently ships a fixed MCP tool set. The contract is
+  [docs/TOOLCONNECT_CONTRACT.md](docs/TOOLCONNECT_CONTRACT.md).
+
+Neither exists as a dependency, neither is importable, and nothing in this repository
+requires them.
+
+### On the name `wikibrain`
+
+BrainConnect was renamed from *WikiBrain*, and the rename has not reached its code. The
+Python package, the `wiki` CLI, the adapter class `WikiBrainMemoryAdapter`, and the
+environment variables `WIKIBRAIN_URL` / `WIKIBRAIN_WRITE_TOKEN` all still say `wikibrain`.
+**Those names are load-bearing — do not "correct" them in a config file.** This
+documentation says BrainConnect when it means the product and `wikibrain` when it means
+an identifier you must type.
 
 ---
 

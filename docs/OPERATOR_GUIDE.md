@@ -33,6 +33,17 @@ What the layer *does* buy you: an agent cannot casually reach a credential that 
 in its environment, cannot mistype a task id, cannot complete its own work with the
 command sitting right there, and cannot make the audit agree that undone work is done.
 
+## What you need, and what you do not
+
+AgentConnect is standalone. The loop below needs `agentconnect-core`, `agentconnect-cli`,
+a database path, and a coding agent. It needs **no** memory backend, **no** tracker, **no**
+workflow server, and **no** GPU.
+
+BrainConnect (trusted memory), Linear, Temporal, Cognee, Graphiti, and a local model
+manager are all optional and unconfigured by default. ComputeConnect and ToolConnect do
+not exist; AgentConnect ships those seams itself. If an instruction below seems to require
+one of them, that is a documentation bug — report it.
+
 ## Install
 
 `agentconnect-core` alone gives you the library, not the command. Install the CLI too:
@@ -233,10 +244,10 @@ Regenerates the handoff, audits, marks the ledger `succeeded`, and *only then* f
 completion hooks that tell Linear. A hook that raises is logged, never fatal: a tracker
 outage cannot un-complete finished work.
 
-Completion is an **operator** action. A session token cannot reach `complete_task` — it
-is in no mode's action list, so MCP and HTTP deny it structurally. The CLI additionally
-refuses `complete` and `memory promote` whenever `AGENTCONNECT_MODE` is set, which is
-exactly when it is running inside a managed agent session:
+Completion is an **operator** action. No MCP tool exposes it, so a managed agent's MCP
+surface cannot reach it. The CLI refuses `complete` and `memory promote` whenever
+`AGENTCONNECT_MODE` is set, which is exactly when it is running inside a managed agent
+session:
 
 ```sh
 agentconnect shell --task "$TASK" -- agentconnect complete "$TASK"
@@ -245,6 +256,13 @@ agentconnect shell --task "$TASK" -- agentconnect complete "$TASK"
 
 This is a compliance guard, not a security control. An agent that edits its environment
 or opens the SQLite file directly is stopped by nothing here.
+
+> **Do not expose the HTTP adapter to a managed agent.** `agentconnect-api` has no
+> authentication, and `POST /tasks/{id}/complete` accepts `force: true`, which skips the
+> audit. `AGENTCONNECT_API_HOST` and `AGENTCONNECT_API_PORT` are forwarded into the agent's
+> environment, so an agent on the same host is told where to knock. Bind it to loopback,
+> keep it off the agent's network path, or do not run it while agents run. Tracked as AC-1
+> in [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md).
 
 ## How Linear fits
 
