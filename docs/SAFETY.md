@@ -23,6 +23,13 @@ Before anything else, the four things this does **not** do:
 * **It only scans AgentConnect-controlled surfaces.** Content that never passes
   through `create_artifact` or a context pack is never seen.
 
+The safety layer is **built in and standalone.** The default install carries the
+baseline engine and needs no external service — not BrainConnect, not ComputeConnect,
+not ToolConnect, none of which is a dependency. The third-party engines below are
+opt-in, and BrainConnect (when configured) runs its *own* safety pass; the two are
+independent, and neither requires the other. See [STATUS.md](STATUS.md) for the
+standalone posture across the whole product.
+
 ## Who decides what
 
 | AgentConnect owns | Engines own |

@@ -146,6 +146,12 @@ survive capture on `CaptureResult`. Quarantine is a field, never inferred from `
 Safety cannot set `trusted`: `tests/test_memory_safety_metadata.py` pins a flagged-but-
 trusted claim and a clean-but-untrusted one.
 
+These are exactly the two observability gaps BrainConnect's own `docs/INTEGRATIONS.md`
+flagged against `9503661` (before this closed them). BrainConnect has since published a
+formal contract — `docs/CONTRACT.md` and seven `tests/contract/*.json` fixtures — pinning
+the `safety`, `quarantined`, and refusal shapes. `tests/test_brainconnect_contract.py`
+holds this adapter to those fixtures and cross-checks the sibling repo when it is present.
+
 The dead `status == "promoted"` downgrade in `capture_candidate` was left in place: it
 cannot fire against real BrainConnect, but it is the adapter's contract with *any* backend
 that claims a capture promoted something.
@@ -242,6 +248,42 @@ A deployment that lets the adapter fall through to `httpx` gets connection-refus
 
 ---
 
+## AC-8 — Refusal-envelope shape was ambiguous across the two repos
+
+**Severity: low (latent, no wire path exists). Status: RESOLVED by tolerating both
+shapes.** Found validating against BrainConnect's `docs/CONTRACT.md` (`e75cb83`).
+
+The refusal envelope a future `brainconnect serve` will return was described two ways
+at once. BrainConnect's `docs/CONTRACT.md` documented a **nested** body —
+`{"error": {"code": "safety_refused", "safety": {…}}}` at HTTP 409 — while its server
+intent (and the flat fixture in its working tree) is **flat**: `error` is the code
+string, `safety` is top-level. BrainConnect chose flat deliberately, to match this
+adapter's *original* reader, which compared `body["error"]` to `"safety_refused"`.
+
+So there was never a shipped defect: against the flat shape BrainConnect actually
+intends, the original adapter was correct, and there is no `brainconnect serve` to
+exercise either shape yet. The risk was purely that the two repos could drift — one
+side changing the nesting would silently turn a safety refusal into an
+`invalid_request`, the exact trust-versus-retry confusion the taxonomy exists to
+prevent.
+
+**Resolution.** `_envelope()` (`core/memory.py`) now reads **both** shapes: a nested
+`error.code` / `error.safety`, or a flat `error` string with top-level `safety`. Then
+`_classified` maps BrainConnect's five codes (`safety_refused`, `not_found`,
+`forbidden`, `invalid_request`, `backend_error`) to the typed memory errors before
+falling back to bare status — and a 409 is never read as a safety refusal *without*
+its code, because without the code we cannot know it is one.
+`tests/test_brainconnect_contract.py` parametrizes the refusal over flat and nested,
+and cross-checks BrainConnect's `promotion_safety_refusal.json` shape-tolerantly, so
+whichever shape BrainConnect ships cannot break this adapter and cannot go unnoticed.
+
+**Cross-repo note (not AgentConnect's to fix):** at the time of writing, BrainConnect's
+committed `docs/CONTRACT.md` (nested) and its working-tree `errors.py` + fixture (flat)
+disagree. That is BrainConnect's to reconcile; this adapter is correct either way. No
+GitHub issue was filed — `gh` is unavailable here — so it is recorded only as this note.
+
+---
+
 ## Not a bug: `MODEL_BACKEND_API_KEY` is absent from `SECRET_DENYLIST`
 
 Worth recording because it looks like a hole and is not.
@@ -271,8 +313,12 @@ Adding the name to the denylist would be defense in depth, not a fix.
   another task.
 * `tests/test_memory_safety_metadata.py` — 22 tests. Safety survives; trust is untouched;
   the four failure modes are told apart.
+* `tests/test_brainconnect_contract.py` — 12 tests. AgentConnect's adapter against
+  BrainConnect's pinned recall/capture/refusal fixtures; both envelope shapes; a
+  shape-tolerant cross-check of the real sibling-repo fixtures when present.
 
 ## Reproduction environment
 
-`origin/main`, gate `876 passed, 3 skipped` (`879 passed` with the `safety-secrets`
-extra installed). BrainConnect checked out at `b128e65`.
+`origin/main`, gate `888 passed, 3 skipped` (`891 passed` with the `safety-secrets`
+extra installed). BrainConnect checked out at `e75cb83` (its `docs/CONTRACT.md` and
+`tests/contract/` fixtures).

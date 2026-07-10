@@ -128,10 +128,10 @@ upstream — routing, the runtime, the agent — handles an opaque `secret_ref` 
 **ComputeConnect must preserve this, or the compliance layer is void.** Concretely:
 
 * An agent subprocess must never hold a provider key. AgentConnect enforces this from its
-  side with an allowlist, not a denylist: `sanitize_env` (`core/sessions.py:145`) builds
+  side with an allowlist, not a denylist: `sanitize_env` (`core/sessions.py`) builds
   the child environment from `BASE_ALLOWLIST` plus `AGENTCONNECT_*` config, so an unknown
   variable is dropped because it was never on the list. `SECRET_DENYLIST`
-  (`sessions.py:80`) is defense in depth, not the mechanism.
+  (`core/sessions.py`) is defense in depth, not the mechanism.
 * A credential must be resolvable from a reference. AgentConnect stores `secret_ref`
   (`common/config.py:107`), never a secret.
 * Local inference authenticates with mTLS, not a bearer token: `HttpLocalClient`

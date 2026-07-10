@@ -9,7 +9,7 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `.venv/bin/python -m pytest -q` — **876 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
+| Gate | `.venv/bin/python -m pytest -q` — **888 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
@@ -143,11 +143,19 @@ Found by validating the integrations. Full detail and reproductions in
 * **AC-5 (was low)** — capture without an `origin_actor_id` is refused by name, before the
   call. No default actor is invented; provenance is not guessed.
 * **AC-6 (was low)** — the documented API port no longer collides with `WIKIBRAIN_URL`.
+* **AC-8 (was low, latent)** — the memory adapter tolerates both shapes of BrainConnect's
+  refusal envelope (flat `error` string and nested `error.code`), so neither repo can turn
+  a safety refusal into an `invalid_request` by changing the nesting.
 
 **Open:**
 
 * **AC-7 (low)** — BrainConnect still ships no HTTP server, and the adapter still defaults
   to `:8787`. Nothing exercises the memory contract on the wire. Not AgentConnect's task.
+
+BrainConnect has since published a formal contract — `docs/CONTRACT.md` and seven
+`tests/contract/*.json` fixtures — pinning the `safety`, `quarantined`, and refusal shapes.
+`tests/test_brainconnect_contract.py` holds this adapter to them and cross-checks the
+sibling repo when it is present.
 
 ## What would reopen work
 

@@ -425,15 +425,45 @@ def _safety_summary(exc: BaseException) -> Optional[dict[str, Any]]:
         return None
 
 
+def _envelope(body: dict[str, Any]) -> tuple[Optional[str], str, Optional[dict[str, Any]]]:
+    """Unpack BrainConnect's refusal envelope: `(code, message, safety)`.
+
+    The pinned shape (BrainConnect `docs/CONTRACT.md`) nests everything under `error`:
+
+        {"error": {"code": "safety_refused", "message": "…", "retryable": false,
+                   "safety": {…}}}
+
+    An earlier draft of this adapter read `body["error"]` as a *string*, so it matched
+    nothing against the real envelope and let a 409 safety refusal fall through to a
+    plain-status heuristic that called it `invalid_request` — the exact confusion the
+    contract warns against. We read the nested code, and fall back to a flat `error`
+    string only for defensiveness against a hand-rolled server.
+    """
+    err = body.get("error")
+    if isinstance(err, dict):
+        return (err.get("code"), str(err.get("message") or ""), err.get("safety"))
+    if isinstance(err, str):
+        return (err, str(body.get("detail") or body.get("message") or ""),
+                body.get("safety"))
+    return (None, "", body.get("safety"))
+
+
+#: BrainConnect's refusal codes (`cli/wiki/errors.py`) → our typed memory errors.
+#: `safety_refused` is 409 in that taxonomy, which is why status alone cannot classify
+#: it: a bare 409 heuristic would read a refusal as a malformed request.
+_REFUSAL_CODES = {"safety_refused", "not_found", "forbidden", "invalid_request",
+                  "backend_error"}
+
+
 def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
     """Run a backend call and give its failure a name.
 
     Two transports reach BrainConnect and they fail in different vocabularies. The
     in-process shim raises `wiki.candidates.SafetyRefused` directly; the HTTP path
-    raises `httpx.HTTPStatusError`. Neither type can be imported here — `wiki` is an
-    optional peer and `httpx` is a lazy dependency — so both are recognized
-    structurally. Anything unrecognized is re-raised untouched rather than
-    relabelled: guessing wrong about a failure is worse than not naming it.
+    raises `httpx.HTTPStatusError` carrying the refusal envelope. Neither type can be
+    imported here — `wiki` is an optional peer and `httpx` is a lazy dependency — so
+    both are recognized structurally. Anything unrecognized is re-raised untouched
+    rather than relabelled: guessing wrong about a failure is worse than not naming it.
     """
     try:
         return call()
@@ -454,11 +484,29 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
                 body = response.json() or {}
             except Exception:  # noqa: BLE001 — a non-JSON error body is still an error
                 body = {}
-            if body.get("error") in ("safety_refused", "memory_safety_refused"):
+            code, message, safety = _envelope(body)
+            detail = message or str(exc)
+
+            # The envelope code is authoritative when present, because status is
+            # ambiguous: 409 is `safety_refused`, not a generic conflict.
+            if code in ("safety_refused", "memory_safety_refused"):
                 raise MemorySafetyRefused(
                     f"the memory authority's safety policy refused to promote "
-                    f"{candidate_id}: {body.get('detail') or exc}",
-                    body.get("safety")) from exc
+                    f"{candidate_id}: {detail}", safety) from exc
+            if code == "forbidden":
+                raise MemoryAuthorizationError(
+                    f"the memory authority forbids this actor: {detail}") from exc
+            if code == "backend_error":
+                raise MemoryServerError(
+                    f"the memory authority is degraded: {detail}") from exc
+            if code in ("not_found", "invalid_request"):
+                raise InvalidRequest(
+                    f"the memory authority rejected candidate "
+                    f"{candidate_id}: {detail}") from exc
+
+            # No recognizable envelope — fall back to the bare status. Note 409 is
+            # deliberately *not* treated as a safety refusal here: without the code we
+            # cannot know it is one, and a wrong guess mislabels a real refusal.
             if status in (401, 403):
                 raise MemoryAuthorizationError(
                     f"the memory authority rejected our credential: {exc}") from exc
