@@ -35,7 +35,7 @@ memory:
   #
   # `global` takes no id — that is WikiBrain's vocabulary, not ours.
   default_scopes: {}
-  #  project: fascia
+  #  project: my-project
   #  repo: mcp-agentconnect
 
   # Hard preferences: they affect routing, privacy, cost, or safety, so they are

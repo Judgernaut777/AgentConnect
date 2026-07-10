@@ -20,11 +20,13 @@ documentation corrections, and the small CLI ergonomics needed to run it.
 
 ## Memory boundary
 
-Implemented and validated.
+Implemented and validated. Every backend below is **optional**: WikiBrain is an optional
+trusted-memory ledger integration, and AgentConnect works without it, using local task
+state and the default no-op memory adapter.
 
-* AgentConnect controls **access**, WikiBrain controls **trust**, Cognee adds breadth,
-  Graphiti adds temporal reasoning. The `ContextBuilder` decides what a manager or
-  worker actually sees.
+* When they are configured: AgentConnect controls **access**, WikiBrain controls
+  **trust**, Cognee adds breadth, Graphiti adds temporal reasoning. The `ContextBuilder`
+  decides what a manager or worker actually sees.
 * `trusted` is the authority signal. `status == "promoted"` is **not** authority. A
   missing `trusted` means untrusted — it fails closed. The verdict may only downgrade.
 * **Only the trusted authority enforces `trusted_only`.** Retrieval backends may return
@@ -69,6 +71,10 @@ Worth stating plainly, because a green suite invites more confidence than it has
 
 ## Known deferred work
 
+* **AgentConnect-local safety scanning** — secrets, PII, prompt injection, unsafe tool
+  directives, and encoded blobs, checked on AgentConnect-owned surfaces before content is
+  injected into an agent or stored as evidence. Designed, not built; see
+  [SAFETY.md](SAFETY.md). There is **no content scanner today**.
 * `wiki serve` — WikiBrain's HTTP transport. **Deferred, and not AgentConnect's task.**
   Tracked here only as a known integration gap. Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is

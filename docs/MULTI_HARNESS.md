@@ -24,7 +24,7 @@ Put the same DB path in each harness's MCP config (`.mcp.json` or equivalent):
 ```json
 { "mcpServers": { "agentconnect": {
   "command": "agentconnect-router",
-  "env": { "AGENTCONNECT_DB": "/home/you/.fascia/shared_memory.sqlite" }
+  "env": { "AGENTCONNECT_DB": "/home/you/.agentconnect/shared_memory.sqlite" }
 } } }
 ```
 
@@ -43,7 +43,7 @@ connects to it over the network.
 AGENTCONNECT_MCP_TRANSPORT=streamable-http \
 AGENTCONNECT_MCP_HOST=127.0.0.1 \
 AGENTCONNECT_MCP_PORT=8760 \
-AGENTCONNECT_DB=/home/you/.fascia/shared_memory.sqlite \
+AGENTCONNECT_DB=/home/you/.agentconnect/shared_memory.sqlite \
 agentconnect-router
 ```
 
@@ -69,5 +69,4 @@ Harnesses connect to `http://<host>:8760/mcp` (streamable-HTTP) or `/sse`. Confi
 
 Start with **A** to try the workflow for free (all local harnesses, one shared DB).
 Move to **B** once you use paid/rented tiers (A risks double-provisioning) or want a
-harness on another machine. See the [Fascia roadmap](https://github.com/Judgernaut777/fascia/blob/main/ROADMAP.md)
-for the fuller comparison.
+harness on another machine.

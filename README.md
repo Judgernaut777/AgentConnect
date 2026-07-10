@@ -1,8 +1,11 @@
 # mcp-agentconnect
 
-> **Part of the [Fascia](https://github.com/Judgernaut777/Fascia-AI-OS) ecosystem** — the **control-plane** layer (routing · model-manager · worker runtime · federation) and the multi-harness subagent fabric. Fascia connects this with **memory** ([WikiBrain](https://github.com/Judgernaut777/WikiBrain)) and a shared **guard** ([fascia-guard](https://github.com/Judgernaut777/fascia-guard)) into one self-hosted, privacy-first agent stack.
+> **A control plane for managed coding-agent work.** Self-hosted, privacy-first, and
+> standalone — nothing else is required to run it. It can *optionally* integrate with
+> [WikiBrain](https://github.com/Judgernaut777/WikiBrain) for trusted long-term memory.
 
 AgentConnect is a task, artifact, decision, review, routing, and handoff backplane for coding agents. It provides a managed launch / shell workflow for tools like Codex or Claude Code, records agent work in an operator ledger, injects bounded context into workers, supports review and audit, and prevents normal managed-agent sessions from completing their own tasks. It is a compliance/control layer, not a security sandbox.
+
 > Agents may think and work inside their own harness. But durable work must enter
 > AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
 
@@ -60,6 +63,10 @@ credentials never are, and `AGENTCONNECT_MODE` restricts what the CLI will do in
 managed session. Direct SQLite, filesystem, and environment tampering are out of scope
 and would need OS-level isolation.
 
+There is **no content scanner today**: no secret detection, no PII redaction, no
+prompt-injection detection. Baseline safety scanning on AgentConnect-owned surfaces is
+designed but unbuilt — see [docs/SAFETY.md](docs/SAFETY.md).
+
 The full boundary — what the layer buys you and what it explicitly does not — is at the
 top of [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
 
@@ -92,10 +99,13 @@ stays `agentconnect.*`):
 
 ## Optional integrations
 
-None of these is required, and none is configured by default. Linear (tracker mirror),
-Temporal (durable workflows), WikiBrain (trusted memory authority), Cognee (broad
-retrieval), Graphiti (temporal graph), and a local model manager. `wiki serve` — real
-WikiBrain over real HTTP — is deferred and belongs to the WikiBrain repository.
+AgentConnect is standalone. None of these is required, and none is configured by default.
+
+**WikiBrain** is an optional trusted-memory ledger integration. AgentConnect works without
+it, using local task state and the default no-op memory adapter. Also optional: Linear
+(tracker mirror), Temporal (durable workflows), Cognee (broad retrieval), Graphiti
+(temporal graph), and a local model manager. `wiki serve` — real WikiBrain over real
+HTTP — is deferred and belongs to the WikiBrain repository.
 
 ---
 
