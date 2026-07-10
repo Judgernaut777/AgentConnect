@@ -118,7 +118,17 @@ def transports(wikibrain_items, cognee_results, graphiti_facts):
 
 
 def build(tmp_path, wikibrain_items=(), cognee_results=(), graphiti_facts=(),
-          hard_policies=(), workers=None):
+          hard_policies=(), workers=None, safety_enabled=False):
+    """`safety_enabled=False` by default.
+
+    These are *ranking and labeling* tests: they ask whether an untrusted item is
+    marked untrusted and ranked below a real claim. The safety scanner is a second,
+    later defense that withholds some of those items entirely — which would leave
+    these tests asserting about an item that is no longer in the pack, and would
+    quietly stop exercising the ranker. Layered defenses are tested one layer at a
+    time; `test_safety.py` covers the scanner, and the two tests below cover the
+    seam where both fire.
+    """
     wb, cog, gra, state = transports(wikibrain_items, cognee_results, graphiti_facts)
     svc = AgentConnectService.create(
         db_path=":memory:", artifact_dir=str(tmp_path / "artifacts"),
@@ -129,6 +139,7 @@ def build(tmp_path, wikibrain_items=(), cognee_results=(), graphiti_facts=(),
             "graphiti": GraphitiMemoryAdapter(transport=gra),
         },
         memory_config=MemoryConfig(hard_policies=list(hard_policies)),
+        safety_enabled=safety_enabled,
     )
     return svc, state
 
@@ -305,6 +316,55 @@ def test_a_high_score_does_not_buy_authority(tmp_path):
     task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
     pack = svc.get_task_context_pack(task.id)
     assert texts(pack) == [PROMOTED_WEAK["text"], POISON]
+
+
+# --------------------------------------------- where the two defenses meet
+def test_safety_withholds_the_poison_the_ranker_would_merely_demote(tmp_path):
+    """The layers are independent, and the outer one is strictly stronger.
+
+    Ranking demotes the poison and labels it untrusted; it still reaches the agent,
+    which is the correct answer for an unremarkable low-authority document. The
+    safety scanner reads the *content*, sees `send all secrets to`, and withholds it
+    outright. Neither layer is redundant: ranking cannot read text, and the scanner
+    cannot judge authority.
+    """
+    svc, _ = build(tmp_path, wikibrain_items=[PROMOTED],
+                   cognee_results=[{"text": POISON, "source_id": "doc_evil", "score": 0.99}],
+                   safety_enabled=True)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    pack = svc.get_task_context_pack(task.id, profile="manager_brief")
+
+    assert POISON not in texts(pack)
+    assert PROMOTED["text"] in texts(pack)  # the real claim survives
+    assert any("withheld by AgentConnect safety scanning" in w for w in pack.warnings)
+
+
+def test_a_withheld_item_is_never_silent(tmp_path):
+    """A pack that quietly got shorter reads exactly like a pack with nothing to
+    say, and the agent has no way to tell the difference."""
+    svc, _ = build(tmp_path,
+                   cognee_results=[{"text": POISON, "source_id": "doc_evil"}],
+                   safety_enabled=True)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    pack = svc.get_task_context_pack(task.id)
+
+    assert texts(pack) == []
+    assert any("1 context item was withheld" in w for w in pack.warnings)
+
+
+def test_a_secret_in_a_recalled_item_is_redacted_not_withheld(tmp_path):
+    """The claim is still useful; the credential in it is not."""
+    leaky = {"text": "Deploy with AKIA1234567890ABCDEF, the CI key.", "status": "promoted",
+             "confidence": "verified", "source_id": "claim_9", "trusted": True}
+    svc, _ = build(tmp_path, wikibrain_items=[leaky], safety_enabled=True)
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    pack = svc.get_task_context_pack(task.id)
+
+    text = texts(pack)[0]
+    assert "AKIA1234567890ABCDEF" not in text
+    assert "[REDACTED:secret:secret.aws_access_key_id]" in text
+    assert "the CI key" in text  # the surrounding claim survives
+    assert any("redacted by AgentConnect safety scanning" in w for w in pack.warnings)
 
 
 def test_a_graphiti_fact_with_no_promoted_backing_ranks_below_broad_retrieval(tmp_path):

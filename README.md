@@ -63,9 +63,13 @@ credentials never are, and `AGENTCONNECT_MODE` restricts what the CLI will do in
 managed session. Direct SQLite, filesystem, and environment tampering are out of scope
 and would need OS-level isolation.
 
-There is **no content scanner today**: no secret detection, no PII redaction, no
-prompt-injection detection. Baseline safety scanning on AgentConnect-owned surfaces is
-designed but unbuilt — see [docs/SAFETY.md](docs/SAFETY.md).
+AgentConnect does include **baseline local content scanning** at two surfaces it owns:
+artifacts are scanned on ingest (probable secrets redacted before the body is written),
+and context packs are scanned before an agent receives them (secrets redacted, high-risk
+prompt injection withheld, always with a warning — never silently). It is local and
+deterministic: no service, no LLM, no third-party dependency. It does not detect PII, and
+it does not stop direct SQLite, file, or environment tampering. See
+[docs/SAFETY.md](docs/SAFETY.md).
 
 The full boundary — what the layer buys you and what it explicitly does not — is at the
 top of [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).

@@ -26,6 +26,7 @@ from . import memory as memory_mod
 from . import reviews as reviews_policy
 from . import sessions as sessions_mod
 from . import subtasks as subtasks_policy
+from .. import safety
 from .context import ContextBuilder, ContextPack, MemoryConfig
 from .memory import (
     TRUSTED_AUTHORITY,
@@ -129,11 +130,18 @@ class AgentConnectService:
         memory_config: Optional[MemoryConfig] = None,
         workspace_dir: Optional[str] = None,
         api_url: str = "http://localhost:8790",
+        safety_enabled: bool = True,
     ) -> None:
         self.storage = storage
         self.artifacts = artifact_store
         self.workspaces = WorkspaceBuilder(workspace_dir)
         self.api_url = api_url
+        #: Baseline local content scanning on artifact ingest and context output.
+        #: On by default. An operator who turns it off gets no scanning at either
+        #: surface, and the packs and artifacts carry no `safety_*` metadata saying
+        #: so — which is why the off switch is a constructor argument rather than a
+        #: config file: it should be hard to do by accident.
+        self.safety_enabled = safety_enabled
         #: Called with a task id *after* the ledger marks it succeeded. Linear
         #: registers here, which is what makes AgentConnect the upstream of the
         #: tracker rather than the other way round (compliance §13).
@@ -156,7 +164,8 @@ class AgentConnectService:
             or NoopMemoryAdapter()
         )
         self.context_builder = ContextBuilder(
-            self, self.memory_backends, self.memory_config
+            self, self.memory_backends, self.memory_config,
+            safety_enabled=self.safety_enabled,
         )
         # Default to inline execution so `pip install agentconnect-core` is a
         # working backplane with no workflow server. Adapters that want
@@ -189,7 +198,8 @@ class AgentConnectService:
         self.memory = adapters.get(authority) or next(
             iter(adapters.values()), NoopMemoryAdapter()
         )
-        self.context_builder = ContextBuilder(self, self.memory_backends, self.memory_config)
+        self.context_builder = ContextBuilder(self, self.memory_backends, self.memory_config,
+                                              safety_enabled=self.safety_enabled)
 
     def trusted_authority(self) -> Optional[TrustedMemoryAdapter]:
         adapter = self.memory_backends.get(self.memory_config.trusted_authority)
@@ -209,6 +219,7 @@ class AgentConnectService:
         memory_config: Optional[MemoryConfig] = None,
         workspace_dir: Optional[str] = None,
         api_url: str = "http://localhost:8790",
+        safety_enabled: bool = True,
     ) -> "AgentConnectService":
         return cls(
             storage=SqliteStorage(db_path or default_db_path()),
@@ -222,6 +233,7 @@ class AgentConnectService:
             memory_config=memory_config,
             workspace_dir=workspace_dir,
             api_url=api_url,
+            safety_enabled=safety_enabled,
         )
 
     # ------------------------------------------------------------ internals
@@ -414,17 +426,60 @@ class AgentConnectService:
 
     # ------------------------------------------------------------- artifacts
     def create_artifact(self, task_id: str, request: CreateArtifactRequest) -> Artifact:
+        """Register an artifact, scanning it first (safety `artifact_ingest`).
+
+        What is stored is the *scanned* body: a probable credential is replaced by a
+        marker naming the rule that matched it. The artifact itself is never dropped
+        — it is the evidence that the work happened, and destroying it to protect a
+        credential would lose the record of the credential having been there. The
+        `safety_*` metadata says what was found, so a quarantined artifact announces
+        itself instead of looking ordinary.
+        """
         self._require_task(task_id)
         artifact_id = ids.new_id(ids.ARTIFACT)
-        rel_path, size = self.artifacts.write(task_id, artifact_id, request.content)
+
+        content, safety_metadata = self._scan_artifact(request.content)
+        metadata = {**request.metadata, **safety_metadata}
+
+        rel_path, size = self.artifacts.write(task_id, artifact_id, content)
         artifact = Artifact(
             id=artifact_id, task_id=task_id, type=request.type, path=rel_path,
             summary=request.summary, created_by=request.created_by, created_at=self._now(),
-            size_bytes=size, metadata=request.metadata,
+            size_bytes=size, metadata=metadata,
         )
         self.storage.insert_artifact(artifact)
         self._touch(task_id)
         return artifact
+
+    def _scan_artifact(self, content: str) -> tuple[str, dict[str, Any]]:
+        """Scan on ingest. Returns `(body_to_store, safety_metadata)`.
+
+        `scan_text` is already fail-closed per rule. This wrapper covers the case it
+        cannot: the scanner module itself failing to run at all. A bare `except` that
+        returned the content unmarked would store an unscanned artifact that looks
+        exactly like a clean one — the precise bug the scanner exists to prevent — so
+        it stores the content with `safety_scanner_failed` set and a `quarantine`
+        decision instead.
+        """
+        if not self.safety_enabled:
+            return content, {}
+        try:
+            result = safety.scan_text(
+                content, surface=safety.ARTIFACT_INGEST, policy=safety.ARTIFACT_INGEST)
+        except Exception as exc:  # noqa: BLE001 — never store unscanned content as clean
+            _log.warning("artifact safety scan failed: %s", exc)
+            return content, {
+                "safety_decision": safety.Decision.quarantine.value,
+                "safety_risk_level": safety.RiskLevel.high.value,
+                "safety_findings": [],
+                "safety_policy_version": safety.POLICY_VERSION,
+                "safety_redacted": False,
+                "safety_warnings": [f"safety scanning failed: {exc}"],
+                "safety_scanner_failed": True,
+            }
+        if result.decision is safety.Decision.allow:
+            return result.redacted_content, {}
+        return result.redacted_content, result.to_metadata()
 
     def get_artifact(self, artifact_id: str) -> Artifact:
         artifact = self.storage.get_artifact(artifact_id)
