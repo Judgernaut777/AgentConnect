@@ -24,6 +24,18 @@ class Conflict(AgentConnectError):
     code = "conflict"
 
 
+class Unauthenticated(AgentConnectError):
+    """The credential is missing, unknown, expired, or revoked.
+
+    Distinct from `PolicyViolation` on purpose. *Who are you* and *you may not do
+    that* are different failures with different fixes: one is a token to re-mint,
+    the other is a permission the principal was never meant to have. Collapsing
+    them tells an operator to go looking in the wrong place.
+    """
+
+    code = "unauthenticated"
+
+
 class PolicyViolation(AgentConnectError):
     """Refused by policy: privacy, authority, or approval — never by a bug."""
 

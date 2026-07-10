@@ -24,6 +24,8 @@ from agentconnect.core.models import (
 )
 from agentconnect.core.service import DEFAULT_CLAIM_TTL_SECONDS, AgentConnectService
 
+from .authz import assert_actor
+
 router = APIRouter(tags=["tasks"])
 
 
@@ -83,26 +85,30 @@ def regenerate_handoff(task_id: str, request: Request) -> HandoffSummary:
 
 @router.post("/tasks/{task_id}/claim", response_model=Claim, status_code=201)
 def claim_task(task_id: str, body: ClaimBody, request: Request) -> Claim:
-    return service(request).claim_task(task_id, body.manager_id, body.role, body.ttl_seconds)
+    who = assert_actor(request, body.manager_id)
+    return service(request).claim_task(task_id, who, body.role, body.ttl_seconds)
 
 
 @router.post("/tasks/{task_id}/release", status_code=204, response_class=Response)
 def release_task(task_id: str, body: ReleaseBody, request: Request) -> Response:
-    service(request).release_task(task_id, body.manager_id)
+    service(request).release_task(task_id, assert_actor(request, body.manager_id))
     return Response(status_code=204)
 
 
 @router.post("/tasks/{task_id}/constraints", status_code=201)
 def add_constraint(task_id: str, body: ConstraintBody, request: Request) -> dict:
-    constraint = service(request).add_constraint(task_id, body.text, body.created_by)
+    who = assert_actor(request, body.created_by if body.created_by != "unknown" else None)
+    constraint = service(request).add_constraint(task_id, body.text, who)
     return constraint.model_dump(mode="json")
 
 
 @router.post("/tasks/{task_id}/decisions", response_model=Decision, status_code=201)
 def record_decision(task_id: str, body: RecordDecisionRequest, request: Request) -> Decision:
+    assert_actor(request, body.made_by)
     return service(request).record_decision(task_id, body)
 
 
 @router.post("/tasks/{task_id}/attempts", response_model=Attempt, status_code=201)
 def record_attempt(task_id: str, body: RecordAttemptRequest, request: Request) -> Attempt:
+    assert_actor(request, body.actor_id)
     return service(request).record_attempt(task_id, body)

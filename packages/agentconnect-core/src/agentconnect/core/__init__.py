@@ -6,7 +6,14 @@ CLI, Linear) call :class:`AgentConnectService` and nothing below it.
 
 from .artifacts import FilesystemArtifactStore, default_artifact_dir
 from .audit import AuditReport, Check, audit_review, audit_task
-from .errors import AgentConnectError, Conflict, InvalidRequest, NotFound, PolicyViolation
+from .errors import (
+    AgentConnectError,
+    Conflict,
+    InvalidRequest,
+    NotFound,
+    PolicyViolation,
+    Unauthenticated,
+)
 from .execution import (
     DirectExecutionBackend,
     ExecutionBackend,
@@ -58,6 +65,7 @@ from .memory import (
 from .sessions import (
     ACTIONS_BY_MODE,
     FORBIDDEN_ACTIONS,
+    OPERATOR_ACTIONS,
     MANAGER_ACTIONS,
     READONLY_ACTIONS,
     REVIEWER_ACTIONS,
@@ -149,6 +157,8 @@ __all__ = [
     "EXPOSED_MCP_TOOLS",
     "ExecutionBackend", "ExecutionHandle", "ExecutionState", "ExecutionStatus", "ExternalRef",
     "FORBIDDEN_ACTIONS",
+    "OPERATOR_ACTIONS",
+    "Unauthenticated",
     "FilesystemAccess", "FilesystemArtifactStore", "GraphitiMemoryAdapter", "HandoffSummary",
     "GLOBAL_SCOPE_ID",
     "HttpLocalComputeProvider", "IndexingMemoryAdapter",

@@ -19,6 +19,7 @@ from agentconnect.core.memory import (
     RecallRequest,
 )
 
+from .authz import assert_actor, principal
 from .routes_tasks import service
 
 router = APIRouter(tags=["memory"])
@@ -87,13 +88,18 @@ def recall(body: RecallBody, request: Request) -> dict[str, Any]:
 
 @router.post("/memory/capture")
 def capture(body: CaptureBody, request: Request) -> dict[str, Any]:
+    who = assert_actor(request, body.origin_actor_id)
     result = service(request).capture_memory_candidate(CaptureRequest(
-        text=body.text, task_id=body.task_id, origin_actor_id=body.origin_actor_id,
+        text=body.text, task_id=body.task_id, origin_actor_id=who,
         origin_actor_type=body.origin_actor_type, source_ref=body.source_ref, tags=body.tags,
     ))
     return {
         "accepted": result.accepted, "candidate_id": result.candidate_id,
         "status": result.status, "message": result.message, "backend": result.backend,
+        # A quarantined candidate is stored but may never be promoted. It must be
+        # structurally distinguishable from an ordinary pending one — a manager
+        # reading `status: "pending"` and nothing else would queue it for review.
+        "quarantined": result.quarantined, "safety": result.safety,
     }
 
 
@@ -120,8 +126,15 @@ def pending(request: Request, limit: int = 50) -> dict[str, Any]:
 @router.post("/memory/promote")
 def promote(body: PromoteBody, request: Request) -> dict[str, Any]:
     """Human/librarian only. Deliberately absent from the MCP surface: an agent
-    must never be able to promote its own suggestion into trusted memory."""
-    return service(request).promote_memory_candidate(body.candidate_id, body.promoted_by)
+    must never be able to promote its own suggestion into trusted memory.
+
+    `promote_memory_candidate` is in `AGENT_FORBIDDEN_ACTIONS`, so `authorize()`
+    refuses this route to every managed-agent token whatever its scope claims.
+    Safety override is **not** exposed here: overriding a safety refusal is a human
+    judgement about content, and it is made at the librarian's own console.
+    """
+    who = assert_actor(request, body.promoted_by)
+    return service(request).promote_memory_candidate(body.candidate_id, who)
 
 
 @router.get("/memory/health")

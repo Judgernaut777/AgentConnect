@@ -42,7 +42,7 @@ from .memory import (
 )
 from .artifacts import FilesystemArtifactStore
 from .audit import AuditReport
-from .errors import Conflict, InvalidRequest, NotFound, PolicyViolation
+from .errors import Conflict, InvalidRequest, NotFound, PolicyViolation, Unauthenticated
 from .execution import DirectExecutionBackend, ExecutionBackend, ExecutionHandle, ExecutionState
 from .workspace import WorkspaceBuilder, mode_for
 from .models import (
@@ -1270,6 +1270,7 @@ class AgentConnectService:
     def promote_memory_candidate(
         self, candidate_id: str, promoted_by: str,
         confidence: Optional[str] = None, scope: Optional[str] = None,
+        safety_override: bool = False, override_reason: Optional[str] = None,
     ) -> dict[str, Any]:
         """Human/librarian only (memory-stack §4). Never exposed as an MCP tool.
 
@@ -1292,6 +1293,15 @@ class AgentConnectService:
             extra["confidence"] = confidence
         if scope is not None:
             extra["scope"] = scope
+        if safety_override:
+            # Never set on AgentConnect's own initiative. A safety refusal is a
+            # statement about content, and only a human who has read that content may
+            # overrule it — with a reason, which the authority records.
+            if not (override_reason or "").strip():
+                raise InvalidRequest(
+                    "overriding a memory safety refusal requires a written reason")
+            extra["safety_override"] = True
+            extra["override_reason"] = override_reason
         claim = authority.promote_candidate(candidate_id, promoted_by, **extra)
         claim.setdefault("claim_id", candidate_id)
         indexed, failed = [], []
@@ -1528,26 +1538,83 @@ class AgentConnectService:
         self.storage.insert_token(token, sessions_mod.hash_token(plaintext))
         return token
 
-    def authorize(self, token: str, action: str) -> dict[str, Any]:
-        """Check a session token against one action. Raises, never returns False.
+    def authorize(
+        self, token: str, action: str, *,
+        task_id: Optional[str] = None, review_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Check a token against one action, in one scope. Raises, never returns False.
 
-        A token buys exactly the actions of its mode. `promote_memory_candidate`,
-        Temporal admin, and secret reads are in no mode's list, so no agent-held
-        token can ever reach them — the deny is structural, not a special case.
+        **This is the only authorization rule in AgentConnect.** Every transport —
+        HTTP, MCP, and any future one — calls it rather than reimplementing it, so
+        that a rule fixed here is fixed everywhere. A transport that grew its own
+        check would be a second policy, and the two would drift.
+
+        Three gates, in order:
+
+        1. `NEVER_TOKEN_ACTIONS` — backend-shaped actions no token reaches, operator
+           included. A token is not how you get to a backend's admin surface.
+        2. `AGENT_FORBIDDEN_ACTIONS` — denied to every *managed agent* mode. This is
+           where `complete_task` and `promote_memory_candidate` live: an agent does
+           not certify its own work, and does not promote its own output to truth.
+        3. The mode's own action list, then the token's task/review binding.
+
+        `task_id` / `review_id` bind the request to the token's scope. A manager
+        token minted for task A cannot act on task B even though `record_attempt`
+        is in its action list — the action is permitted, the *target* is not. An
+        operator scope carries no binding and is therefore unscoped.
         """
         record = self.storage.get_token_by_hash(sessions_mod.hash_token(token or ""))
         if record is None:
-            raise PolicyViolation("unknown session token")
+            raise Unauthenticated("unknown session token")
         if not record.active_at(self._now()):
             reason = "revoked" if record.revoked_at else "expired"
-            raise PolicyViolation(f"session token is {reason}")
-        allowed = set(record.scope.get("actions", []))
-        if action in sessions_mod.FORBIDDEN_ACTIONS or action not in allowed:
+            raise Unauthenticated(f"session token is {reason}")
+
+        scope = record.scope
+        mode = scope.get("mode", "")
+        allowed = set(scope.get("actions", []))
+
+        if action in sessions_mod.NEVER_TOKEN_ACTIONS:
+            raise PolicyViolation(f"action {action!r} is not reachable with any token")
+        if mode != SessionMode.operator.value and action in sessions_mod.AGENT_FORBIDDEN_ACTIONS:
             raise PolicyViolation(
-                f"action {action!r} is not permitted for a "
-                f"{record.scope.get('mode')} session token"
+                f"action {action!r} is not permitted for a {mode} session token"
             )
-        return record.scope
+        if action not in allowed:
+            raise PolicyViolation(
+                f"action {action!r} is not permitted for a {mode} session token"
+            )
+
+        for name, requested in (("task_id", task_id), ("review_id", review_id)):
+            bound = scope.get(name)
+            if bound is not None and requested is not None and bound != requested:
+                raise PolicyViolation(
+                    f"this session token is scoped to {name} {bound!r}; "
+                    f"it cannot act on {requested!r}"
+                )
+        return scope
+
+    def mint_operator_token(
+        self, actor: str, ttl_seconds: int = sessions_mod.DEFAULT_TOKEN_TTL_SECONDS,
+    ) -> SessionToken:
+        """Issue an unscoped operator credential. Never minted by `launch`.
+
+        `actor` becomes the authenticated principal: it is what gets written into the
+        ledger when this token completes a task, and it is not negotiable by the
+        caller of a route. Handing one of these to an agent hands over the control
+        plane, so it is deliberately awkward to obtain — a human runs one command.
+        """
+        if not actor or not actor.strip():
+            raise InvalidRequest("an operator token must name its actor")
+        now = self._now()
+        plaintext = sessions_mod.mint_token()
+        token = SessionToken(
+            id=ids.new_id(ids.TOKEN), session_id=sessions_mod.OPERATOR_SESSION_ID,
+            scope=sessions_mod.build_operator_scope(actor.strip()),
+            expires_at=now + max(1, ttl_seconds), created_at=now, plaintext=plaintext,
+        )
+        self.storage.insert_token(token, sessions_mod.hash_token(plaintext))
+        return token
 
     def revoke_session_tokens(self, session_id: str) -> int:
         return self.storage.revoke_tokens_for_session(session_id, self._now())

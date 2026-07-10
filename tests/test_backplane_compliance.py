@@ -36,7 +36,9 @@ from agentconnect.core import (
     SubtaskRequest,
     TaskStatus,
 )
-from agentconnect.core.errors import Conflict, PolicyViolation
+from conftest import operator_client  # noqa: E402
+
+from agentconnect.core.errors import Conflict, PolicyViolation, Unauthenticated
 from agentconnect.core.sessions import (
     SECRET_DENYLIST,
     is_secretish,
@@ -403,12 +405,20 @@ def test_a_token_is_scoped_to_its_mode_and_entity(svc, task):
 
 def test_a_manager_token_cannot_promote_memory_or_touch_temporal(svc, task):
     result = svc.launch_session("claude", task_id=task.id)
-    for forbidden in ("promote_memory_candidate", "wikibrain_promote", "cognee_write",
-                      "graphiti_write", "temporal_signal", "temporal_admin",
-                      "secrets_read", "admin_settings", "grant_approval",
-                      "approve_subtask", "local_model_generate"):
+    # Denied to a managed agent; an operator may do some of these.
+    for forbidden in ("promote_memory_candidate", "temporal_signal", "grant_approval",
+                      "approve_subtask", "complete_task", "force_complete_task"):
         with pytest.raises(PolicyViolation, match="not permitted"):
             svc.authorize(result["token"], forbidden)
+    # Denied to *every* token, operator included: these reach a backend directly.
+    for never in ("wikibrain_promote", "wikibrain_admin", "cognee_write", "graphiti_write",
+                  "temporal_admin", "secrets_read", "admin_settings",
+                  "local_model_generate"):
+        with pytest.raises(PolicyViolation, match="not reachable with any token"):
+            svc.authorize(result["token"], never)
+        operator = svc.mint_operator_token("matthew")
+        with pytest.raises(PolicyViolation, match="not reachable with any token"):
+            svc.authorize(operator.plaintext, never)
 
 
 def test_a_reviewer_token_cannot_decide_or_delegate(svc, task):
@@ -436,19 +446,19 @@ def test_an_unknown_expired_or_revoked_token_is_refused(svc, task, monkeypatch):
     clock = {"now": 1000.0}
     svc._clock = lambda: clock["now"]
 
-    with pytest.raises(PolicyViolation, match="unknown session token"):
+    with pytest.raises(Unauthenticated, match="unknown session token"):
         svc.authorize(mint_token(), "record_attempt")
 
     result = svc.launch_session("claude", task_id=task.id, token_ttl_seconds=60)
     assert svc.authorize(result["token"], "record_attempt")
 
     clock["now"] = 1061.0
-    with pytest.raises(PolicyViolation, match="expired"):
+    with pytest.raises(Unauthenticated, match="expired"):
         svc.authorize(result["token"], "record_attempt")
 
     clock["now"] = 1000.0
     svc.revoke_session_tokens(result["session"].id)
-    with pytest.raises(PolicyViolation, match="revoked"):
+    with pytest.raises(Unauthenticated, match="revoked"):
         svc.authorize(result["token"], "record_attempt")
 
 
@@ -463,7 +473,7 @@ def test_ending_a_shell_revokes_the_token(svc, task):
     result = svc.launch_session("claude", task_id=task.id)
     svc.start_shell(result["session"].id, "claude")
     svc.end_shell(result["session"].id, 0)
-    with pytest.raises(PolicyViolation, match="revoked"):
+    with pytest.raises(Unauthenticated, match="revoked"):
         svc.authorize(result["token"], "record_attempt")
 
 
@@ -687,6 +697,21 @@ def test_an_agent_shell_cannot_promote_memory(svc, monkeypatch, capsys):
     assert _cli_main(["memory", "promote", "candidate_1", "--by", "codex"],
                      svc, mode="manager", monkeypatch=monkeypatch) == 2
     assert "forbidden_action" in capsys.readouterr().err
+
+
+def test_an_agent_shell_cannot_mint_itself_an_operator_token(svc, monkeypatch, capsys):
+    """The CLI guard's newest hole: an operator token grants what the session lacks."""
+    assert _cli_main(["tokens", "issue", "--actor", "claude"],
+                     svc, mode="manager", monkeypatch=monkeypatch) == 2
+    assert "forbidden_action" in capsys.readouterr().err
+
+
+def test_the_operator_may_mint_one_outside_a_managed_session(svc, monkeypatch, capsys):
+    assert _cli_main(["tokens", "issue", "--actor", "matthew"], svc,
+                     monkeypatch=monkeypatch) == 0
+    token = json.loads(capsys.readouterr().out)["token"]
+    assert token.startswith("act_")
+    assert svc.authorize(token, "complete_task")["mode"] == "operator"
 
 
 def test_a_reviewer_may_still_complete_its_own_review(svc, task, monkeypatch):
@@ -1108,7 +1133,7 @@ def test_a_stale_session_is_abandoned_and_its_token_revoked(svc, task):
     clock["now"] = 1000.0 + 48 * 3600
     assert svc.abandon_stale_sessions(older_than_seconds=24 * 3600) == [result["session"].id]
     assert svc.get_session(result["session"].id).status is SessionStatus.abandoned
-    with pytest.raises(PolicyViolation, match="revoked"):
+    with pytest.raises(Unauthenticated, match="revoked"):
         svc.authorize(result["token"], "record_attempt")
     assert svc.active_session_for(task_id=task.id) is None
 
@@ -1130,11 +1155,8 @@ def test_relaunching_reuses_the_workspace_directory(svc, task):
 # ================================================================ 10. HTTP API
 @pytest.fixture()
 def client(svc):
-    from fastapi.testclient import TestClient
-
-    from agentconnect.api.app import create_app
-
-    return TestClient(create_app(service=svc, linear_sync=None))
+    """An operator-authenticated client. Every route but `/health` demands a token."""
+    return operator_client(svc, linear_sync=None)
 
 
 def test_api_launch_audit_and_complete(client, svc, task):

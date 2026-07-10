@@ -21,3 +21,20 @@ for _pkg in (
     _src = ROOT / "packages" / _pkg / "src"
     if str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
+
+
+def operator_client(service, linear_sync=None, actor: str = "operator"):
+    """A `TestClient` carrying an operator token.
+
+    Every route except `GET /health` now authenticates, so a test that wants to
+    drive the API must hold a credential exactly as a caller does. Minting one here
+    rather than bypassing `enforce` is the point: the tests exercise the real door.
+    """
+    from fastapi.testclient import TestClient
+
+    from agentconnect.api.app import create_app
+
+    token = service.mint_operator_token(actor)
+    client = TestClient(create_app(service=service, linear_sync=linear_sync))
+    client.headers.update({"Authorization": f"Bearer {token.plaintext}"})
+    return client

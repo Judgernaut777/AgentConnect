@@ -25,6 +25,8 @@ pytest.importorskip("mcp")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from conftest import operator_client  # noqa: E402
+
 from agentconnect.api.app import create_app  # noqa: E402
 from agentconnect.cli.main import main as cli_main  # noqa: E402
 from agentconnect.linear import LinearClient, LinearSync  # noqa: E402
@@ -50,7 +52,7 @@ def test_full_manager_switch_flow(tmp_path, capsys):
     )
     transport = FakeTransport()
     sync = LinearSync(svc, LinearClient(transport=transport), team_id="team-1")
-    api = TestClient(create_app(service=svc, linear_sync=sync))
+    api = operator_client(svc, linear_sync=sync)
     mcp = build_mcp_server(service=svc)
 
     def cli(*argv):

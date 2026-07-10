@@ -32,42 +32,78 @@ DEFAULT_TOKEN_TTL_SECONDS = 12 * 3600
 
 # --------------------------------------------------------------------- scopes
 
+#: Reads that tell an agent where it is. Held by every mode, including readonly.
+#: `get_handoff_summary` is deliberately absent — it *persists* the summary it
+#: computes, so it is a write wearing a getter's name.
+_ORIENTATION_ACTIONS: frozenset[str] = frozenset({
+    "get_task_context_pack", "list_artifacts", "read_artifact_chunk",
+    "get_task", "get_status",
+})
+
 #: A manager drives the task: it decides, delegates, and asks for review.
-MANAGER_ACTIONS: frozenset[str] = frozenset({
-    "get_task_context_pack", "claim_task", "record_attempt", "record_decision",
-    "submit_subtask", "get_subtask_status", "list_artifacts", "read_artifact_chunk",
-    "request_review", "release_task",
+MANAGER_ACTIONS: frozenset[str] = _ORIENTATION_ACTIONS | frozenset({
+    "create_task", "claim_task", "record_attempt", "record_decision",
+    "submit_subtask", "get_subtask_status", "explain_route", "get_handoff_summary",
+    "request_review", "release_task", "register_artifact", "add_constraint",
+    "recall_memory", "capture_memory_candidate", "record_memory_feedback",
 })
 
 #: A reviewer reads and judges. It cannot decide, delegate, or complete the task.
-REVIEWER_ACTIONS: frozenset[str] = frozenset({
-    "get_task_context_pack", "claim_review", "record_attempt", "list_artifacts",
-    "read_artifact_chunk", "complete_review",
+REVIEWER_ACTIONS: frozenset[str] = _ORIENTATION_ACTIONS | frozenset({
+    "claim_review", "record_attempt", "get_review", "complete_review",
+    "recall_memory", "get_handoff_summary",
 })
 
 #: Look, do not touch. What `--readonly` and `--force-readonly` grant.
-READONLY_ACTIONS: frozenset[str] = frozenset({
-    "get_task_context_pack", "list_artifacts", "read_artifact_chunk",
-    "get_subtask_status",
+READONLY_ACTIONS: frozenset[str] = _ORIENTATION_ACTIONS | frozenset({
+    "get_subtask_status", "get_review", "explain_route",
+})
+
+#: The human, or the control plane acting for one. Unscoped: no `task_id` binding.
+#: It is the only mode that may complete a task, and the only one that may promote
+#: a memory candidate — promotion is a judgement about truth, and an agent does not
+#: get to make it about its own output.
+OPERATOR_ACTIONS: frozenset[str] = MANAGER_ACTIONS | REVIEWER_ACTIONS | frozenset({
+    "complete_task", "force_complete_task", "cancel_subtask",
+    "approve_subtask", "deny_subtask", "grant_approval",
+    "promote_memory_candidate", "list_pending_memory",
+    "launch_session", "end_session", "list_sessions", "list_workspaces",
+    "audit_task", "audit_review", "list_tasks", "get_inbox",
+    "linear_sync", "temporal_signal", "get_execution_status",
 })
 
 ACTIONS_BY_MODE: dict[SessionMode, frozenset[str]] = {
     SessionMode.manager: MANAGER_ACTIONS,
     SessionMode.reviewer: REVIEWER_ACTIONS,
     SessionMode.readonly: READONLY_ACTIONS,
+    SessionMode.operator: OPERATOR_ACTIONS,
 }
 
-#: Named so a reviewer of *this file* can see what is being withheld, and so a
-#: token that somehow lists one of these is rejected rather than silently obeyed.
-#: These are not tools AgentConnect exposes; they are the shapes of the tools a
-#: backend would expose if an agent reached it directly.
-FORBIDDEN_ACTIONS: frozenset[str] = frozenset({
+#: Denied to any **managed agent** token, whatever its scope claims. A token that
+#: somehow lists one of these is rejected rather than silently obeyed. Completion
+#: and promotion live here because an agent judging its own work is the failure
+#: this whole layer exists to prevent.
+AGENT_FORBIDDEN_ACTIONS: frozenset[str] = frozenset({
+    "complete_task", "force_complete_task",
     "promote_memory_candidate", "wikibrain_promote", "wikibrain_admin",
     "cognee_write", "graphiti_write",
     "temporal_signal", "temporal_admin", "workflow_terminate",
     "local_model_generate", "secrets_read", "admin_settings",
     "grant_approval", "approve_subtask", "deny_subtask",
 })
+
+#: Denied to **every** token, operator included. These are not actions AgentConnect
+#: exposes at all; they are the shapes of the tools a *backend* would expose if
+#: something reached it directly. No HTTP route and no MCP tool maps to one, and a
+#: token is never the way to reach a backend's admin surface.
+NEVER_TOKEN_ACTIONS: frozenset[str] = frozenset({
+    "wikibrain_promote", "wikibrain_admin", "cognee_write", "graphiti_write",
+    "temporal_admin", "workflow_terminate", "local_model_generate",
+    "secrets_read", "admin_settings",
+})
+
+#: Retained name. It has always meant "an agent may not do this", and it still does.
+FORBIDDEN_ACTIONS: frozenset[str] = AGENT_FORBIDDEN_ACTIONS
 
 
 def actions_for(mode: SessionMode) -> frozenset[str]:
@@ -241,4 +277,26 @@ def build_scope(
         "task_id": task_id,
         "review_id": review_id,
         "actions": sorted(actions_for(mode)),
+    }
+
+
+#: The synthetic session id an operator token carries. Operator tokens belong to no
+#: managed session, so ending a shell cannot revoke one — and revoking a shell's
+#: token cannot disarm the operator.
+OPERATOR_SESSION_ID = "operator"
+
+
+def build_operator_scope(actor: str) -> dict[str, Any]:
+    """An operator is bound to no task. That is the point: it completes them.
+
+    `task_id` and `review_id` are None, which `authorize()` reads as *unscoped* —
+    the one principal allowed to act across tasks.
+    """
+    return {
+        "session_id": OPERATOR_SESSION_ID,
+        "manager_id": actor,
+        "mode": SessionMode.operator.value,
+        "task_id": None,
+        "review_id": None,
+        "actions": sorted(actions_for(SessionMode.operator)),
     }

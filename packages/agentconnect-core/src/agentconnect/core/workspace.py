@@ -34,26 +34,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .models import RepoMode, SessionMode
+from .tools import DENIED_MCP_TOOLS, MCP_TOOL_NAMES
 
 _log = logging.getLogger(__name__)
 
 WORKSPACE_ENV = "AGENTCONNECT_WORKSPACE_DIR"
 BRANCH_PREFIX = "agentconnect"
 
-#: Exactly the tools a managed agent may see (§10). Anything a backend would
-#: expose directly — Temporal, WikiBrain promotion, Cognee/Graphiti writes, the
-#: local model manager, the secrets manager — is absent by construction.
-EXPOSED_MCP_TOOLS: tuple[str, ...] = (
-    "get_task_context_pack", "claim_task", "record_attempt", "record_decision",
-    "submit_subtask", "get_subtask_status", "request_review", "list_artifacts",
-    "read_artifact_chunk", "release_task",
-)
-
-#: Written into `.mcp.json` so the denial is auditable rather than implicit.
-DENIED_MCP_TOOLS: tuple[str, ...] = (
-    "temporal_signal", "wikibrain_promote", "cognee_write", "graphiti_write",
-    "local_model_generate", "secrets_read",
-)
+#: Exactly the tools a managed agent may see (§10) — *generated* from the catalog in
+#: `core.tools`, never hand-maintained. Anything a backend would expose directly is
+#: absent by construction, because no server offering it is configured.
+EXPOSED_MCP_TOOLS: tuple[str, ...] = MCP_TOOL_NAMES
 
 
 def default_workspace_root() -> Path:

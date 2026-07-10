@@ -54,7 +54,7 @@ from agentconnect.core import (
     SessionStatus,
     TaskStatus,
 )
-from agentconnect.core.errors import PolicyViolation
+from agentconnect.core.errors import PolicyViolation, Unauthenticated
 
 REPO = Path(__file__).resolve().parents[1]
 SRC = [str(REPO / "packages" / p / "src") for p in (
@@ -326,7 +326,7 @@ def test_the_proprietary_agent_loop_forces_durable_work_through_agentconnect(
 
     # The manager's shell session was recorded start to end, and its token is dead.
     assert operator.get_session(session.id).status is SessionStatus.ended
-    with pytest.raises(PolicyViolation, match="revoked"):
+    with pytest.raises(Unauthenticated, match="revoked"):
         operator.authorize(_token_of(workspace), "record_attempt")
 
     # 8: a review ticket, not a chat message.

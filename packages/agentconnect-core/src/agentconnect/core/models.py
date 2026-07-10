@@ -379,11 +379,23 @@ class InboxItem(BaseModel):
 
 
 class SessionMode(str, Enum):
-    """What a launched agent is *for*. Determines its token scope (compliance §9)."""
+    """What a launched agent is *for*. Determines its token scope (compliance §9).
+
+    ``operator`` is not a launchable mode. No `agentconnect launch` produces one;
+    it belongs to a human or a control plane, is minted deliberately, and is the
+    only mode that may complete a task. Keeping it in this enum is what lets one
+    `authorize()` serve every principal instead of two parallel systems.
+    """
 
     manager = "manager"
     reviewer = "reviewer"
     readonly = "readonly"
+    operator = "operator"
+
+    @property
+    def is_managed_agent(self) -> bool:
+        """True for every mode an agent can actually be launched into."""
+        return self is not SessionMode.operator
 
 
 class SessionStatus(str, Enum):

@@ -85,18 +85,21 @@ ToolConnect owning the catalog. See [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.m
 
 Three mechanisms, of which **only two are wired**.
 
-**Scoped session tokens — defined, not enforced.** `mint_token()` (`sessions.py:225`)
-issues `act_<urlsafe>`; only its SHA-256 is stored (`storage.py:152`). `build_scope()`
-(`sessions.py:233`) records the mode's action list — manager 10, reviewer 6, readonly 4.
-`AgentConnectService.authorize(token, action)` (`service.py:1531`) checks expiry,
-revocation, `FORBIDDEN_ACTIONS`, and scope, raising `PolicyViolation`.
+**Scoped session tokens — enforced.** `mint_token()` issues `act_<urlsafe>`; only its
+SHA-256 is stored. `build_scope()` records the mode's action list.
+`AgentConnectService.authorize(token, action, task_id=…, review_id=…)` checks expiry,
+revocation, the two denial sets, the mode's actions, and the token's task binding. It
+raises `Unauthenticated` when the credential cannot be established and `PolicyViolation`
+when it can and the answer is still no.
 
-**`authorize()` is called by no adapter.** Not by the MCP server, not by the CLI, not by
-the HTTP API — only by tests. Enforcement today is structural and environmental:
-`.mcp.json` allow/deny, environment sanitization, and the CLI mode refusal below. The
-token is real, scoped, hashed, and revoked on shell exit; it simply gates nothing. Any
-ToolConnect design that assumes per-call token authorization is designing a feature, not
-adopting one.
+**Every transport calls it.** The HTTP adapter via an app-level `enforce` dependency, on
+every route; the MCP server via a decorator around every tool registration, using the
+action declared in `core.tools.MCP_TOOLS`. There is one authorization rule and no
+transport reimplements it — a rule fixed in `authorize()` is fixed everywhere.
+
+The **CLI still does not authenticate**: it opens `AGENTCONNECT_DB_PATH` directly and is
+guarded only by `AGENTCONNECT_MODE`. A ToolConnect that mediates tool calls must account
+for it.
 
 **Environment sanitization — wired.** `sanitize_env` (`sessions.py:145`) is
 **allowlist-wins**: `BASE_ALLOWLIST` (PATH, HOME, SHELL, TERM, LANG, LC_ALL, USER,
@@ -123,16 +126,13 @@ Four paths reach the same ledger. Only the first is MCP.
 2. **CLI** — `agentconnect …` builds the service from the environment and calls it
    directly. Guarded only by `_refuse_operator_command`.
 3. **Shell helper shims** — thin wrappers over the CLI, written into each workspace.
-4. **HTTP** — `agentconnect-api`, whose handlers call the service directly.
+4. **HTTP** — `agentconnect-api`, whose handlers call the service directly, behind
+   `enforce`.
 
-**The HTTP adapter has no authentication whatsoever, and it exposes completion.**
-`POST /tasks/{task_id}/complete` (`routes_compliance.py:104`) accepts `force: bool`, and
-`force=True` skips the audit. Meanwhile `AGENTCONNECT_API_HOST` and `AGENTCONNECT_API_PORT`
-are forwarded into the agent's environment (`sessions.py:122`). If an operator runs the
-HTTP adapter, a managed agent is told where it is and can mark its own task `succeeded`
-without a token and without passing the audit. This defeats two of the five rules in the
-[operational contract](BACKPLANE.md). It is filed in
-[INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md) as AC-1.
+Of the four, three authenticate. **The CLI does not**, and that is the remaining soft
+spot: it is the transport a managed agent already holds, guarded by an environment
+variable it can unset. It is a compliance guard, not a security control, and closing it
+needs OS-level isolation rather than another check.
 
 Any ToolConnect that mediates tool calls must mediate **all four** paths, or agents will
 route around it through the one it does not cover.
@@ -198,12 +198,16 @@ and no tool mediator changes that.
 
 ## Preconditions before any code moves
 
-1. Fix AC-1 (unauthenticated HTTP completion). A mediator in front of MCP is theatre while
-   the HTTP door is open.
-2. Reconcile `EXPOSED_MCP_TOOLS`, `MANAGER_ACTIONS`, and the registered tool names — decide
-   whether `get_subtask_status` should exist or `get_status` should be renamed.
-3. Decide whether `authorize()` is wired or deleted. A defined-but-uncalled security
-   mechanism is worse than an absent one, because it reads as a guarantee.
+All three are now met, which is why this contract is worth writing against:
+
+1. ~~Fix AC-1.~~ Done: the HTTP adapter authenticates, and completion cannot skip the audit.
+2. ~~Reconcile the tool lists.~~ Done: `core.tools.MCP_TOOLS` is the single catalog, and
+   `.mcp.json` is generated from it.
+3. ~~Decide whether `authorize()` is wired or deleted.~~ Wired, and called by both the HTTP
+   and MCP transports.
+
+What remains before ToolConnect could take over the gate: the CLI is unauthenticated, and
+tool inputs are still unscanned (below).
 
 ## Related
 
