@@ -77,6 +77,27 @@ Its **PII coverage is deliberately nil**. A homegrown regex for names and addres
 catches the easy third, misses the rest, and the coverage it appears to provide is
 the reason nobody installs a real engine. Enable Presidio.
 
+### Engine licensing
+
+AgentConnect is Apache-2.0. Two engine integrations deserve explicit license notes:
+
+* **TruffleHog is AGPL-3.0, and its integration is a documented exception** to the
+  earlier ecosystem decision that rejected TruffleHog on license grounds, **pending
+  user ratification**. The exception is scoped to exactly the boundary the code
+  already enforces: the engine is optional and **off by default**; TruffleHog is an
+  operator-installed external executable invoked **subprocess-only** — it is never
+  imported, never linked, never bundled, never shipped, and never a pip dependency;
+  and `--no-verification` is forced unless the operator explicitly sets
+  `allow_network_verification`. AgentConnect neither distributes nor modifies
+  TruffleHog, so running it at arm's length does not pull AGPL obligations into
+  this codebase. If the exception is not ratified, engine selection is by
+  capability and Gitleaks (MIT) or detect-secrets (Apache-2.0) substitutes freely.
+* **Operator-supplied classifier weights may carry gated licenses.** The
+  `prompt_guard` engine ships no model and has no default: it loads whatever the
+  operator names, from local files only. Model-weight licenses are the operator's
+  responsibility — in particular, Meta's Llama Prompt Guard weights are distributed
+  under the gated Llama Community License, not an open-source license.
+
 ## Configuration
 
 Copy `config/safety.yaml.example` to `config/safety.yaml`, or point
