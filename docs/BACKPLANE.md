@@ -396,6 +396,10 @@ Environment: `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`,
 # Memory is opt-in. With no config file and no *_URL set, packs are task state only.
 agentconnect memory pending                 # the librarian's queue
 agentconnect memory promote candidate_1 --by matthew   # human-only; not an MCP tool
+# BrainConnect refuses to guess confidence, and refuses to guess scope for a
+# candidate that proposed none — supply them when it does:
+agentconnect memory promote candidate_1 --by matthew \
+    --confidence high --scope repo:my-app   # confidence: low|medium|high|verified
 
 # Run a proprietary agent through the backplane:
 agentconnect launch claude --task task_123 --claim --repo ~/code/myrepo

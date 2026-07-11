@@ -297,8 +297,17 @@ def _cmd_memory_pending(svc: AgentConnectService, a: argparse.Namespace) -> None
 
 
 def _cmd_memory_promote(svc: AgentConnectService, a: argparse.Namespace) -> None:
-    """Human/librarian only. There is no MCP tool for this, on purpose."""
-    _emit(svc.promote_memory_candidate(a.candidate_id, a.by))
+    """Human/librarian only. There is no MCP tool for this, on purpose.
+
+    `--confidence` and `--scope` are optional at the CLI (a backend that can infer
+    them still works), but forwarded verbatim when supplied: BrainConnect refuses
+    to guess either, so a typical agent-captured candidate needs them.
+    """
+    _emit(svc.promote_memory_candidate(
+        a.candidate_id, a.by,
+        confidence=getattr(a, "confidence", None),
+        scope=getattr(a, "scope", None),
+    ))
 
 
 def _cmd_tasks_context_pack(svc: AgentConnectService, a: argparse.Namespace) -> None:
@@ -812,6 +821,14 @@ def build_parser() -> argparse.ArgumentParser:
         "promote", help="promote a candidate to a trusted claim (human/librarian only)")
     p.add_argument("candidate_id")
     p.add_argument("--by", required=True, help="the human or librarian promoting it")
+    p.add_argument(
+        "--confidence", choices=["low", "medium", "high", "verified"], default=None,
+        help="the authority's confidence label; BrainConnect refuses to guess it "
+             "(profiles filter on it, e.g. implementation_constraints requires high)")
+    p.add_argument(
+        "--scope", default=None,
+        help="scope descriptor, e.g. 'global', 'repo:my-app', 'project:x'. Required "
+             "when the candidate proposed no scope (BrainConnect will not guess one)")
     p.set_defaults(func=_cmd_memory_promote)
 
     # linear

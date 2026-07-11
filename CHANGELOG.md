@@ -64,6 +64,17 @@ authority's own verdict.
   in `memory.yaml`) — into the adapter's `api_key`, sent as the Authorization
   header and never logged. With no token set, `api_key` stays `None` (unchanged).
 
+### `memory promote` can supply confidence and scope
+
+* **`agentconnect memory promote` gained `--confidence` and `--scope`.** The
+  service and adapter already forwarded both to BrainConnect's
+  `/candidates/{id}/promote`, but the CLI exposed neither, so a typical
+  agent-captured candidate always failed `invalid_request` — BrainConnect refuses
+  to guess confidence, and refuses to guess scope for a candidate that proposed
+  none. `--confidence` is constrained to `low|medium|high|verified`; `--scope`
+  takes a descriptor (`global`, `repo:my-app`, `project:x`). Both are optional (a
+  backend that can infer them still works) and forwarded verbatim when supplied.
+
 ### Standalone posture, re-proven
 
 The backplane imports, serves, and degrades gracefully with **none** of
