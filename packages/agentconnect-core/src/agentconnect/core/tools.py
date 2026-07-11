@@ -58,6 +58,7 @@ ACTION_FOR_TOOL: dict[str, str] = {t.name: t.action for t in MCP_TOOLS}
 #: than implicit. None of these is registered by any server: the deny is structural,
 #: and this list is the statement of intent, not the mechanism.
 DENIED_MCP_TOOLS: tuple[str, ...] = (
-    "temporal_signal", "wikibrain_promote", "cognee_write", "graphiti_write",
+    "temporal_signal", "wikibrain_promote", "brainconnect_promote",
+    "cognee_write", "graphiti_write",
     "local_model_generate", "secrets_read",
 )

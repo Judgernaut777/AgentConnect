@@ -45,13 +45,19 @@ class McpStdioMemorySink:
 
     def __init__(
         self,
-        command: str = "wiki",
+        command: Optional[str] = None,
         args: Optional[list[str]] = None,
         *,
         harness: str = "agentconnect",
         cwd: Optional[str] = None,
         timeout: float = 30.0,
     ):
+        if command is None:
+            # BrainConnect is WikiBrain renamed; during the transition either CLI
+            # may be the one installed. Prefer the new name, fall back to the old.
+            import shutil
+
+            command = "brainconnect" if shutil.which("brainconnect") else "wiki"
         self._command = command
         self._args = args if args is not None else ["mcp", "serve", "--contribute-only"]
         self._harness = harness

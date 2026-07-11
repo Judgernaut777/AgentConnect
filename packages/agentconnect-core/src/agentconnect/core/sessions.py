@@ -86,6 +86,9 @@ ACTIONS_BY_MODE: dict[SessionMode, frozenset[str]] = {
 AGENT_FORBIDDEN_ACTIONS: frozenset[str] = frozenset({
     "complete_task", "force_complete_task",
     "promote_memory_candidate", "wikibrain_promote", "wikibrain_admin",
+    # BrainConnect is WikiBrain renamed; the denial follows the service to its
+    # new name. Both spellings stay denied for as long as either can appear.
+    "brainconnect_promote", "brainconnect_admin",
     "cognee_write", "graphiti_write",
     "temporal_signal", "temporal_admin", "workflow_terminate",
     "local_model_generate", "secrets_read", "admin_settings",
@@ -97,7 +100,9 @@ AGENT_FORBIDDEN_ACTIONS: frozenset[str] = frozenset({
 #: something reached it directly. No HTTP route and no MCP tool maps to one, and a
 #: token is never the way to reach a backend's admin surface.
 NEVER_TOKEN_ACTIONS: frozenset[str] = frozenset({
-    "wikibrain_promote", "wikibrain_admin", "cognee_write", "graphiti_write",
+    "wikibrain_promote", "wikibrain_admin",
+    "brainconnect_promote", "brainconnect_admin",  # the same backend, renamed
+    "cognee_write", "graphiti_write",
     "temporal_admin", "workflow_terminate", "local_model_generate",
     "secrets_read", "admin_settings",
 })

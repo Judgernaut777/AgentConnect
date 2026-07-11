@@ -35,8 +35,14 @@ from .workers import EchoWorker, WorkerAdapter
 _log = logging.getLogger(__name__)
 
 #: Backend name -> (adapter class, env var holding its base URL, default URL).
+#: "brainconnect" is WikiBrain renamed: the SAME adapter and the same trusted
+#: authority, registered under the new service string (its packs and health then
+#: report the name it was configured under). Configure ONE of the two — with both
+#: configured they are two clients of one service, and the trusted-authority
+#: lookup resolves whichever the config names (aliases match either way).
 _MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str]] = {
     "wikibrain": (WikiBrainMemoryAdapter, "WIKIBRAIN_URL", "http://localhost:8787"),
+    "brainconnect": (WikiBrainMemoryAdapter, "BRAINCONNECT_URL", "http://localhost:8787"),
     "cognee": (CogneeMemoryAdapter, "COGNEE_URL", "http://localhost:8001"),
     "graphiti": (GraphitiMemoryAdapter, "GRAPHITI_URL", "http://localhost:8002"),
 }
@@ -137,7 +143,12 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
         if not declared and not os.environ.get(env_var):
             continue  # nothing configured for this backend at all
         base_url = os.environ.get(env_var) or spec.get("base_url") or default_url
-        adapters[name] = cls(base_url=base_url)  # type: ignore[call-arg]
+        if cls is WikiBrainMemoryAdapter:
+            # Registered under the name it was configured as ("wikibrain" or
+            # "brainconnect"), so packs and health report what the operator wrote.
+            adapters[name] = cls(base_url=base_url, backend_name=name)
+        else:
+            adapters[name] = cls(base_url=base_url)  # type: ignore[call-arg]
 
     if not adapters:
         _log.info("no memory backends configured; context packs will be task state only")
