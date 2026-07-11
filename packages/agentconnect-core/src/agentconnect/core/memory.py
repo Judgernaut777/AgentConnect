@@ -265,7 +265,11 @@ class CaptureRequest:
     task_id: Optional[str] = None
     proposed_scopes: list[MemoryScope] = field(default_factory=list)
     origin_actor_id: Optional[str] = None
-    origin_actor_type: Optional[str] = None  # manager | worker | human | system
+    #: AgentConnect vocabulary: manager | worker | human | system. The ledger's
+    #: vocabulary has no "system"; the WikiBrain wire adapter maps it to "tool"
+    #: at the boundary (see `_LEDGER_ACTOR_TYPE_MAP`). Other backends receive
+    #: this value exactly as written here.
+    origin_actor_type: Optional[str] = None
     source_ref: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -480,8 +484,16 @@ _REFUSAL_CODES = {"safety_refused", "not_found", "forbidden", "invalid_request",
                   "backend_error"}
 
 
-def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
+def _classified(call: "Any", subject: str) -> dict[str, Any]:
     """Run a backend call and give its failure a name.
+
+    Every WikiBrain adapter call goes through here — capture, promotion, recall,
+    pending listing, feedback. It used to guard only the write paths, so a 403 on
+    recall leaked as a raw `httpx.HTTPStatusError` and a caller in bearer-token mode
+    could never tell a revoked credential from a dropped socket.
+
+    `subject` is a short human phrase naming what was being attempted
+    (``"promoting cand_4"``, ``"recall"``); it only feeds error messages.
 
     Two transports reach BrainConnect and they fail in different vocabularies. The
     in-process shim raises `wiki.candidates.SafetyRefused` directly; the HTTP path
@@ -498,8 +510,8 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
         name = type(exc).__name__
         if name == "SafetyRefused":
             raise MemorySafetyRefused(
-                f"the memory authority's safety policy refused to promote "
-                f"{candidate_id}: {exc}", _safety_summary(exc)) from exc
+                f"the memory authority's safety policy refused "
+                f"{subject}: {exc}", _safety_summary(exc)) from exc
 
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
@@ -516,8 +528,8 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
             # ambiguous: 409 is `safety_refused`, not a generic conflict.
             if code in ("safety_refused", "memory_safety_refused"):
                 raise MemorySafetyRefused(
-                    f"the memory authority's safety policy refused to promote "
-                    f"{candidate_id}: {detail}", safety) from exc
+                    f"the memory authority's safety policy refused "
+                    f"{subject}: {detail}", safety) from exc
             if code == "forbidden":
                 raise MemoryAuthorizationError(
                     f"the memory authority forbids this actor: {detail}") from exc
@@ -526,8 +538,8 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
                     f"the memory authority is degraded: {detail}") from exc
             if code in ("not_found", "invalid_request"):
                 raise InvalidRequest(
-                    f"the memory authority rejected candidate "
-                    f"{candidate_id}: {detail}") from exc
+                    f"the memory authority rejected "
+                    f"{subject}: {detail}") from exc
 
             # No recognizable envelope — fall back to the bare status. Note 409 is
             # deliberately *not* treated as a safety refusal here: without the code we
@@ -537,7 +549,7 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
                     f"the memory authority rejected our credential: {exc}") from exc
             if status in (400, 404, 409, 422):
                 raise InvalidRequest(
-                    f"the memory authority rejected candidate {candidate_id}: {exc}") from exc
+                    f"the memory authority rejected {subject}: {exc}") from exc
             if status >= 500:
                 raise MemoryServerError(f"the memory authority failed: {exc}") from exc
 
@@ -546,6 +558,17 @@ def _classified(call: "Any", candidate_id: str) -> dict[str, Any]:
             raise MemoryUnavailable(
                 f"the memory authority is unreachable: {exc}") from exc
         raise
+
+
+#: The ledger's actor vocabulary is BrainConnect trust semantics —
+#: ``human | manager | worker | librarian | agent | tool`` — and it 400s on
+#: anything else. AgentConnect's vocabulary additionally has ``system`` (an
+#: automated, non-agent action), which in ledger terms *is* a tool action, so
+#: this wire adapter translates it at the boundary and sends every other value
+#: verbatim. The consumer adapts; the authority's vocabulary does not bend.
+#: The mapping belongs to this adapter alone — other backends receive the
+#: caller's actor type untouched.
+_LEDGER_ACTOR_TYPE_MAP = {"system": "tool"}
 
 
 class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
@@ -580,13 +603,13 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
         )
 
     def recall(self, request: RecallRequest) -> RecallPack:
-        body = self._call("POST", "/recall", {
+        body = _classified(lambda: self._call("POST", "/recall", {
             "query": request.query, "task_id": request.task_id, "profile": request.profile,
             "max_items": request.max_items, "trusted_only": request.trusted_only,
             "include_pending": request.include_pending,
             "include_superseded": request.include_superseded,
             "scopes": _scope_payload(request.scopes),
-        })
+        }), "recall")
         items = []
         for raw in body.get("items", []):
             scope = raw.get("scope") or {}
@@ -637,6 +660,14 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
         )
 
     def capture_candidate(self, request: CaptureRequest) -> CaptureResult:
+        """Send a candidate to the ledger — always pending, never promoted.
+
+        Actor-type translation happens here, on the wire: AgentConnect's
+        ``origin_actor_type="system"`` is sent to the ledger as ``"tool"``
+        (see `_LEDGER_ACTOR_TYPE_MAP`); every other value crosses verbatim.
+        The `CaptureRequest` itself is never mutated, so other backends and
+        the AgentConnect event log keep seeing what the caller said.
+        """
         # BrainConnect requires `proposed_by` and skips `None` values when building
         # its request, so an unset origin actor died deep inside its constructor with
         # a `TypeError` naming a field this side has never heard of. Refuse here,
@@ -649,11 +680,12 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
         body = _classified(lambda: self._call("POST", "/capture", {
             "text": request.text, "task_id": request.task_id,
             "origin_actor_id": request.origin_actor_id,
-            "origin_actor_type": request.origin_actor_type,
+            "origin_actor_type": _LEDGER_ACTOR_TYPE_MAP.get(
+                request.origin_actor_type, request.origin_actor_type),
             "source_ref": request.source_ref, "tags": request.tags,
             "proposed_scopes": [{"scope_type": s.scope_type, "scope_id": s.scope_id}
                                 for s in request.proposed_scopes],
-        }), request.origin_actor_id or "<unknown>")
+        }), f"capture from {request.origin_actor_id}")
         status = body.get("status", "pending")
         if status == "promoted":
             _log.warning("wikibrain reported promotion on capture; recording as pending")
@@ -704,22 +736,24 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
 
         body = _classified(
             lambda: self._call("POST", f"/candidates/{candidate_id}/promote", payload),
-            candidate_id,
+            f"promoting {candidate_id}",
         )
         body.setdefault("claim_id", candidate_id)
         body.setdefault("status", "promoted")
         return body
 
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
-        return list(self._call("GET", f"/candidates?status=pending&limit={limit}")
-                    .get("candidates", []))
+        return list(_classified(
+            lambda: self._call("GET", f"/candidates?status=pending&limit={limit}"),
+            "listing pending candidates",
+        ).get("candidates", []))
 
     def record_feedback(self, request: MemoryFeedbackRequest) -> None:
-        self._call("POST", "/feedback", {
+        _classified(lambda: self._call("POST", "/feedback", {
             "task_id": request.task_id, "memory_item_id": request.memory_item_id,
             "source_id": request.source_id, "feedback": request.feedback,
             "actor_id": request.actor_id, "note": request.note,
-        })
+        }), f"feedback on {request.memory_item_id or request.source_id or 'memory'}")
 
     def health(self) -> dict[str, Any]:
         try:
