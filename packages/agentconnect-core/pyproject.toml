@@ -35,3 +35,8 @@ safety-all = [
 where = ["src"]
 include = ["agentconnect.common*", "agentconnect.core*", "agentconnect.safety*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+# Packaged default config (empty provider/profile registries + fail-closed routing
+# policy) so an installed router starts without a source checkout.
+"agentconnect.common" = ["default_config/*.yaml"]

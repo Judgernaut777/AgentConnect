@@ -1,0 +1,7 @@
+# Packaged default: NO capability profiles and no resident model.
+#
+# Ships inside the agentconnect-core wheel purely so an installed router can
+# start with an empty registry. Real deployments set AGENTCONNECT_CONFIG_DIR.
+default_resident_model: ""
+profiles: {}
+agent_defaults: {}
