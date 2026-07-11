@@ -124,12 +124,12 @@ a real ComputeConnect is integration-tested against the same shapes separately).
   A `None`/absent tier means the engine must assume the **most restrictive** tier —
   an old caller is never less safe, and this client never invents a looser tier.
 
-* **Minimal CA-2 — `run_id` on `/generate` responses.** Responses now carry the
-  engine's run identifier, surfaced as `LocalRunResult.run_id`, which makes
+* **CA-3 — `run_id` on `/generate` responses.** (ComputeConnect numbered this CA-3;
+  it carries the `run_id` half of the original CA-2's motivation.) Responses now carry
+  the engine's run identifier, surfaced as `LocalRunResult.run_id`, which makes
   `POST /runs/{run_id}/cancel` actually usable. Engines that omit it are tolerated
-  (`run_id = None`). Dispatch-by-reference — the rest of the original CA-2 —
-  is **not** implemented; `/generate` remains a thin streaming proxy per
-  ComputeConnect invariant 3.
+  (`run_id = None`). Dispatch-by-reference — CA-2 proper — is **not** implemented;
+  `/generate` remains a thin streaming proxy per ComputeConnect invariant 3.
 
 The provider does not participate in routing directly. It is wrapped by
 `LocalModelManagerWorkerAdapter` (`local_compute.py:200`) and registered as one worker in
