@@ -1,4 +1,4 @@
-"""Conformance: the six LocalComputeProvider HTTP routes, post CA-1/CA-2.
+"""Conformance: the six LocalComputeProvider HTTP routes, post CA-1/CA-3.
 
 ComputeConnect (docs/CONTRACT.md there; docs/COMPUTECONNECT_CONTRACT.md here) conforms
 to the surface `HttpLocalComputeProvider` speaks:
@@ -11,7 +11,7 @@ with two ratified amendments:
 * **CA-1** — `POST /generate` carries `privacy_tier`, so execution can re-verify the
   privacy decision made at estimate time. `None`/absent means "assume the most
   restrictive tier"; sending it can therefore only tighten, never loosen.
-* **Minimal CA-2** — `/generate` responses carry a `run_id`, making
+* **CA-3** (the run_id half of the original CA-2) — `/generate` responses carry a `run_id`, making
   `POST /runs/{run_id}/cancel` usable. Older engines that omit it are tolerated.
 
 These run against a real localhost HTTP stub — NOT an injected transport — so the
@@ -47,7 +47,7 @@ class _StubEngine(BaseHTTPRequestHandler):
     """A compliant post-amendment engine. Records every request it serves."""
 
     requests: list[tuple[str, str, dict | None]] = []  # (method, path, body)
-    omit_run_id = False  # flip to emulate a pre-CA-2 engine
+    omit_run_id = False  # flip to emulate a pre-CA-3 engine
 
     def _reply(self, status: int, body: dict) -> None:
         raw = json.dumps(body).encode()

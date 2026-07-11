@@ -37,7 +37,7 @@ routes, exercised over the real httpx path against a stub engine).
   `POST /generate` body so the engine can re-verify the privacy decision made at
   estimate time. `None`/absent means "assume the most restrictive tier".
   `LocalModelManagerWorkerAdapter` populates it from the subtask's tier.
-* **Minimal CA-2** — `/generate` responses carry `run_id`, surfaced as
+* **CA-3** (the run_id half of the original CA-2) — `/generate` responses carry `run_id`, surfaced as
   `LocalRunResult.run_id`, making `POST /runs/{run_id}/cancel` usable. Older
   engines that omit it are tolerated. Dispatch-by-reference is deliberately not
   implemented; `/generate` remains a thin streaming proxy.

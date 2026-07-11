@@ -92,7 +92,7 @@ class LocalRunResult:
     runtime: Optional[str]
     metrics: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
-    #: Minimal CA-2 (ComputeConnect docs/CONTRACT.md): `/generate` responses carry
+    #: CA-3 (ComputeConnect docs/CONTRACT.md): `/generate` responses carry
     #: the engine's run identifier so `/runs/{run_id}/cancel` is actually usable.
     #: ``None`` when an older engine does not return one — tolerated, never required.
     run_id: Optional[str] = None
@@ -190,7 +190,7 @@ class HttpLocalComputeProvider(LocalComputeProvider):
             # the most restrictive one, so omission and null are equally safe.
             "privacy_tier": request.privacy_tier,
         })
-        run_id = body.get("run_id")  # minimal CA-2; absent from older engines
+        run_id = body.get("run_id")  # CA-3; absent from older engines
         return LocalRunResult(
             status=str(body.get("status", "succeeded")), output=str(body.get("output", "")),
             model=body.get("model"), runtime=body.get("runtime"),
