@@ -324,3 +324,69 @@ def test_cli_defaults_attribution_to_the_session_actor(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTCONNECT_MANAGER_ID", raising=False)
     args = build_parser().parse_args(["artifacts", "add", "task_x", "--content", "c"])
     assert args.by == "human"
+
+
+# --------------------------------------- DEFECT 2: promote confidence + scope
+
+
+def _promote_capturing_service(tmp_path):
+    """A service whose trusted authority records the promote payload it receives."""
+    from agentconnect.core.memory import WikiBrainMemoryAdapter
+
+    seen: dict = {}
+
+    def transport(method, url, payload):
+        if url.endswith("/promote"):
+            seen["method"] = method
+            seen["url"] = url
+            seen["payload"] = payload
+            return {"id": "claim_1", "status": "promoted", "text": "x"}
+        return {}
+
+    brain = WikiBrainMemoryAdapter(transport=transport, backend_name="brainconnect")
+    svc = AgentConnectService.create(
+        db_path=str(tmp_path / "ledger.db"),
+        artifact_dir=str(tmp_path / "artifacts"),
+        memory_backends={"brainconnect": brain},
+    )
+    return svc, seen
+
+
+def test_cli_promote_threads_confidence_and_scope(tmp_path, capsys):
+    """`memory promote --confidence high --scope repo:my-app` reaches the adapter
+    with both values — without them BrainConnect refuses to guess and 400s."""
+    svc, seen = _promote_capturing_service(tmp_path)
+    rc = cli_main(
+        ["memory", "promote", "candidate_1", "--by", "matthew",
+         "--confidence", "high", "--scope", "repo:my-app"],
+        service=svc,
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "promoted"
+    assert seen["payload"]["promoted_by"] == "matthew"
+    assert seen["payload"]["confidence"] == "high"
+    assert seen["payload"]["scope"] == "repo:my-app"
+
+
+def test_cli_promote_omits_unset_confidence_and_scope(tmp_path, capsys):
+    """Backends that can infer both still work: the flags are optional and, when
+    unset, are not forwarded at all (behavior unchanged)."""
+    svc, seen = _promote_capturing_service(tmp_path)
+    rc = cli_main(
+        ["memory", "promote", "candidate_1", "--by", "matthew"], service=svc)
+    assert rc == 0
+    assert seen["payload"]["promoted_by"] == "matthew"
+    assert "confidence" not in seen["payload"]
+    assert "scope" not in seen["payload"]
+
+
+def test_cli_promote_rejects_unknown_confidence(tmp_path):
+    """The CLI constrains confidence to the BrainConnect vocabulary."""
+    svc, _seen = _promote_capturing_service(tmp_path)
+    with pytest.raises(SystemExit):
+        cli_main(
+            ["memory", "promote", "candidate_1", "--by", "matthew",
+             "--confidence", "certain"],
+            service=svc,
+        )
