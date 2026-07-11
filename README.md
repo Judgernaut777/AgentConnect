@@ -579,4 +579,5 @@ See `docs/ARCHITECTURE.md` for the section-by-section map.
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE); every package under
+`packages/` ships the same license text in its wheel.
