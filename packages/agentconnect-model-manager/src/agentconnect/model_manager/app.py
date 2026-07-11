@@ -51,7 +51,7 @@ def create_app(
     from fastapi import FastAPI
 
     mgr = manager or ResidencyManager()
-    app = FastAPI(title="Local Model Manager", version="0.2.0")
+    app = FastAPI(title="Local Model Manager", version="0.1.0")
     if allowed_clients:
         app.add_middleware(ClientIdentityMiddleware, allowed=allowed_clients)
 

@@ -9,7 +9,7 @@ description = "CLI adapter for the AgentConnect task backplane."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["agentconnect-core==0.2.0"]
+dependencies = ["agentconnect-core==0.1.0"]
 
 [project.optional-dependencies]
 linear = ["agentconnect-linear==0.1.0"]

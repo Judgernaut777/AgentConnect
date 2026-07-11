@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentconnect-router"
-version = "0.2.0"
+version = "0.1.0"
 description = "AgentConnect Agent Router — the MCP control plane. Classifies tasks, enforces privacy/quota policy, scores providers deterministically, and dispatches work. The primary product; runs standalone without the Model Manager."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "agentconnect-core==0.2.0",
+    "agentconnect-core==0.1.0",
     "mcp>=1.0",
     "httpx>=0.27",
     "tenacity>=8",
@@ -20,7 +20,7 @@ dependencies = [
 # Single-box convenience: install the Model Manager alongside the Router so the
 # Router can embed an in-process manager when no MODEL_MANAGER_URL is set. The
 # Router library never hard-imports it — this is a soft, optional extra.
-embedded = ["agentconnect-model-manager==0.2.0"]
+embedded = ["agentconnect-model-manager==0.1.0"]
 # Agentic execution: the worker runtime's act/tool loop, dispatched in-process
 # for tasks submitted with execution="agentic". Lazily imported — the Router
 # never hard-imports it, so one-shot-only deployments can skip it.

@@ -9,7 +9,7 @@ description = "Linear adapter for the AgentConnect task backplane — push sync 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["agentconnect-core==0.2.0"]
+dependencies = ["agentconnect-core==0.1.0"]
 
 [project.optional-dependencies]
 # Only the default (network) transport needs httpx; an injected transport does not.
