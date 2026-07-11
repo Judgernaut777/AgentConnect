@@ -117,7 +117,13 @@ class CaptureRequest:
     task_id: str | None = None
     proposed_scopes: list[MemoryScope] = field(default_factory=list)
     origin_actor_id: str | None = None
-    origin_actor_type: str | None = None  # manager | worker | human | system
+    # AgentConnect vocabulary: manager | worker | human | system. The BrainConnect
+    # ledger's actor vocabulary (human|manager|worker|librarian|agent|tool) has no
+    # "system"; the WikiBrain wire adapter maps "system" -> "tool" at the boundary
+    # (an automated non-agent system action is a tool action in ledger terms) and
+    # sends every other value verbatim. The mapping is the wire adapter's alone —
+    # other backends receive this value untouched.
+    origin_actor_type: str | None = None
     source_ref: str | None = None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -232,6 +238,12 @@ must be labeled.
 * **StaticMemoryAdapter** — tests; items from config or fixture.
 * **HttpMemoryAdapter** — generic HTTP memory service (`base_url`, `api_key_env`).
 * **WikiBrainMemoryAdapter** — `brain_recall` / `brain_capture` (always pending) / feedback endpoint.
+  Translates `origin_actor_type="system"` to the ledger's `"tool"` on the capture wire
+  (the ledger's actor vocabulary is BrainConnect trust semantics; the consumer adapts).
+  All of its HTTP calls — capture, promotion, recall, pending listing, feedback — classify
+  backend failures into the typed memory errors (`MemoryAuthorizationError`,
+  `MemorySafetyRefused`, `MemoryServerError`, `InvalidRequest`, `MemoryUnavailable`);
+  a 403 on recall is a credential problem, not a generic HTTP exception.
 * **CogneeMemoryAdapter** — map results into `RecallPack`. If Cognee lacks pending/promoted
   semantics, the adapter labels status `unknown` or implements an AgentConnect-side pending table.
 
