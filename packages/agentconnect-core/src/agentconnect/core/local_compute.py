@@ -76,6 +76,11 @@ class LocalRunRequest:
     context: Optional[str] = None
     max_output_tokens: int = 2048
     temperature: float = 0.0
+    #: CA-1 (ComputeConnect docs/CONTRACT.md): execution re-verifies the privacy
+    #: decision made at estimate time, instead of trusting the candidate filter
+    #: alone. Optional and additive: an engine receiving ``None`` must assume the
+    #: most restrictive tier — so an old caller is never *less* safe.
+    privacy_tier: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -87,6 +92,10 @@ class LocalRunResult:
     runtime: Optional[str]
     metrics: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Minimal CA-2 (ComputeConnect docs/CONTRACT.md): `/generate` responses carry
+    #: the engine's run identifier so `/runs/{run_id}/cancel` is actually usable.
+    #: ``None`` when an older engine does not return one — tolerated, never required.
+    run_id: Optional[str] = None
 
 
 class LocalComputeProvider(abc.ABC):
@@ -177,11 +186,16 @@ class HttpLocalComputeProvider(LocalComputeProvider):
             "model": request.model, "task_type": request.task_type, "prompt": request.prompt,
             "context": request.context, "max_output_tokens": request.max_output_tokens,
             "temperature": request.temperature,
+            # CA-1: sent even when None — the engine treats a missing/None tier as
+            # the most restrictive one, so omission and null are equally safe.
+            "privacy_tier": request.privacy_tier,
         })
+        run_id = body.get("run_id")  # minimal CA-2; absent from older engines
         return LocalRunResult(
             status=str(body.get("status", "succeeded")), output=str(body.get("output", "")),
             model=body.get("model"), runtime=body.get("runtime"),
             metrics=body.get("metrics") or {}, warnings=list(body.get("warnings", [])),
+            run_id=str(run_id) if run_id is not None else None,
         )
 
     def cancel(self, run_id: str) -> None:
@@ -297,6 +311,8 @@ class LocalModelManagerWorkerAdapter(WorkerAdapter):
                 task_type=self._task_type,
                 prompt=f"{subtask.title}\n\n{subtask.instructions}",
                 max_output_tokens=self._max_output_tokens,
+                # CA-1: the engine re-verifies the tier routing already enforced.
+                privacy_tier=subtask.privacy_tier.value,
             ))
         except Exception as exc:
             # An outage is a failed run, recorded in the ledger — never a crash
