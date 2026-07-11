@@ -53,6 +53,17 @@ join their `wikibrain_*` counterparts — old spellings stay denied). Aliasing
 confers nothing: trust still requires the trusted-authority role and the
 authority's own verdict.
 
+### Memory backend authentication
+
+* **Bearer tokens now plumb from env into the memory adapters.** `brainconnect
+  serve --token` (and `BRAINCONNECT_TOKEN`) protect the server, but the
+  AgentConnect side had no way to supply the token, so every recall/capture
+  against a protected server silently degraded to a `MemoryAuthorizationError`
+  warning. `memory_from_env` now reads a per-backend token — `WIKIBRAIN_TOKEN`,
+  `BRAINCONNECT_TOKEN`, `COGNEE_TOKEN`, `GRAPHITI_TOKEN` (or a per-backend `token:`
+  in `memory.yaml`) — into the adapter's `api_key`, sent as the Authorization
+  header and never logged. With no token set, `api_key` stays `None` (unchanged).
+
 ### Standalone posture, re-proven
 
 The backplane imports, serves, and degrades gracefully with **none** of

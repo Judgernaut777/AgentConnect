@@ -171,8 +171,13 @@ deliberately **not** in the core: hard preferences are AgentConnect config
 (`hard_policies`) or scoped WikiBrain claims.
 
 Config lives in `config/memory.yaml` (`AGENTCONNECT_MEMORY_CONFIG`), backend URLs
-in `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`. Absent config means memory is
-simply off and context packs are task state only.
+in `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`. A token-protected backend
+(`brainconnect serve --token`) takes a bearer token from the matching
+`WIKIBRAIN_TOKEN` / `BRAINCONNECT_TOKEN` / `COGNEE_TOKEN` / `GRAPHITI_TOKEN` env
+var (or a per-backend `token:` in `memory.yaml`); it is sent as the Authorization
+header and never logged. Without it, every recall/capture against a protected
+server degrades to a `MemoryAuthorizationError` warning — memory silently off.
+Absent config means memory is simply off and context packs are task state only.
 
 **Local compute (spec 3, Part B).** `LocalComputeProvider` +
 `HttpLocalComputeProvider` (speaking `/health`, `/models`, `/models/loaded`,
@@ -384,7 +389,8 @@ agentconnect linear sync TASK_ID
 Environment: `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`,
 `AGENTCONNECT_MAX_COST_USD`, `AGENTCONNECT_WORKERS`, `TEMPORAL_ADDRESS`,
 `AGENTCONNECT_TEMPORAL_TASK_QUEUE`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID`,
-`AGENTCONNECT_MEMORY_CONFIG`, `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`.
+`AGENTCONNECT_MEMORY_CONFIG`, `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`,
+`WIKIBRAIN_TOKEN` / `BRAINCONNECT_TOKEN` / `COGNEE_TOKEN` / `GRAPHITI_TOKEN`.
 
 ```bash
 # Memory is opt-in. With no config file and no *_URL set, packs are task state only.

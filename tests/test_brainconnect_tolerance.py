@@ -145,6 +145,115 @@ def test_bootstrap_yaml_declared_brainconnect(monkeypatch, tmp_path):
     assert config.trusted_authority == "brainconnect"
 
 
+# ------------------------------------------------------ bearer-token plumbing
+
+
+def test_bootstrap_env_plumbs_brainconnect_token(monkeypatch, tmp_path):
+    """A BRAINCONNECT_TOKEN reaches the adapter's api_key, so a token-protected
+    `brainconnect serve` is authenticated instead of degrading to auth errors."""
+    monkeypatch.setenv("BRAINCONNECT_URL", "http://localhost:8787")
+    monkeypatch.setenv("BRAINCONNECT_TOKEN", "Bearer s3cr3t")
+    for var in ("WIKIBRAIN_URL", "COGNEE_URL", "GRAPHITI_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGENTCONNECT_MEMORY_CONFIG", str(tmp_path / "missing.yaml"))
+    adapters, _config = memory_from_env()
+    assert adapters["brainconnect"]._api_key == "Bearer s3cr3t"
+
+
+def test_bootstrap_wikibrain_token_alias(monkeypatch, tmp_path):
+    """The wikibrain-aliased env var works too, so either service string authenticates."""
+    monkeypatch.setenv("WIKIBRAIN_URL", "http://localhost:8787")
+    monkeypatch.setenv("WIKIBRAIN_TOKEN", "Bearer alias")
+    for var in ("BRAINCONNECT_URL", "COGNEE_URL", "GRAPHITI_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGENTCONNECT_MEMORY_CONFIG", str(tmp_path / "missing.yaml"))
+    adapters, _config = memory_from_env()
+    assert adapters["wikibrain"]._api_key == "Bearer alias"
+
+
+def test_bootstrap_without_token_leaves_api_key_none(monkeypatch, tmp_path):
+    """Current behavior is unchanged when no token is configured."""
+    monkeypatch.setenv("BRAINCONNECT_URL", "http://localhost:8787")
+    for var in ("WIKIBRAIN_URL", "COGNEE_URL", "GRAPHITI_URL",
+                "BRAINCONNECT_TOKEN", "WIKIBRAIN_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGENTCONNECT_MEMORY_CONFIG", str(tmp_path / "missing.yaml"))
+    adapters, _config = memory_from_env()
+    assert adapters["brainconnect"]._api_key is None
+
+
+def test_bootstrap_yaml_token_plumbed(monkeypatch, tmp_path):
+    """The memory.yaml backend spec can carry the token too, mirroring base_url."""
+    config_file = tmp_path / "memory.yaml"
+    config_file.write_text(
+        "memory:\n"
+        "  enabled: true\n"
+        "  trusted_authority: brainconnect\n"
+        "  backends:\n"
+        "    brainconnect:\n"
+        "      enabled: true\n"
+        "      base_url: http://localhost:8787\n"
+        "      token: Bearer from-yaml\n",
+        encoding="utf-8",
+    )
+    for var in ("WIKIBRAIN_URL", "BRAINCONNECT_URL", "COGNEE_URL", "GRAPHITI_URL",
+                "BRAINCONNECT_TOKEN", "WIKIBRAIN_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGENTCONNECT_MEMORY_CONFIG", str(config_file))
+    adapters, _config = memory_from_env()
+    assert adapters["brainconnect"]._api_key == "Bearer from-yaml"
+
+
+def test_adapter_api_key_is_sent_as_authorization_header(monkeypatch):
+    """The plumbed token actually reaches the wire as the Authorization header."""
+    import httpx
+
+    seen: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):  # noqa: D401
+            return None
+
+        def json(self):
+            return {"items": []}
+
+    def _fake_request(method, url, json=None, headers=None, timeout=None):
+        seen["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "request", _fake_request)
+    adapter = WikiBrainMemoryAdapter(base_url="http://localhost:8787",
+                                     api_key="Bearer wire-token")
+    from agentconnect.core.memory import RecallRequest
+
+    adapter.recall(RecallRequest(query="x", profile="manager_brief"))
+    assert seen["headers"].get("Authorization") == "Bearer wire-token"
+
+
+def test_adapter_without_api_key_sends_no_authorization_header(monkeypatch):
+    import httpx
+
+    seen: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"items": []}
+
+    def _fake_request(method, url, json=None, headers=None, timeout=None):
+        seen["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "request", _fake_request)
+    adapter = WikiBrainMemoryAdapter(base_url="http://localhost:8787")
+    from agentconnect.core.memory import RecallRequest
+
+    adapter.recall(RecallRequest(query="x", profile="manager_brief"))
+    assert "Authorization" not in seen["headers"]
+
+
 # ------------------------------------------------------------------ deny-lists
 def test_the_denials_follow_the_rename():
     for action in ("brainconnect_promote", "brainconnect_admin"):

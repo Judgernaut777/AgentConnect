@@ -12,6 +12,13 @@ Env:
   AGENTCONNECT_WORKERS        comma-separated built-ins to register (default "echo")
   AGENTCONNECT_WORKSPACE_DIR  managed agent workspaces (default ~/.agentconnect/workspaces)
   AGENTCONNECT_API_URL        what a launched agent is told to call (default :8790)
+
+Memory backend env (each optional; a backend with no URL set stays off):
+  WIKIBRAIN_URL / BRAINCONNECT_URL   the trusted-authority base URL
+  WIKIBRAIN_TOKEN / BRAINCONNECT_TOKEN  bearer token for a token-protected server
+                                     (`brainconnect serve --token`); sent as the
+                                     Authorization header, never logged
+  COGNEE_URL / COGNEE_TOKEN, GRAPHITI_URL / GRAPHITI_TOKEN   likewise
 """
 
 from __future__ import annotations
@@ -34,17 +41,20 @@ from .workers import EchoWorker, WorkerAdapter
 
 _log = logging.getLogger(__name__)
 
-#: Backend name -> (adapter class, env var holding its base URL, default URL).
-#: "brainconnect" is WikiBrain renamed: the SAME adapter and the same trusted
-#: authority, registered under the new service string (its packs and health then
-#: report the name it was configured under). Configure ONE of the two — with both
-#: configured they are two clients of one service, and the trusted-authority
-#: lookup resolves whichever the config names (aliases match either way).
-_MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str]] = {
-    "wikibrain": (WikiBrainMemoryAdapter, "WIKIBRAIN_URL", "http://localhost:8787"),
-    "brainconnect": (WikiBrainMemoryAdapter, "BRAINCONNECT_URL", "http://localhost:8787"),
-    "cognee": (CogneeMemoryAdapter, "COGNEE_URL", "http://localhost:8001"),
-    "graphiti": (GraphitiMemoryAdapter, "GRAPHITI_URL", "http://localhost:8002"),
+#: Backend name -> (adapter class, env var holding its base URL, default URL,
+#: env var holding its bearer token). "brainconnect" is WikiBrain renamed: the
+#: SAME adapter and the same trusted authority, registered under the new service
+#: string (its packs and health then report the name it was configured under).
+#: Configure ONE of the two — with both configured they are two clients of one
+#: service, and the trusted-authority lookup resolves whichever the config names
+#: (aliases match either way). The token env var mirrors the URL var: a
+#: token-protected `brainconnect serve` (--token / BRAINCONNECT_TOKEN) is reached
+#: by setting BRAINCONNECT_TOKEN here, and the wikibrain alias by WIKIBRAIN_TOKEN.
+_MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str, str]] = {
+    "wikibrain": (WikiBrainMemoryAdapter, "WIKIBRAIN_URL", "http://localhost:8787", "WIKIBRAIN_TOKEN"),
+    "brainconnect": (WikiBrainMemoryAdapter, "BRAINCONNECT_URL", "http://localhost:8787", "BRAINCONNECT_TOKEN"),
+    "cognee": (CogneeMemoryAdapter, "COGNEE_URL", "http://localhost:8001", "COGNEE_TOKEN"),
+    "graphiti": (GraphitiMemoryAdapter, "GRAPHITI_URL", "http://localhost:8002", "GRAPHITI_TOKEN"),
 }
 
 MEMORY_CONFIG_PATH = "AGENTCONNECT_MEMORY_CONFIG"
@@ -136,19 +146,23 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
 
     declared = (raw.get("memory") or {}).get("backends") or {}
     adapters: dict[str, MemoryAdapter] = {}
-    for name, (cls, env_var, default_url) in _MEMORY_BACKENDS.items():
+    for name, (cls, env_var, default_url, token_env) in _MEMORY_BACKENDS.items():
         spec = declared.get(name) or {}
         if declared and not spec.get("enabled", False):
             continue
         if not declared and not os.environ.get(env_var):
             continue  # nothing configured for this backend at all
         base_url = os.environ.get(env_var) or spec.get("base_url") or default_url
+        # Optional bearer token, mirroring the base-URL precedence: env wins over
+        # the memory.yaml `token`, and neither means an unauthenticated client
+        # (api_key stays None). Never logged — a token in a warning line is a leak.
+        api_key = os.environ.get(token_env) or spec.get("token") or None
         if cls is WikiBrainMemoryAdapter:
             # Registered under the name it was configured as ("wikibrain" or
             # "brainconnect"), so packs and health report what the operator wrote.
-            adapters[name] = cls(base_url=base_url, backend_name=name)
+            adapters[name] = cls(base_url=base_url, backend_name=name, api_key=api_key)
         else:
-            adapters[name] = cls(base_url=base_url)  # type: ignore[call-arg]
+            adapters[name] = cls(base_url=base_url, api_key=api_key)  # type: ignore[call-arg]
 
     if not adapters:
         _log.info("no memory backends configured; context packs will be task state only")
