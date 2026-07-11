@@ -39,6 +39,8 @@ from .memory import (
     RecallPack,
     RecallRequest,
     TrustedMemoryAdapter,
+    backend_aliases,
+    resolve_backend,
 )
 from .artifacts import FilesystemArtifactStore
 from .audit import AuditReport
@@ -164,7 +166,7 @@ class AgentConnectService:
         # bare recall never returns a search hit dressed up as a claim.
         self.memory: MemoryAdapter = (
             memory
-            or self.memory_backends.get(self.memory_config.trusted_authority)
+            or resolve_backend(self.memory_backends, self.memory_config.trusted_authority)
             or next(iter(self.memory_backends.values()), None)
             or NoopMemoryAdapter()
         )
@@ -200,7 +202,7 @@ class AgentConnectService:
         # `self.memory` remains the single-adapter recall path; point it at the
         # trusted authority when one is present, so a bare `recall_memory` call
         # never accidentally answers from a retrieval engine.
-        self.memory = adapters.get(authority) or next(
+        self.memory = resolve_backend(adapters, authority) or next(
             iter(adapters.values()), NoopMemoryAdapter()
         )
         self.context_builder = ContextBuilder(self, self.memory_backends, self.memory_config,
@@ -208,7 +210,7 @@ class AgentConnectService:
                                               safety_pipeline=self.safety_pipeline)
 
     def trusted_authority(self) -> Optional[TrustedMemoryAdapter]:
-        adapter = self.memory_backends.get(self.memory_config.trusted_authority)
+        adapter = resolve_backend(self.memory_backends, self.memory_config.trusted_authority)
         return adapter if isinstance(adapter, TrustedMemoryAdapter) else None
 
     @classmethod
@@ -1176,7 +1178,7 @@ class AgentConnectService:
             except Exception as exc:
                 return {"backend": self.memory.backend_name, "status": "unreachable",
                         "detail": str(exc)}
-        primary = backends.get(self.memory_config.trusted_authority)
+        primary = resolve_backend(backends, self.memory_config.trusted_authority)
         return {
             "backend": self.memory.backend_name,
             "status": (primary or next(iter(backends.values()))).get("status", "unknown"),
@@ -1306,7 +1308,8 @@ class AgentConnectService:
         claim.setdefault("claim_id", candidate_id)
         indexed, failed = [], []
         for name, adapter in self.memory_backends.items():
-            if name == self.memory_config.trusted_authority:
+            if adapter is authority or name in backend_aliases(
+                    self.memory_config.trusted_authority):
                 continue
             if not isinstance(adapter, IndexingMemoryAdapter):
                 continue

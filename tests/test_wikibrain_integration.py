@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-# --- locate the sibling WikiBrain checkout ----------------------------------
+# --- locate the sibling WikiBrain / BrainConnect checkout --------------------
 WIKIBRAIN_REPO = Path(
     os.environ.get("WIKIBRAIN_REPO", Path(__file__).resolve().parents[2] / "WikiBrain")
 )
@@ -35,12 +35,29 @@ _CLI = WIKIBRAIN_REPO / "cli"
 if _CLI.is_dir() and str(_CLI) not in sys.path:
     sys.path.insert(0, str(_CLI))
 
-wiki_api = pytest.importorskip(
-    "wiki.api", reason=f"WikiBrain checkout not found at {WIKIBRAIN_REPO}")
+# BrainConnect is WikiBrain mid-rename (module `wiki` → `brainconnect`). Prefer
+# the new module name, fall back to the old; the semantics under test are the same.
+import importlib  # noqa: E402
 
-from wiki import candidates as wiki_candidates  # noqa: E402
-from wiki import scopes as wiki_scopes  # noqa: E402
-from wiki.db import Repo as WikiRepo, init_db as wiki_init_db  # noqa: E402
+_BRAIN_MODULE = None
+for _candidate in ("brainconnect", "wiki"):
+    try:
+        wiki_api = importlib.import_module(f"{_candidate}.api")
+        _BRAIN_MODULE = _candidate
+        break
+    except ImportError:
+        continue
+if _BRAIN_MODULE is None:
+    pytest.skip(
+        f"BrainConnect/WikiBrain checkout not found at {WIKIBRAIN_REPO} "
+        "(neither `brainconnect.api` nor `wiki.api` imports)",
+        allow_module_level=True,
+    )
+
+wiki_candidates = importlib.import_module(f"{_BRAIN_MODULE}.candidates")
+wiki_scopes = importlib.import_module(f"{_BRAIN_MODULE}.scopes")
+_wiki_db = importlib.import_module(f"{_BRAIN_MODULE}.db")
+WikiRepo, wiki_init_db = _wiki_db.Repo, _wiki_db.init_db
 
 from agentconnect.core.context import ContextBuilder, MemoryRanker  # noqa: E402
 from agentconnect.core.memory import (  # noqa: E402
@@ -429,7 +446,8 @@ def test_feedback_can_address_the_claim_it_was_recalled_from(adapter, ledger):
         task_id="task_auth_001", memory_item_id=item.item_id, source_id=None,
         feedback="stale", actor_id="claude-code", note="moved in v3"))
     with WikiRepo.open(start=ledger["root"]) as repo:
-        from wiki import feedback as wiki_feedback, refs as wiki_refs
+        wiki_feedback = importlib.import_module(f"{_BRAIN_MODULE}.feedback")
+        wiki_refs = importlib.import_module(f"{_BRAIN_MODULE}.refs")
         tally = wiki_feedback.tally(repo, wiki_refs.parse(item.item_id, wiki_refs.CLAIM))
     assert tally == {"stale": 1}
 

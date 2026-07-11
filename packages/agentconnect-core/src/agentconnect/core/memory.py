@@ -107,6 +107,31 @@ TRUSTED_STATUSES: frozenset[str] = frozenset({"promoted"})
 
 DEFAULT_MAX_ITEMS = 8
 
+#: BrainConnect is WikiBrain renamed (module `wiki` → `brainconnect`, service string
+#: "wikibrain" → "brainconnect"). During the transition BOTH names refer to the same
+#: trusted authority, and every place a backend name is matched accepts either.
+#: Aliasing confers nothing: only the role/adapter decides trust, exactly as before.
+TRUSTED_AUTHORITY_NAMES: frozenset[str] = frozenset({"wikibrain", "brainconnect"})
+
+
+def backend_aliases(name: str) -> frozenset[str]:
+    """Every name that refers to the same backend as `name`. Usually just itself."""
+    if name in TRUSTED_AUTHORITY_NAMES:
+        return TRUSTED_AUTHORITY_NAMES
+    return frozenset({name})
+
+
+def resolve_backend(adapters: "dict[str, Any]", name: str) -> Optional[Any]:
+    """Alias-tolerant lookup: `adapters['brainconnect']` answers for "wikibrain"
+    and vice versa, so a renamed BrainConnect keeps resolving as the configured
+    trusted authority. Exact name wins when both are registered."""
+    if name in adapters:
+        return adapters[name]
+    for alias in sorted(backend_aliases(name)):
+        if alias in adapters:
+            return adapters[alias]
+    return None
+
 
 def label(
     item: "MemoryItem", backend: str, role: MemoryRole,
@@ -535,15 +560,19 @@ class WikiBrainMemoryAdapter(TrustedMemoryAdapter):
     def __init__(
         self, base_url: str = "http://localhost:8787", api_key: Optional[str] = None,
         transport: Optional[Any] = None, timeout: float = 10.0,
+        backend_name: str = "wikibrain",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._transport = transport
         self._timeout = timeout
+        # "wikibrain" or "brainconnect" — the same service, mid-rename. The name is
+        # provenance labelling only; trust comes from the role, never the string.
+        self._backend_name = backend_name
 
     @property
     def backend_name(self) -> str:
-        return "wikibrain"
+        return self._backend_name
 
     def _call(self, method: str, path: str, payload: Optional[dict] = None) -> dict[str, Any]:
         return _http_call(

@@ -41,12 +41,15 @@ from .memory import (
     MemoryScope,
     RecallPack,
     RecallRequest,
+    backend_aliases,
     label,
 )
 
 _log = logging.getLogger(__name__)
 
 WIKIBRAIN = "wikibrain"
+#: WikiBrain renamed. Same service, same trust semantics; matching accepts both.
+BRAINCONNECT = "brainconnect"
 COGNEE = "cognee"
 GRAPHITI = "graphiti"
 
@@ -326,7 +329,15 @@ class MemoryRouter:
         if not self.config.enabled:
             return []
         wanted = self.config.profile(profile).backends
-        selected = [name for name in wanted if name in self.adapters]
+        # Alias-tolerant: a profile written as `[wikibrain, …]` still selects an
+        # adapter registered as "brainconnect" (the same authority, mid-rename),
+        # and vice versa. Exact name wins; each adapter is selected at most once.
+        selected: list[str] = []
+        for name in wanted:
+            resolved = name if name in self.adapters else next(
+                (a for a in sorted(backend_aliases(name)) if a in self.adapters), None)
+            if resolved is not None and resolved not in selected:
+                selected.append(resolved)
         if selected:
             return selected
         # A deployment with a backend the profiles do not name (a StaticMemoryAdapter
