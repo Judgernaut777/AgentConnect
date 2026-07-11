@@ -297,3 +297,30 @@ def test_cli_artifact_read_all_pages_to_eof(svc, task, capsys):
              service=svc)
     body = capsys.readouterr().out
     assert "x" * 300 in body
+
+
+def test_cli_defaults_attribution_to_the_session_actor(monkeypatch, tmp_path):
+    """Found by the 0.1.0 real dogfood run: `agentconnect artifacts add` inside a
+    managed claude session recorded `created_by: "human"`. Inside a session
+    (AGENTCONNECT_MODE set) the default actor is the session's manager id; outside,
+    the CLI remains a human's tool; an explicit --by always wins."""
+    from agentconnect.cli.main import build_parser
+
+    monkeypatch.setenv("AGENTCONNECT_MODE", "manager")
+    monkeypatch.setenv("AGENTCONNECT_MANAGER_ID", "claude")
+    args = build_parser().parse_args(["artifacts", "add", "task_x", "--content", "c"])
+    assert args.by == "claude"
+    args = build_parser().parse_args(["memory", "capture", "--text", "t"])
+    assert args.by == "claude" and args.actor_type == "manager"
+    args = build_parser().parse_args(
+        ["artifacts", "add", "task_x", "--content", "c", "--by", "matthew"])
+    assert args.by == "matthew"  # explicit wins
+
+    monkeypatch.setenv("AGENTCONNECT_MODE", "worker")
+    args = build_parser().parse_args(["memory", "capture", "--text", "t"])
+    assert args.actor_type == "worker"
+
+    monkeypatch.delenv("AGENTCONNECT_MODE", raising=False)
+    monkeypatch.delenv("AGENTCONNECT_MANAGER_ID", raising=False)
+    args = build_parser().parse_args(["artifacts", "add", "task_x", "--content", "c"])
+    assert args.by == "human"

@@ -66,6 +66,28 @@ def _read_body(file: Optional[str], content: Optional[str]) -> str:
     return content or ""
 
 
+def _session_default_actor() -> str:
+    """Attribution default for durable records: inside a managed agent session
+    (`AGENTCONNECT_MODE` is set — `launch`/`shell` control it, and it is what makes
+    the CLI refuse `complete`), default to the session's actor id, never "human".
+    The 0.1.0 dogfood run recorded an agent-written artifact as `created_by:
+    "human"` because this defaulted unconditionally — a forged provenance the audit
+    then trusts. Outside a session the CLI remains a human's tool. An explicit
+    ``--by`` always wins; this is only the default.
+    """
+    if os.environ.get("AGENTCONNECT_MODE"):
+        return os.environ.get("AGENTCONNECT_MANAGER_ID") or "agent"
+    return "human"
+
+
+def _session_default_actor_type() -> str:
+    """`manager` for manager/reviewer sessions, `worker` for worker sessions."""
+    mode = os.environ.get("AGENTCONNECT_MODE", "")
+    if not mode:
+        return "human"
+    return "worker" if mode == "worker" else "manager"
+
+
 # --------------------------------------------------------------------- tasks
 def _cmd_tasks_create(svc: AgentConnectService, a: argparse.Namespace) -> None:
     _emit(svc.create_task(CreateTaskRequest(
@@ -660,7 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file")
     p.add_argument("--content")
     p.add_argument("--summary", default="")
-    p.add_argument("--by", default="human")
+    p.add_argument("--by", default=_session_default_actor())
     p.set_defaults(func=_cmd_artifacts_add)
 
     p = artifacts.add_parser("list")
@@ -762,8 +784,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task")
     p.add_argument("--text")
     p.add_argument("--file")
-    p.add_argument("--by", default="human")
-    p.add_argument("--actor-type", dest="actor_type", default="human",
+    p.add_argument("--by", default=_session_default_actor())
+    p.add_argument("--actor-type", dest="actor_type", default=_session_default_actor_type(),
                    choices=["manager", "worker", "human", "system"])
     p.add_argument("--tag", action="append")
     p.set_defaults(func=_cmd_memory_capture)
@@ -775,7 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--item", dest="item")
     p.add_argument("--source", dest="source")
     p.add_argument("--task")
-    p.add_argument("--by", default="human")
+    p.add_argument("--by", default=_session_default_actor())
     p.add_argument("--note")
     p.set_defaults(func=_cmd_memory_feedback)
 
