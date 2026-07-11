@@ -1,8 +1,11 @@
 # ComputeConnect — integration contract
 
-**Status: design note. ComputeConnect does not exist.** Nothing in this repository
-imports it, depends on it, or degrades without it. AgentConnect ships every seam below
-itself, today, and runs standalone.
+**Status: contract under implementation.** A ComputeConnect implementation is being
+built concurrently (2026-07); its `docs/CONTRACT.md` is the naming authority for the
+shared surface, and two amendments are ratified and implemented on this side (see
+§2). Still true and load-bearing: nothing in this repository imports ComputeConnect,
+depends on it, or degrades without it. AgentConnect ships every seam below itself,
+today, and runs standalone.
 
 This document states what AgentConnect would expect a compute provider to satisfy, so
 that the split — if it happens — is a matter of moving implementations behind interfaces
@@ -106,6 +109,27 @@ pins the HTTP surface a ComputeConnect service would serve:
 GET  /health          GET  /models        GET  /models/loaded
 POST /route/estimate  POST /generate      POST /runs/{id}/cancel
 ```
+
+### Ratified amendments (2026-07-12; ComputeConnect `docs/CONTRACT.md` is the naming authority)
+
+Both are additive; both are implemented in this repo and pinned by
+`tests/test_local_compute_conformance.py` (the six routes against a stub engine —
+a real ComputeConnect is integration-tested against the same shapes separately).
+
+* **CA-1 — `privacy_tier` on `LocalRunRequest`.** AgentConnect owns the change (it
+  defines `LocalRunRequest`). The field is optional and rides in the `POST /generate`
+  body, so the engine can **positively re-verify** the privacy decision made at
+  estimate time instead of trusting the candidate filter alone.
+  `LocalModelManagerWorkerAdapter.run` populates it from `subtask.privacy_tier`.
+  A `None`/absent tier means the engine must assume the **most restrictive** tier —
+  an old caller is never less safe, and this client never invents a looser tier.
+
+* **Minimal CA-2 — `run_id` on `/generate` responses.** Responses now carry the
+  engine's run identifier, surfaced as `LocalRunResult.run_id`, which makes
+  `POST /runs/{run_id}/cancel` actually usable. Engines that omit it are tolerated
+  (`run_id = None`). Dispatch-by-reference — the rest of the original CA-2 —
+  is **not** implemented; `/generate` remains a thin streaming proxy per
+  ComputeConnect invariant 3.
 
 The provider does not participate in routing directly. It is wrapped by
 `LocalModelManagerWorkerAdapter` (`local_compute.py:200`) and registered as one worker in
