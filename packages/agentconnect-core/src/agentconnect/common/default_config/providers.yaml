@@ -1,0 +1,11 @@
+# Packaged default: NO providers.
+#
+# This file ships inside the agentconnect-core wheel so that a clean
+# `pip install agentconnect-router && agentconnect-router` starts instead of
+# dying with `FileNotFoundError: config/providers.yaml`. It deliberately
+# registers nothing: a fresh install must not believe it has inference
+# providers it was never given. Point AGENTCONNECT_CONFIG_DIR at a real
+# config directory (see the repo's config/ for a documented example) to
+# register providers.
+policy_version: "packaged-default"
+providers: {}

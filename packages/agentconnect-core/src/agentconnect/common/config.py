@@ -14,6 +14,12 @@ from typing import Any
 
 import yaml
 
+#: Config files shipped inside the wheel: empty provider/profile registries plus the
+#: fail-closed routing policy. They exist so an installed `agentconnect-router` can
+#: START without a source checkout; they register no providers, so they grant nothing.
+PACKAGED_CONFIG_DIR = Path(__file__).resolve().parent / "default_config"
+
+
 def _discover_config_dir() -> Path:
     """Locate the repo's ``config/`` directory.
 
@@ -24,7 +30,10 @@ def _discover_config_dir() -> Path:
          of where the packages live).
       3. An upward search from this file's location (works when installed alongside
          the repo layout).
-      4. ``./config`` as a last resort.
+      4. The packaged defaults inside the wheel (empty registries, fail-closed
+         routing policy) — so a clean ``pip install`` starts instead of raising
+         ``FileNotFoundError`` (found during the 0.1.0 clean-install verification).
+      5. ``./config`` as a last resort.
 
     The old ``parents[3]`` repo-root assumption no longer holds now that ``common``
     lives under ``packages/agentconnect-core/src/agentconnect/common``.
@@ -36,6 +45,8 @@ def _discover_config_dir() -> Path:
         for base in (start, *start.parents):
             if (base / "config" / "providers.yaml").exists():
                 return base / "config"
+    if (PACKAGED_CONFIG_DIR / "providers.yaml").exists():
+        return PACKAGED_CONFIG_DIR
     return Path.cwd() / "config"
 
 
