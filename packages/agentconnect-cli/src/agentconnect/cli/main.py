@@ -474,6 +474,29 @@ def _cmd_sessions_show(svc: AgentConnectService, a: argparse.Namespace) -> None:
     _emit(svc.get_session(a.session_id))
 
 
+def _cmd_sessions_reconcile(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.reconcile_orphans(older_than_seconds=a.older_than, dry_run=a.dry_run))
+
+
+def _cmd_backup(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.backup_ledger(a.dest))
+
+
+def _cmd_restore(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    if not a.yes:
+        raise AgentConnectError(
+            "restore overwrites the live ledger; pass --yes to confirm")
+    _emit(svc.restore_ledger(a.src))
+
+
+def _cmd_metrics(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.metrics())
+
+
+def _cmd_ready(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.readiness())
+
+
 def _cmd_workspaces_list(svc: AgentConnectService, a: argparse.Namespace) -> None:
     _emit(svc.list_workspaces(include_destroyed=a.all))
 
@@ -687,6 +710,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session_id")
     p.set_defaults(func=_cmd_sessions_show)
 
+    p = sessions.add_parser(
+        "reconcile",
+        help="sweep sessions/runs whose process died without a terminal event")
+    p.add_argument("--older-than", type=float, default=None,
+                   help="also reconcile records older than N seconds with no liveness "
+                        "evidence (heartbeat timeout); omit to reconcile only "
+                        "provider-confirmed-dead processes")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would be reconciled without mutating the ledger")
+    p.set_defaults(func=_cmd_sessions_reconcile)
+
     workspaces = top.add_parser("workspaces", help="task workspaces").add_subparsers(
         dest="cmd", required=True)
     p = workspaces.add_parser("list")
@@ -705,6 +739,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also delete the directory and unregister the git worktree")
     p.add_argument("--by", default="human")
     p.set_defaults(func=_cmd_cleanup)
+
+    # ------------------------------------------------- operations (Part: Operations)
+    p = top.add_parser("backup", help="consistent online snapshot of the ledger DB")
+    p.add_argument("dest", help="destination path for the backup .db")
+    p.set_defaults(func=_cmd_backup)
+
+    p = top.add_parser("restore", help="restore the ledger DB from a backup (overwrites)")
+    p.add_argument("src", help="path to a backup produced by `agentconnect backup`")
+    p.add_argument("--yes", action="store_true",
+                   help="required: confirm overwriting the current ledger")
+    p.set_defaults(func=_cmd_restore)
+
+    p = top.add_parser("metrics", help="operational metrics (sessions/runs/errors/queues)")
+    p.set_defaults(func=_cmd_metrics)
+
+    p = top.add_parser("ready", help="readiness check (ledger reachable?)")
+    p.set_defaults(func=_cmd_ready)
 
     # tasks
     tasks = top.add_parser("tasks", help="task ledger").add_subparsers(dest="cmd", required=True)
@@ -1044,6 +1095,14 @@ def _refuse_operator_command(args: argparse.Namespace) -> Optional[str]:
             f"minting an operator token is an operator action; this is a managed "
             f"agent session (AGENTCONNECT_MODE={mode}). An operator token would "
             f"grant exactly the authority this session is denied."
+        )
+    if group in ("backup", "restore") or (
+        group == "sessions" and getattr(args, "cmd", None) == "reconcile"
+    ):
+        return (
+            f"ledger {group} is an operator action; this is a managed agent session "
+            f"(AGENTCONNECT_MODE={mode}). Ask the operator to run `agentconnect "
+            f"{group}`."
         )
     return None
 
