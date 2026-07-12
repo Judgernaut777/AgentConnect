@@ -41,6 +41,11 @@ MCP_TOOLS: tuple[McpTool, ...] = (
     McpTool("record_attempt", "record_attempt", mutates=True),
     McpTool("request_review", "request_review", mutates=True),
     McpTool("submit_subtask", "submit_subtask", mutates=True),
+    # Explicit tool-use authorization surface. Token-gated on `authorize_tool`, then
+    # routed to the ToolConnect governor (a permissive no-op when none is bound). It
+    # authorizes a declared tool set; it never invokes a tool (AgentConnect is not on
+    # the invocation data path), so it is not a mutation of the ledger.
+    McpTool("authorize_tool", "authorize_tool"),
     McpTool("get_status", "get_status"),
     McpTool("list_artifacts", "list_artifacts"),
     McpTool("read_artifact_chunk", "read_artifact_chunk"),

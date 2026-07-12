@@ -41,6 +41,7 @@ from agentconnect.core.models import (
 )
 from agentconnect.core.service import DEFAULT_CLAIM_TTL_SECONDS, AgentConnectService
 from agentconnect.core.tools import ACTION_FOR_TOOL
+from agentconnect.core.toolconnect_client import DEFAULT_TOOL_SOURCE_ID
 
 from . import tools
 
@@ -301,6 +302,41 @@ def build_mcp_server(
         # the manager poll. Never block an MCP request on a worker.
         handles = svc.executions_for("subtask", subtask.id)
         return tools.dumps(tools.compact_subtask(subtask, handles[-1] if handles else None))
+
+    @tool()
+    def authorize_tool(
+        tool_refs: list[str],
+        source_id: str = DEFAULT_TOOL_SOURCE_ID,
+        task_id: Optional[str] = None,
+    ) -> str:
+        """Ask whether a declared tool set may be used, before delegating work that
+        needs it. `tool_refs` are bare names or `source_id:name` qualifiers.
+
+        The token/scope check has already run (this call is gated on the
+        `authorize_tool` action); the decision itself is the bound ToolConnect
+        governor's and is fail-closed — a policy deny OR an unreachable engine denies.
+        With no governor configured it is a permissive allow. AgentConnect authorizes
+        here; it never invokes a tool, so a governor is not a runtime proxy."""
+        principal = {"id": _actor(None), "kind": "agent", "privacy_tier": "local"}
+        try:
+            authz = svc._consult_tool_governor(
+                list(tool_refs), source_id=source_id, principal=principal,
+                task_id=task_id or _env("AGENTCONNECT_TASK_ID"),
+            )
+        except AgentConnectError as exc:
+            return _err(exc)
+        return tools.dumps({
+            "allowed": authz.allowed,
+            "governed": authz.governed,
+            "denied_tool": authz.denied_tool or None,
+            "unavailable": authz.unavailable,
+            "decisions": [
+                {"source_id": sid, "name": name, "allowed": d.allowed,
+                 "decision_id": d.decision_id, "unavailable": d.unavailable,
+                 "reason": d.reason[:200]}
+                for sid, name, d in authz.decisions
+            ],
+        })
 
     @tool()
     def get_status(task_id: Optional[str] = None) -> str:

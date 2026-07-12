@@ -82,6 +82,64 @@ class ToolDecision:
         )
 
 
+#: The source_id AgentConnect uses when a declared tool is a bare name with no
+#: source qualifier. A worker's declared ``tools`` list is names, not namespaced
+#: ``(source_id, name)`` identities; the honest default is to attribute them to the
+#: worker's harness (passed explicitly by the caller), and this constant is only the
+#: fallback for a caller that supplies neither a qualifier nor a source.
+DEFAULT_TOOL_SOURCE_ID = "agentconnect"
+
+
+def split_tool_ref(entry: str, default_source_id: str) -> tuple[str, str]:
+    """Parse a declared tool entry into ``(source_id, name)``.
+
+    A worker declares tools as bare names; a caller may also pass a
+    ``"source_id:name"`` qualifier to authorize a specific namespaced tool. A bare
+    name resolves against ``default_source_id`` (the worker's harness). The name half
+    keeps any additional colons, so ``"s:a:b"`` is source ``s`` / name ``a:b``.
+    """
+    if ":" in entry:
+        source_id, name = entry.split(":", 1)
+        if source_id and name:
+            return source_id, name
+    return default_source_id, entry
+
+
+@dataclass(frozen=True)
+class ToolUseAuthorization:
+    """The aggregate outcome of authorizing a *set* of declared tools.
+
+    ``allowed`` is ``True`` only when every consulted tool was allowed. The first
+    tool that is denied (a policy deny OR an ``unavailable`` outage deny) sets
+    ``allowed=False`` and names itself in ``denied_tool`` with its ``decision``, so a
+    caller can block and report *which* tool failed and *why*. ``governed`` records
+    whether a governor was actually consulted: when no governor is bound the result is
+    a permissive ``allowed=True, governed=False`` no-op that preserves standalone
+    behavior, and callers must not mistake it for a real allow decision.
+    """
+
+    allowed: bool
+    governed: bool
+    decisions: tuple[tuple[str, str, ToolDecision], ...] = ()
+    denied_tool: str = ""
+    decision: Optional[ToolDecision] = None
+
+    @property
+    def unavailable(self) -> bool:
+        """True when the blocking deny was an outage (fail-closed), not a policy rule."""
+        return bool(self.decision and self.decision.unavailable)
+
+    def as_metadata(self) -> dict[str, Any]:
+        return {
+            "governed": self.governed,
+            "allowed": self.allowed,
+            "denied_tool": self.denied_tool or None,
+            "unavailable": self.unavailable,
+            "reason": (self.decision.reason[:200] if self.decision else ""),
+            "decision_id": (self.decision.decision_id if self.decision else ""),
+        }
+
+
 @runtime_checkable
 class ToolGovernor(Protocol):
     """The seam the ToolConnect contract (§3) proposes AgentConnect own.

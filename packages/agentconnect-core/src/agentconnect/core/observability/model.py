@@ -75,6 +75,17 @@ class EventType(str, Enum):
     decision_recorded = "decision.recorded"
 
     # Governance / cross-plane
+    #: A generic ledger-action authorization succeeded (`authorize()` passed for a
+    #: task-scoped action). This is NOT a tool-use decision — it is the token/scope
+    #: gate firing. It was historically (mis)emitted as `tool.authorized`, which
+    #: conflated every authorized action with a tool authorization; the two are now
+    #: distinct so an operator can filter real tool authorizations.
+    action_authorized = "action.authorized"
+    #: A *tool-use* authorization was decided by the bound ToolConnect governor.
+    #: It fires only when a governor is consulted, carries the ToolConnect
+    #: `decision_id`, and its `outcome` distinguishes an allow from a deny (policy
+    #: deny or an `unavailable` fail-closed outage deny). Absent a governor, no tool
+    #: authorization is claimed and this event never fires.
     tool_authorized = "tool.authorized"
     compute_placed = "compute.placed"
     memory_recalled = "memory.recalled"
@@ -153,6 +164,7 @@ DEFAULT_STATE_FOR_EVENT: dict[EventType, ObservationState] = {
     EventType.artifact_created: ObservationState.working,
     EventType.attempt_recorded: ObservationState.working,
     EventType.decision_recorded: ObservationState.working,
+    EventType.action_authorized: ObservationState.working,
     EventType.tool_authorized: ObservationState.working,
     EventType.compute_placed: ObservationState.starting,
     EventType.memory_recalled: ObservationState.working,

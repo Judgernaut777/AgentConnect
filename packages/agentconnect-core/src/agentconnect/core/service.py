@@ -105,6 +105,12 @@ from .models import (
 )
 from .routing import RouteExplanation, RoutePolicy, WorkerRegistry, route
 from .storage import SqliteStorage, default_db_path
+from .toolconnect_client import (
+    DEFAULT_TOOL_SOURCE_ID,
+    ToolDecision,
+    ToolUseAuthorization,
+    split_tool_ref,
+)
 from .workers import WorkerContext, WorkerResult
 
 _log = logging.getLogger(__name__)
@@ -1079,6 +1085,25 @@ class AgentConnectService:
         worker = self.registry.get(explanation.selected_worker or "")
         caps = worker.capabilities()
         now = self._now()
+
+        # Tool-use authorization chokepoint (ToolConnect governor). This is the real
+        # path on which the governor is consulted: before a worker is ever spawned,
+        # its *declared* tool set is authorized. Fail-closed — a policy deny or an
+        # engine outage refuses the subtask rather than running it unconstrained. A
+        # standalone deployment with no governor bound takes the permissive no-op and
+        # is unchanged. The harness's internal per-call tool loop is out of scope by
+        # design (ADR 0008); the declared set is what AgentConnect can honestly gate.
+        authz = self._consult_tool_governor(
+            list(caps.tools), source_id=caps.harness,
+            principal={"id": caps.worker_id, "kind": "agent",
+                       "privacy_tier": caps.location.value},
+            task_id=subtask.parent_task_id, subtask_id=subtask.id,
+            context={"subtask_privacy_tier": subtask.privacy_tier.value,
+                     "worker_harness": caps.harness},
+        )
+        if not authz.allowed:
+            return self._block_subtask_on_governor(subtask, caps.worker_id, authz, now)
+
         run = WorkerRun(
             id=ids.new_id(ids.RUN), subtask_id=subtask.id, worker_id=caps.worker_id,
             harness=caps.harness, model=caps.model, status=RunStatus.running,
@@ -1200,6 +1225,45 @@ class AgentConnectService:
                 agent_id=worker_id, agent_role="worker", outcome=outcome,
                 metadata={"summary": summary[:120]},
             )
+        self._settle_parent_after_subtask(subtask.parent_task_id)
+        return self._require_subtask(subtask.id)
+
+    def _block_subtask_on_governor(
+        self, subtask: Subtask, worker_id: str, authz: ToolUseAuthorization, now: int,
+    ) -> Subtask:
+        """Refuse a subtask whose declared tool set the governor denied.
+
+        The subtask never runs: no worker is spawned, no run row is created, no
+        artifact is written. It moves ``queued -> failed`` (a valid transition) with
+        an attempt recorded so the refusal is durable in the ledger, and a
+        ``subtask.denied`` observation carrying the blocking tool and whether the deny
+        was a policy rule or a fail-closed outage.
+        """
+        reason = (
+            f"tool-use denied by governor: {authz.denied_tool} "
+            f"({'unavailable/fail-closed' if authz.unavailable else 'policy deny'})"
+        )
+        if authz.decision and authz.decision.reason:
+            reason = f"{reason}: {authz.decision.reason[:160]}"
+        subtasks_policy.check_transition(subtask, SubtaskStatus.failed)
+        self.storage.update_subtask(
+            subtask.id, status=SubtaskStatus.failed.value, updated_at=now,
+        )
+        self.record_attempt(
+            subtask.parent_task_id,
+            RecordAttemptRequest(
+                actor_id=worker_id, actor_type=ActorType.worker,
+                summary=reason, outcome="failed",
+            ),
+        )
+        self._observe(
+            EventType.subtask_denied, task_id=subtask.parent_task_id,
+            subtask_id=subtask.id, delegation_id=subtask.delegation_id,
+            parent_delegation_id=subtask.parent_delegation_id,
+            agent_id=worker_id, agent_role="worker",
+            outcome=ObservationOutcome.denied,
+            metadata={"reason": reason, **authz.as_metadata()},
+        )
         self._settle_parent_after_subtask(subtask.parent_task_id)
         return self._require_subtask(subtask.id)
 
@@ -2091,11 +2155,138 @@ class AgentConnectService:
                 )
         scoped_task = task_id or scope.get("task_id")
         if scoped_task:
-            self._observe(EventType.tool_authorized, task_id=scoped_task,
+            # This is the token/scope gate passing for ONE ledger action — not a
+            # tool-use authorization. It was historically emitted as
+            # `tool.authorized`, which made every authorized action look like a tool
+            # authorization and left an operator no way to see real tool decisions.
+            # Tool-use authorization is a distinct event (`tool.authorized`) fired
+            # only by a ToolConnect governor consultation in `_consult_tool_governor`.
+            self._observe(EventType.action_authorized, task_id=scoped_task,
                           agent_id=scope.get("manager_id", "unknown"), agent_role=mode,
                           session_id=scope.get("session_id"),
                           metadata={"action": action})
         return scope
+
+    # ------------------------------------------------------- tool-use governance
+    def _consult_tool_governor(
+        self, tools: list[str], *, source_id: str,
+        principal: dict[str, Any], task_id: Optional[str] = None,
+        subtask_id: Optional[str] = None, run_id: Optional[str] = None,
+        context: Optional[dict[str, Any]] = None,
+    ) -> ToolUseAuthorization:
+        """Authorize a declared tool set through the bound ToolConnect governor.
+
+        This is the one place a tool-use authorization is genuinely decided. Its
+        posture is the ToolConnect contract's, and the opposite of memory's:
+
+        * **No governor bound => permissive no-op.** Returns ``allowed=True,
+          governed=False`` and emits nothing. Standalone AgentConnect is unchanged;
+          absence of a policy engine is not a denial of every tool.
+        * **A governor bound => fail-closed, per tool.** Every declared tool is
+          consulted. The first deny — a policy deny *or* an ``unavailable`` deny from
+          an unreachable/garbled/incompatible engine, *or* a governor that raises —
+          refuses the whole set. There is no path that turns an outage into an allow.
+
+        Each consultation emits a ``tool.authorized`` observation carrying the
+        ToolConnect ``decision_id`` and whether the deny was a policy deny or an
+        outage, so an operator sees tool authorizations distinctly from the generic
+        ``action.authorized`` signal. Outcomes are recorded best-effort via
+        ``governor.record()``; recording never gates a decision.
+
+        Boundary (see ADR 0008): this authorizes the *declared* tool set at prepare
+        time. It is deliberately NOT per-tool-call interception — the worker harness
+        runs its own internal tool loop and AgentConnect is never on that data path
+        (``workers.py``). Declared-set authorization + the explicit ``authorize_tool``
+        surface is the honest scope of enforcement this architecture supports.
+        """
+        governor = self.tool_governor
+        if governor is None:
+            return ToolUseAuthorization(allowed=True, governed=False)
+
+        decisions: list[tuple[str, str, ToolDecision]] = []
+        for entry in tools:
+            sid, name = split_tool_ref(entry, source_id)
+            try:
+                decision = governor.authorize(principal, sid, name, context)
+            except Exception as exc:  # noqa: BLE001 — a governor that raises is an outage
+                _log.warning("tool governor raised authorizing %s:%s; denying "
+                             "fail-closed: %s", sid, name, exc)
+                decision = ToolDecision.deny(f"governor raised: {exc}", unavailable=True)
+            decisions.append((sid, name, decision))
+            self._observe(
+                EventType.tool_authorized, task_id=task_id, subtask_id=subtask_id,
+                run_id=run_id, agent_id=str(principal.get("id", "unknown")),
+                agent_role="worker",
+                outcome=(None if decision.allowed else ObservationOutcome.denied),
+                metadata={
+                    "tool": name, "source_id": sid,
+                    "decision_id": decision.decision_id,
+                    "allowed": decision.allowed,
+                    "unavailable": decision.unavailable,
+                    "default_deny": decision.default_deny,
+                    "reason": decision.reason[:200],
+                    "determining_policies": list(decision.determining_policies),
+                    "governor_mode": getattr(governor, "mode", "required"),
+                },
+            )
+            # Close the loop best-effort. We authorize the declared set, we do not
+            # observe the harness's per-call invocation, so the honest recorded
+            # outcome is the grant ("authorized") or the block ("blocked"), never a
+            # fabricated invocation result. An outage on the audit path never gates.
+            if decision.decision_id:
+                try:
+                    governor.record(
+                        decision.decision_id,
+                        "authorized" if decision.allowed else "blocked",
+                        {"subtask_id": subtask_id, "tool": f"{sid}:{name}",
+                         "by": "agentconnect"},
+                    )
+                except Exception as exc:  # noqa: BLE001 — audit is never a gate
+                    _log.warning("governor.record(%s) failed: %s",
+                                 decision.decision_id, exc)
+            if not decision.allowed:
+                return ToolUseAuthorization(
+                    allowed=False, governed=True, decisions=tuple(decisions),
+                    denied_tool=f"{sid}:{name}", decision=decision,
+                )
+        return ToolUseAuthorization(
+            allowed=True, governed=True, decisions=tuple(decisions),
+        )
+
+    def authorize_tool_use(
+        self, token: str, tools: list[str], *,
+        source_id: str = DEFAULT_TOOL_SOURCE_ID,
+        task_id: Optional[str] = None, subtask_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        principal: Optional[dict[str, Any]] = None,
+        context: Optional[dict[str, Any]] = None,
+    ) -> ToolUseAuthorization:
+        """Explicit tool-use authorization surface (ToolConnect contract §3).
+
+        Two gates, in order:
+
+        1. The normal token/scope check via :meth:`authorize` for the
+           ``authorize_tool`` action — an unknown/expired/unscoped-wrong token raises
+           exactly as it would for any other action, before any governor is touched.
+        2. The bound governor, fail-closed, via :meth:`_consult_tool_governor`.
+
+        With no governor bound this is a permissive no-op after the token check, so a
+        standalone deployment behaves exactly as before. Callers that hold no session
+        token (internal worker preparation) use :meth:`_consult_tool_governor`
+        directly; that path is already inside an authorized subtask.
+        """
+        scope = self.authorize(token, "authorize_tool", task_id=task_id)
+        if principal is None:
+            principal = {
+                "id": scope.get("manager_id") or scope.get("session_id") or "agent",
+                "kind": "agent",
+                "privacy_tier": "local",
+            }
+        return self._consult_tool_governor(
+            tools, source_id=source_id, principal=principal,
+            task_id=task_id or scope.get("task_id"), subtask_id=subtask_id,
+            run_id=run_id, context=context,
+        )
 
     def mint_operator_token(
         self, actor: str, ttl_seconds: int = sessions_mod.DEFAULT_TOKEN_TTL_SECONDS,

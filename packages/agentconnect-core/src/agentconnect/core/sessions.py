@@ -46,6 +46,10 @@ MANAGER_ACTIONS: frozenset[str] = _ORIENTATION_ACTIONS | frozenset({
     "submit_subtask", "get_subtask_status", "explain_route", "get_handoff_summary",
     "request_review", "release_task", "register_artifact", "add_constraint",
     "recall_memory", "capture_memory_candidate", "record_memory_feedback",
+    # Explicit tool-use authorization surface (ToolConnect governor). A manager may
+    # ask whether a declared tool set is permitted before delegating work that uses
+    # it; the request itself is token-gated on this action, then the governor decides.
+    "authorize_tool",
 })
 
 #: A reviewer reads and judges. It cannot decide, delegate, or complete the task.
