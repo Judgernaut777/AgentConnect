@@ -71,6 +71,43 @@ def test_probable_secrets_are_detected(text, rule_id):
     assert result.risk_level is RiskLevel.high
 
 
+@pytest.mark.parametrize("header", [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    "-----END RSA PRIVATE KEY-----",
+])
+def test_a_lone_pem_private_key_delimiter_is_flagged_and_redacted(header):
+    """A bounded terminal capture can show the `-----BEGIN … PRIVATE KEY-----`
+    header while the body/footer have scrolled off. The block rule needs both
+    delimiters; the marker rule catches the lone header so it is not surfaced as
+    an unredacted signal that a private key was present."""
+    text = f"scrollback...\n{header}\nMIIEvDEF+base64lookingbody...\n"
+    result = scan_text(text, surface=ARTIFACT_INGEST, policy=ARTIFACT_INGEST)
+    assert "secret.private_key_marker" in rule_ids(result)
+    assert result.risk_level is RiskLevel.high
+    assert header not in result.redacted_content
+
+
+@pytest.mark.parametrize("delimiter", [
+    "-----BEGIN CERTIFICATE-----",
+    "-----END CERTIFICATE-----",
+    "-----BEGIN PUBLIC KEY-----",
+    "-----BEGIN RSA PUBLIC KEY-----",
+    "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+])
+def test_a_certificate_or_public_key_delimiter_is_not_a_secret(delimiter):
+    """The marker rule is scoped to PRIVATE KEY blocks. A certificate or public
+    key is not sensitive and must not be redacted — false positives teach an
+    operator to switch the scanner off."""
+    result = scan_text(delimiter, surface=ARTIFACT_INGEST, policy=ARTIFACT_INGEST)
+    assert Category.secret not in categories(result)
+    assert result.redacted_content == delimiter
+
+
 @pytest.mark.parametrize("text", [
     "OPENAI_API_KEY=${OPENAI_API_KEY}",
     "OPENAI_API_KEY=<your-key-here>",
