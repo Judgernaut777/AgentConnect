@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, requested_by TEXT NOT NULL,
     assigned_to TEXT NOT NULL, status TEXT NOT NULL,
     criteria_json TEXT NOT NULL DEFAULT '[]', artifact_refs_json TEXT NOT NULL DEFAULT '[]',
-    result_artifact_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+    result_artifact_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    delegation_id TEXT, parent_delegation_id TEXT
 );
 CREATE TABLE IF NOT EXISTS subtasks (
     id TEXT PRIMARY KEY, parent_task_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -96,7 +97,8 @@ CREATE TABLE IF NOT EXISTS subtasks (
     sandbox_json TEXT NOT NULL DEFAULT '{}',
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
     approved_by TEXT, approved_max_cost_usd REAL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    delegation_id TEXT, parent_delegation_id TEXT
 );
 CREATE TABLE IF NOT EXISTS worker_runs (
     id TEXT PRIMARY KEY, subtask_id TEXT NOT NULL, worker_id TEXT NOT NULL,
@@ -147,7 +149,15 @@ CREATE TABLE IF NOT EXISTS manager_sessions (
     workspace_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL, claim_id TEXT,
     started_at REAL NOT NULL, ended_at REAL,
     launch_command TEXT NOT NULL DEFAULT '', shell_command TEXT NOT NULL DEFAULT '',
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    delegation_id TEXT, parent_delegation_id TEXT
+);
+CREATE TABLE IF NOT EXISTS observation_handles (
+    id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+    task_id TEXT, provider TEXT NOT NULL, handle_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'unknown', outcome TEXT,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    UNIQUE (entity_type, entity_id, provider)
 );
 CREATE TABLE IF NOT EXISTS session_tokens (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
@@ -173,7 +183,20 @@ CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_subtask ON worker_runs(subtask_id);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_extrefs_lookup ON external_refs(provider, external_id);
+CREATE INDEX IF NOT EXISTS idx_obs_entity ON observation_handles(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_obs_task ON observation_handles(task_id);
 """
+
+#: Columns added after the initial schema shipped. Existing databases created by
+#: an earlier version are brought forward with ``ALTER TABLE ADD COLUMN`` at open
+#: time — additive only, so a downgrade still reads the rows it understands. The
+#: delegation ids make the agent tree and cross-entity correlation reconstructable
+#: from the ledger without guessing from timestamps (observability handoff §Part IV).
+_MIGRATIONS: dict[str, tuple[str, ...]] = {
+    "subtasks": ("delegation_id", "parent_delegation_id"),
+    "reviews": ("delegation_id", "parent_delegation_id"),
+    "manager_sessions": ("delegation_id", "parent_delegation_id"),
+}
 
 
 def default_db_path() -> str:
@@ -221,7 +244,27 @@ class SqliteStorage:
             self._conn.execute("PRAGMA busy_timeout = 5000")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive schema migration for databases predating a column.
+
+        Runs under the init lock. `observation_handles` and the fresh delegation
+        columns are in `_SCHEMA` for new databases; here we bring an *existing*
+        database forward by adding any missing column. Never drops or rewrites.
+        """
+        for table, columns in _MIGRATIONS.items():
+            existing = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column in columns:
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        # `observation_handles` may be absent in a pre-observability database even
+        # though `_SCHEMA` (CREATE IF NOT EXISTS) just ran — it did create it. The
+        # ALTER loop above is the only backfill needed.
 
     def close(self) -> None:
         with self._lock:
@@ -475,11 +518,12 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(
                 "INSERT INTO reviews (id,task_id,requested_by,assigned_to,status,criteria_json,"
-                "artifact_refs_json,result_artifact_id,created_at,updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "artifact_refs_json,result_artifact_id,created_at,updated_at,"
+                "delegation_id,parent_delegation_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rv.id, rv.task_id, rv.requested_by, rv.assigned_to, rv.status.value,
                  _j(rv.criteria), _j(rv.artifact_refs), rv.result_artifact_id,
-                 rv.created_at, rv.updated_at),
+                 rv.created_at, rv.updated_at, rv.delegation_id, rv.parent_delegation_id),
             )
         return rv
 
@@ -528,6 +572,7 @@ class SqliteStorage:
             criteria=_u(r["criteria_json"], []), artifact_refs=_u(r["artifact_refs_json"], []),
             result_artifact_id=r["result_artifact_id"], created_at=r["created_at"],
             updated_at=r["updated_at"],
+            delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
         )
 
     # ------------------------------------------------------------ subtasks
@@ -537,12 +582,14 @@ class SqliteStorage:
                 "INSERT INTO subtasks (id,parent_task_id,title,instructions,status,privacy_tier,"
                 "preferred_worker,assigned_worker,created_at,updated_at,result_artifact_id,"
                 "route_reason_json,sandbox_json,required_capabilities_json,approved_by,"
-                "approved_max_cost_usd,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "approved_max_cost_usd,metadata_json,delegation_id,parent_delegation_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.id, s.parent_task_id, s.title, s.instructions, s.status.value,
                  s.privacy_tier.value, s.preferred_worker, s.assigned_worker, s.created_at,
                  s.updated_at, s.result_artifact_id, _j(s.route_reason),
                  _j(s.sandbox.model_dump(mode="json")), _j(s.required_capabilities),
-                 s.approved_by, s.approved_max_cost_usd, _j(s.metadata)),
+                 s.approved_by, s.approved_max_cost_usd, _j(s.metadata),
+                 s.delegation_id, s.parent_delegation_id),
             )
         return s
 
@@ -584,6 +631,7 @@ class SqliteStorage:
             required_capabilities=_u(r["required_capabilities_json"], []),
             approved_by=r["approved_by"], approved_max_cost_usd=r["approved_max_cost_usd"],
             metadata=_u(r["metadata_json"], {}),
+            delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
         )
 
     # --------------------------------------------------------- worker runs
@@ -875,10 +923,11 @@ class SqliteStorage:
             c.execute(
                 "INSERT INTO manager_sessions (id,task_id,review_id,manager_id,workspace_id,"
                 "mode,status,claim_id,started_at,ended_at,launch_command,shell_command,"
-                "metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "metadata_json,delegation_id,parent_delegation_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.id, s.task_id, s.review_id, s.manager_id, s.workspace_id, s.mode.value,
                  s.status.value, s.claim_id, s.started_at, s.ended_at, s.launch_command,
-                 s.shell_command, _j(s.metadata)),
+                 s.shell_command, _j(s.metadata), s.delegation_id, s.parent_delegation_id),
             )
         return s
 
@@ -953,7 +1002,64 @@ class SqliteStorage:
             status=r["status"], claim_id=r["claim_id"], started_at=r["started_at"],
             ended_at=r["ended_at"], launch_command=r["launch_command"],
             shell_command=r["shell_command"], metadata=_u(r["metadata_json"], {}),
+            delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
         )
+
+    # -------------------------------------------------- observation handles
+    def upsert_observation_handle(
+        self, entity_type: str, entity_id: str, handle: Any, task_id: Optional[str],
+        state: str = "unknown", outcome: Optional[str] = None, at: float = 0.0,
+    ) -> None:
+        """Persist a provider's ObservationHandle so `agents attach|output|cancel`
+        can reach the exact live pane later, keyed by (entity, provider)."""
+        payload = handle.model_dump(mode="json") if hasattr(handle, "model_dump") else handle
+        provider = payload.get("provider", "unknown")
+        with self.transaction() as c:
+            c.execute(
+                "INSERT INTO observation_handles (id,entity_type,entity_id,task_id,provider,"
+                "handle_json,state,outcome,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(entity_type,entity_id,provider) DO UPDATE SET "
+                "handle_json=excluded.handle_json,state=excluded.state,"
+                "outcome=excluded.outcome,updated_at=excluded.updated_at,task_id=excluded.task_id",
+                (f"obs_{entity_type}_{entity_id}_{provider}", entity_type, entity_id, task_id,
+                 provider, _j(payload), state, outcome, at, at),
+            )
+
+    def observation_handles_for(self, entity_type: str, entity_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM observation_handles WHERE entity_type=? AND entity_id=?",
+                (entity_type, entity_id),
+            ).fetchall()
+        return [self._obs_handle(r) for r in rows]
+
+    def observation_handles_for_task(self, task_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM observation_handles WHERE task_id=? ORDER BY created_at",
+                (task_id,),
+            ).fetchall()
+        return [self._obs_handle(r) for r in rows]
+
+    def update_observation_handle_state(
+        self, entity_type: str, entity_id: str, provider: str,
+        state: str, outcome: Optional[str], at: float,
+    ) -> None:
+        with self.transaction() as c:
+            c.execute(
+                "UPDATE observation_handles SET state=?,outcome=?,updated_at=? "
+                "WHERE entity_type=? AND entity_id=? AND provider=?",
+                (state, outcome, at, entity_type, entity_id, provider),
+            )
+
+    @staticmethod
+    def _obs_handle(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"], "entity_type": r["entity_type"], "entity_id": r["entity_id"],
+            "task_id": r["task_id"], "provider": r["provider"],
+            "handle": _u(r["handle_json"], {}), "state": r["state"],
+            "outcome": r["outcome"], "created_at": r["created_at"], "updated_at": r["updated_at"],
+        }
 
     # ------------------------------------------------------- session tokens
     def insert_token(self, t: SessionToken, token_hash: str) -> SessionToken:

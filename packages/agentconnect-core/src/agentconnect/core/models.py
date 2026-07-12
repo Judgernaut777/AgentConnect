@@ -295,6 +295,11 @@ class Review(BaseModel):
     result_artifact_id: Optional[str] = None
     created_at: float = Field(default_factory=now)
     updated_at: float = Field(default_factory=now)
+    #: Observability delegation record (Part IV): this review's own delegation id
+    #: and the delegation that requested it, so the agent tree is reconstructable
+    #: from the ledger without inferring parentage from timestamps.
+    delegation_id: Optional[str] = None
+    parent_delegation_id: Optional[str] = None
 
 
 class Subtask(BaseModel):
@@ -315,6 +320,11 @@ class Subtask(BaseModel):
     approved_by: Optional[str] = None
     approved_max_cost_usd: Optional[float] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    #: Observability delegation record (Part IV): this subtask's own delegation id
+    #: and its delegating parent (the manager session, or a parent subtask under
+    #: hierarchical delegation), so the tree is built from records not tmux layout.
+    delegation_id: Optional[str] = None
+    parent_delegation_id: Optional[str] = None
 
 
 class WorkerRun(BaseModel):
@@ -448,6 +458,10 @@ class ManagerSession(BaseModel):
     launch_command: str = ""
     shell_command: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+    #: Observability delegation record (Part IV): a launched manager/reviewer is a
+    #: top-level delegation root (parent None) unless spawned under another.
+    delegation_id: Optional[str] = None
+    parent_delegation_id: Optional[str] = None
 
 
 class SessionToken(BaseModel):
