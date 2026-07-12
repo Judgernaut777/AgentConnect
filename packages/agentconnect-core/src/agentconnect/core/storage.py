@@ -661,17 +661,35 @@ class SqliteStorage:
             rows = self._conn.execute(
                 "SELECT * FROM worker_runs WHERE subtask_id=? ORDER BY started_at", (subtask_id,)
             ).fetchall()
-        return [
-            WorkerRun(
-                id=r["id"], subtask_id=r["subtask_id"], worker_id=r["worker_id"],
-                harness=r["harness"], model=r["model"], status=r["status"],
-                route_reason=_u(r["route_reason_json"], {}), started_at=r["started_at"],
-                finished_at=r["finished_at"], input_artifact_id=r["input_artifact_id"],
-                output_artifact_id=r["output_artifact_id"], metrics=_u(r["metrics_json"], {}),
-                error=r["error"],
-            )
-            for r in rows
-        ]
+        return [self._run(r) for r in rows]
+
+    def get_run(self, run_id: str) -> Optional[WorkerRun]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM worker_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        return self._run(row) if row else None
+
+    def list_runs_by_status(self, status: str, limit: int = 1000) -> list[WorkerRun]:
+        """Every run in a given status across all subtasks. Used by the orphan
+        reconcile pass to find `running` runs whose process may have died."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM worker_runs WHERE status=? ORDER BY started_at LIMIT ?",
+                (status, max(0, limit)),
+            ).fetchall()
+        return [self._run(r) for r in rows]
+
+    @staticmethod
+    def _run(r: sqlite3.Row) -> WorkerRun:
+        return WorkerRun(
+            id=r["id"], subtask_id=r["subtask_id"], worker_id=r["worker_id"],
+            harness=r["harness"], model=r["model"], status=r["status"],
+            route_reason=_u(r["route_reason_json"], {}), started_at=r["started_at"],
+            finished_at=r["finished_at"], input_artifact_id=r["input_artifact_id"],
+            output_artifact_id=r["output_artifact_id"], metrics=_u(r["metrics_json"], {}),
+            error=r["error"],
+        )
 
     # ------------------------------------------------------- external refs
     def upsert_external_ref(self, ref: ExternalRef) -> ExternalRef:
@@ -989,6 +1007,8 @@ class SqliteStorage:
     def update_session(self, session_id: str, **fields: Any) -> None:
         if not fields:
             return
+        if "metadata" in fields:
+            fields["metadata_json"] = _j(fields.pop("metadata"))
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE manager_sessions SET {cols} WHERE id=?",
@@ -1105,6 +1125,69 @@ class SqliteStorage:
                 (e.id, e.task_id, e.kind, e.actor, _j(e.payload), e.created_at),
             )
         return e
+
+    # ------------------------------------------------- metrics / reconcile / backup
+    def status_counts(self, table: str, column: str = "status") -> dict[str, int]:
+        """`{status: count}` for a table. Table/column are internal constants, never
+        user input, so the f-string interpolation carries no injection surface."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {column} AS k, COUNT(*) AS n FROM {table} GROUP BY {column}"
+            ).fetchall()
+        return {str(r["k"]): int(r["n"]) for r in rows}
+
+    def count_rows(self, table: str) -> int:
+        with self._lock:
+            row = self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        return int(row["n"])
+
+    def live_observation_handles(self) -> list[dict]:
+        """Every handle not already in a terminal state, across all tasks. The
+        reconcile pass probes these for liveness."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM observation_handles "
+                "WHERE state NOT IN ('done','failed','cancelled') ORDER BY created_at"
+            ).fetchall()
+        return [self._obs_handle(r) for r in rows]
+
+    def backup_to(self, dest_path: str) -> str:
+        """Consistent online backup of the whole ledger via SQLite's backup API.
+
+        Safe to call while the service is live and mid-write: the backup runs
+        under the same connection lock and SQLite copies a transactionally
+        consistent snapshot (it does not just `cp` the file, which could catch a
+        half-written WAL). Returns the destination path.
+        """
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            target = sqlite3.connect(str(dest))
+            try:
+                self._conn.backup(target)
+            finally:
+                target.close()
+        return str(dest)
+
+    def restore_from(self, src_path: str) -> str:
+        """Restore the live ledger from a backup, in place, via the backup API.
+
+        Copies ``src_path`` *into* the live connection under the lock, so open
+        handles keep working and readers see the restored contents atomically —
+        no file swap, no torn WAL. The source must be a SQLite database produced
+        by :meth:`backup_to` (or any consistent copy of the ledger).
+        """
+        src = Path(src_path)
+        if not src.exists():
+            raise FileNotFoundError(f"backup not found: {src_path}")
+        with self._lock:
+            source = sqlite3.connect(str(src))
+            try:
+                source.backup(self._conn)
+            finally:
+                source.close()
+            self._conn.commit()
+        return str(src)
 
     def list_events(self, task_id: Optional[str] = None, limit: int = 100) -> list[Event]:
         with self._lock:

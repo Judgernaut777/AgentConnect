@@ -2266,3 +2266,232 @@ class AgentConnectService:
             self.revoke_session_tokens(session.id)
             abandoned.append(session.id)
         return abandoned
+
+    # ------------------------------------------------------ orphan reconcile
+    def _handle_liveness(self, entity_type: str, entity_id: str) -> tuple[Optional[bool], list]:
+        """`(alive, rows)` for an entity's observation handles.
+
+        ``alive`` is ``True`` if any provider proves the process still runs,
+        ``False`` if a provider proves it is dead and none prove it alive, and
+        ``None`` when no provider can tell (no live-surface provider, or the
+        handle predates observability). Only a hard ``False`` justifies
+        reconciling from liveness alone — ``None`` falls through to the age gate.
+        """
+        rows = self.storage.observation_handles_for(entity_type, entity_id)
+        if not rows or not self.observability.enabled:
+            return None, rows
+        verdicts: list[Optional[bool]] = []
+        for row in rows:
+            if row["state"] in ("done", "failed", "cancelled"):
+                continue
+            try:
+                handle = ObservationHandle(**row["handle"])
+            except Exception:  # noqa: BLE001
+                continue
+            verdicts.append(self.observability.is_live(handle))
+        if any(v is True for v in verdicts):
+            return True, rows
+        if any(v is False for v in verdicts):
+            return False, rows
+        return None, rows
+
+    def reconcile_orphans(
+        self, older_than_seconds: Optional[float] = None, dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Sweep sessions/runs whose process died without a terminal event.
+
+        A record is an *orphan* when it is still in a live status but either (a) a
+        live-surface provider proves its process/pane is dead, or (b) an age gate
+        (``older_than_seconds``, a heartbeat timeout) has elapsed with no evidence
+        it is alive. Orphans are swept to a terminal, reconcilable state — sessions
+        to ``abandoned``, runs to ``failed`` — tagged ``reconciled`` in metadata so
+        an operator can tell a crash-swept record from a clean finish, and their
+        live panes/tokens are reaped. A crash therefore leaves the ledger
+        reconcilable rather than wedged with a forever-"running" row.
+
+        ``dry_run`` reports what *would* be reconciled without mutating anything.
+        Idempotent: a second pass finds nothing, because the first moved every
+        orphan to a terminal state.
+        """
+        now = self._now()
+        age_cutoff = (now - max(0.0, older_than_seconds)
+                      if older_than_seconds is not None else None)
+        report: dict[str, Any] = {
+            "dry_run": dry_run, "at": now,
+            "reconciled_sessions": [], "reconciled_runs": [], "stale_handles": [],
+            "checked_sessions": 0, "checked_runs": 0,
+        }
+
+        # --- sessions -----------------------------------------------------
+        for session in self.storage.list_sessions(limit=1000):
+            if session.status not in (SessionStatus.prepared, SessionStatus.running):
+                continue
+            report["checked_sessions"] += 1
+            alive, _rows = self._handle_liveness("session", session.id)
+            if alive is True:
+                continue
+            dead_by_liveness = alive is False
+            dead_by_age = (age_cutoff is not None and session.started_at <= age_cutoff)
+            if not (dead_by_liveness or dead_by_age):
+                continue
+            reason = ("process/pane confirmed dead" if dead_by_liveness
+                      else f"no terminal event within {older_than_seconds}s")
+            entry = {"session_id": session.id, "task_id": session.task_id,
+                     "manager_id": session.manager_id, "reason": reason,
+                     "detected_by": "liveness" if dead_by_liveness else "age"}
+            report["reconciled_sessions"].append(entry)
+            if dry_run:
+                continue
+            meta = dict(session.metadata or {})
+            meta["reconciled"] = {"at": now, "reason": reason,
+                                  "detected_by": entry["detected_by"],
+                                  "prior_status": session.status.value}
+            self.storage.update_session(
+                session.id, status=SessionStatus.abandoned.value, ended_at=now,
+                metadata=meta,
+            )
+            self.revoke_session_tokens(session.id)
+            self._close_observation_handles("session", session.id,
+                                             ObservationOutcome.failed)
+            self.record_event(
+                session.task_id, "session_reconciled", "system",
+                {"session_id": session.id, "reason": reason,
+                 "detected_by": entry["detected_by"]},
+            )
+            self._observe(EventType.session_reconciled, task_id=session.task_id,
+                          session_id=session.id, delegation_id=session.delegation_id,
+                          agent_id=session.manager_id, agent_role=session.mode.value,
+                          outcome=ObservationOutcome.failed, metadata={"reason": reason})
+
+        # --- worker runs --------------------------------------------------
+        for run in self.storage.list_runs_by_status(RunStatus.running.value):
+            report["checked_runs"] += 1
+            subtask = self.storage.get_subtask(run.subtask_id)
+            alive, _rows = self._handle_liveness("subtask", run.subtask_id)
+            if alive is True:
+                continue
+            dead_by_liveness = alive is False
+            dead_by_age = (age_cutoff is not None and run.started_at <= age_cutoff)
+            if not (dead_by_liveness or dead_by_age):
+                continue
+            reason = ("worker process confirmed dead" if dead_by_liveness
+                      else f"no terminal event within {older_than_seconds}s")
+            entry = {"run_id": run.id, "subtask_id": run.subtask_id,
+                     "worker_id": run.worker_id, "reason": reason,
+                     "detected_by": "liveness" if dead_by_liveness else "age"}
+            report["reconciled_runs"].append(entry)
+            if dry_run:
+                continue
+            metrics = dict(run.metrics or {})
+            metrics["reconciled"] = {"at": now, "reason": reason,
+                                     "detected_by": entry["detected_by"]}
+            self.storage.update_run(
+                run.id, status=RunStatus.failed.value, finished_at=now,
+                error=f"reconciled: {reason}", metrics=metrics,
+            )
+            if subtask is not None and subtask.status is SubtaskStatus.running:
+                self.storage.update_subtask(
+                    run.subtask_id, status=SubtaskStatus.failed.value, updated_at=now,
+                )
+            self._close_observation_handles("subtask", run.subtask_id,
+                                             ObservationOutcome.failed)
+            parent = subtask.parent_task_id if subtask else None
+            self.record_event(
+                parent, "run_reconciled", "system",
+                {"run_id": run.id, "subtask_id": run.subtask_id, "reason": reason},
+            )
+            self._observe(EventType.run_reconciled, task_id=parent,
+                          subtask_id=run.subtask_id, run_id=run.id,
+                          agent_id=run.worker_id, agent_role="worker",
+                          outcome=ObservationOutcome.failed, metadata={"reason": reason})
+
+        # --- stale handles: live-marked handles whose provider says dead ---
+        if self.observability.enabled:
+            for row in self.storage.live_observation_handles():
+                try:
+                    handle = ObservationHandle(**row["handle"])
+                except Exception:  # noqa: BLE001
+                    continue
+                if self.observability.is_live(handle) is False:
+                    report["stale_handles"].append(
+                        {"entity_type": row["entity_type"], "entity_id": row["entity_id"],
+                         "provider": row["provider"]})
+                    if not dry_run:
+                        self.storage.update_observation_handle_state(
+                            row["entity_type"], row["entity_id"], row["provider"],
+                            "failed", "failed", now,
+                        )
+        return report
+
+    # ------------------------------------------------------ ops: metrics/ready
+    def metrics(self) -> dict[str, Any]:
+        """Operational counters for the metrics endpoint (Part: Operations).
+
+        Pure reads off the ledger: task/session/run/subtask/review counts by
+        status, plus observability failure/queue gauges. No side effects, so it
+        is safe to scrape frequently.
+        """
+        obs_failures = 0
+        try:
+            comp = self.observability.provider
+            obs_failures = len(getattr(comp, "failures", []))
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "tasks": self.storage.status_counts("tasks"),
+            "sessions": self.storage.status_counts("manager_sessions"),
+            "runs": self.storage.status_counts("worker_runs"),
+            "subtasks": self.storage.status_counts("subtasks"),
+            "reviews": self.storage.status_counts("reviews"),
+            "approvals": self.storage.status_counts("approvals"),
+            "totals": {
+                "tasks": self.storage.count_rows("tasks"),
+                "sessions": self.storage.count_rows("manager_sessions"),
+                "runs": self.storage.count_rows("worker_runs"),
+                "artifacts": self.storage.count_rows("artifacts"),
+                "events": self.storage.count_rows("events"),
+                "observation_handles": self.storage.count_rows("observation_handles"),
+            },
+            "observability": {
+                "enabled": self.observability.enabled,
+                "provider_failures": obs_failures,
+            },
+        }
+
+    def readiness(self) -> dict[str, Any]:
+        """Readiness (can this instance serve traffic?) vs liveness (is the process
+        up?). Checks the one hard dependency — the ledger — with a real query, plus
+        a soft observability probe that never fails readiness on its own.
+        """
+        checks: dict[str, Any] = {}
+        ready = True
+        try:
+            self.storage.count_rows("tasks")
+            checks["storage"] = {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            checks["storage"] = {"ok": False, "detail": str(exc)}
+            ready = False
+        try:
+            health = self.observability.provider.health()
+            checks["observability"] = {"ok": True, "available": health.available,
+                                       "detail": health.detail}
+        except Exception as exc:  # noqa: BLE001
+            checks["observability"] = {"ok": True, "available": False, "detail": str(exc)}
+        return {"ready": ready, "checks": checks}
+
+    # --------------------------------------------------------- backup/restore
+    def backup_ledger(self, dest_path: str) -> dict[str, Any]:
+        """Consistent online snapshot of the ledger DB. Safe while serving."""
+        path = self.storage.backup_to(dest_path)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        return {"backup": path, "size_bytes": size,
+                "tasks": self.storage.count_rows("tasks"),
+                "sessions": self.storage.count_rows("manager_sessions")}
+
+    def restore_ledger(self, src_path: str) -> dict[str, Any]:
+        """Restore the live ledger from a backup, in place. Overwrites current
+        contents — an operator action, gated by the CLI's `--yes`."""
+        path = self.storage.restore_from(src_path)
+        return {"restored_from": path,
+                "tasks": self.storage.count_rows("tasks"),
+                "sessions": self.storage.count_rows("manager_sessions")}
