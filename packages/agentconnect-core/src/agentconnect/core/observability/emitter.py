@@ -141,12 +141,13 @@ class ObservabilityEmitter:
             eid = event_id or dedupe_key or f"{event_type.value}:{anchor}:{seq}"
             event = AgentObservationEvent(
                 event_id=eid, sequence=seq, timestamp=self._clock(),
+                metadata=self._redact_metadata(metadata or {}),
                 event_type=event_type, state=resolved_state, outcome=outcome,
                 trace_id=trace_id, task_id=task_id, delegation_id=delegation_id,
                 parent_delegation_id=parent_delegation_id, subtask_id=subtask_id,
                 session_id=session_id, run_id=run_id, review_id=review_id,
                 agent_id=agent_id, agent_role=agent_role, provider=provider,
-                workspace_id=workspace_id, metadata=metadata or {},
+                workspace_id=workspace_id,
             )
             self.emit(event)
             return event
@@ -199,6 +200,15 @@ class ObservabilityEmitter:
                 raise
             _log.warning("close failed", exc_info=True)
 
+    def is_live(self, handle: ObservationHandle) -> Optional[bool]:
+        """True/False/None whether the observed process is still alive. Never
+        raises: a probe error is reported as ``None`` (unknown), not a crash."""
+        try:
+            return self.provider.is_live(handle)
+        except Exception:  # noqa: BLE001
+            _log.warning("is_live failed", exc_info=True)
+            return None
+
     def attach_info(self, handle: ObservationHandle) -> AttachInformation:
         return self.provider.attach_info(handle)
 
@@ -209,3 +219,38 @@ class ObservabilityEmitter:
         if self._redactor is None:
             return text, False
         return self._redactor(text)
+
+    #: Metadata keys whose values are always scrubbed regardless of content — a
+    #: belt-and-suspenders list so a token that does not match the redactor's
+    #: pattern is still never persisted into the event stream.
+    _SENSITIVE_KEYS = frozenset({
+        "token", "secret", "password", "passwd", "api_key", "apikey",
+        "authorization", "auth", "credential", "credentials", "bearer",
+        "session_token", "access_token", "refresh_token", "private_key",
+    })
+
+    def _redact_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Scrub sensitive values out of event metadata before it is persisted.
+
+        Two layers: (1) any key whose name looks like a credential is masked
+        outright; (2) every remaining string value is run through the safety
+        redactor (the same one that scrubs terminal output), so a secret that
+        landed in an innocuously-named field is still caught. Non-string scalars
+        (ids, counts, enums) pass through untouched. Never raises — a redactor
+        error masks the value rather than leaking it."""
+        if not metadata:
+            return {}
+        out: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if str(key).lower() in self._SENSITIVE_KEYS:
+                out[key] = "[redacted]"
+                continue
+            if isinstance(value, str) and self._redactor is not None:
+                try:
+                    redacted_text, _ = self._redactor(value)
+                    out[key] = redacted_text
+                except Exception:  # noqa: BLE001 — on scanner failure, mask
+                    out[key] = "[redacted: scan failed]"
+            else:
+                out[key] = value
+        return out

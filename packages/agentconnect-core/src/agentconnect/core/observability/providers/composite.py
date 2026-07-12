@@ -159,3 +159,20 @@ class CompositeObservabilityProvider(AgentObservabilityProvider):
                 detail=f"provider {handle.provider!r} is not configured",
             )
         return provider.capture_output(handle, max_lines=max_lines)
+
+    def is_live(self, handle: ObservationHandle) -> Optional[bool]:
+        """Ask the handle's issuing provider whether the process is still alive.
+
+        Only the provider that minted the handle can interpret its ``target``, so
+        we route to it (never poll every provider). A missing provider -> ``None``
+        (no evidence), never ``False`` — a config change must not manufacture a
+        dead verdict that reconciles a live session.
+        """
+        provider = self.provider_named(handle.provider)
+        if provider is None:
+            return None
+        try:
+            return provider.is_live(handle)
+        except Exception as exc:  # noqa: BLE001 — a probe failure is "unknown", not "dead"
+            _log.warning("is_live probe failed on %r: %s", handle.provider, exc)
+            return None
