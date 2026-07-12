@@ -85,6 +85,11 @@ class EventType(str, Enum):
     audit_passed = "audit.passed"
     audit_failed = "audit.failed"
 
+    # Reconciliation (an orphaned session/run whose process died with no
+    # terminal event, swept to a terminal state by the reconcile pass).
+    session_reconciled = "session.reconciled"
+    run_reconciled = "run.reconciled"
+
 
 class ObservationState(str, Enum):
     """The normalized agent state model (Part III).
@@ -155,6 +160,8 @@ DEFAULT_STATE_FOR_EVENT: dict[EventType, ObservationState] = {
     EventType.audit_started: ObservationState.reviewing,
     EventType.audit_passed: ObservationState.done,
     EventType.audit_failed: ObservationState.failed,
+    EventType.session_reconciled: ObservationState.failed,
+    EventType.run_reconciled: ObservationState.failed,
 }
 
 

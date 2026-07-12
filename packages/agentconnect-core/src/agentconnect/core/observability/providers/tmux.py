@@ -285,6 +285,38 @@ class TmuxObservabilityProvider(AgentObservabilityProvider):
             if not self._run("list-panes", "-t", session, check=False).stdout.strip():
                 self._run("kill-session", "-t", session, check=False)
 
+    # --------------------------------------------------------------- liveness
+    def is_live(self, handle: ObservationHandle) -> Optional[bool]:
+        """True while the pane's command still runs; False once it has exited.
+
+        With ``remain-on-exit on`` a finished agent leaves a *dead* pane behind
+        (readable, but its process is gone). tmux reports that via
+        ``#{pane_dead}``: ``1`` means the command exited. A missing pane (killed,
+        server gone) is also not-live. Anything we cannot parse -> ``None`` so we
+        never reconcile on a guess.
+        """
+        target = handle.target
+        if not target:
+            return None
+        session = target.split(":", 1)[0]
+        if not self._session_exists(session):
+            return False
+        try:
+            proc = self._run(
+                "display-message", "-p", "-t", target, "-F", "#{pane_dead}", check=False,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if proc.returncode != 0:
+            # No such pane on a live server -> the pane is gone -> not live.
+            return False
+        flag = proc.stdout.strip()
+        if flag == "1":
+            return False
+        if flag == "0":
+            return True
+        return None
+
     # ------------------------------------------------------------- teardown
     def kill_server(self) -> None:
         """Tear down the entire dedicated tmux server. For test/demo cleanup —

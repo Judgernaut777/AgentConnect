@@ -19,6 +19,8 @@ it supports. A provider that offers no live surface (JSONL, OTLP) still answers
 
 from __future__ import annotations
 
+from typing import Optional
+
 from .model import (
     AgentObservationEvent,
     AttachInformation,
@@ -91,4 +93,16 @@ class AgentObservabilityProvider:
 
     # ----------------------------------------------------------------- end
     def close(self, handle: ObservationHandle, outcome: ObservationOutcome) -> None:
+        return None
+
+    # --------------------------------------------------------------- liveness
+    def is_live(self, handle: ObservationHandle) -> Optional[bool]:
+        """Whether the observed process/pane is still alive.
+
+        Returns ``True`` (alive), ``False`` (confirmed dead), or ``None`` (this
+        provider cannot tell — the default). The orphan-reconcile pass treats
+        ``None`` as "no evidence", so only a provider that can *prove* a process
+        died (like tmux, which can see whether the pane's command is still
+        running) ever causes a session/run to be reconciled from liveness alone.
+        """
         return None
