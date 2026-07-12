@@ -115,6 +115,13 @@ def feedback(body: FeedbackBody, request: Request) -> dict[str, Any]:
 class PromoteBody(BaseModel):
     candidate_id: str
     promoted_by: str
+    # Optional, mirroring the CLI's `memory promote --confidence/--scope`. A backend
+    # that can infer them still works with both unset, but BrainConnect refuses to
+    # guess either (confidence gates profile filters; a guessed scope leaks a
+    # repo-local fact into global recall), so promoting an agent-captured candidate
+    # THROUGH AgentConnect over HTTP needs them threaded through to the adapter.
+    confidence: Optional[str] = None
+    scope: Optional[str] = None
 
 
 @router.get("/memory/pending")
@@ -134,7 +141,8 @@ def promote(body: PromoteBody, request: Request) -> dict[str, Any]:
     judgement about content, and it is made at the librarian's own console.
     """
     who = assert_actor(request, body.promoted_by)
-    return service(request).promote_memory_candidate(body.candidate_id, who)
+    return service(request).promote_memory_candidate(
+        body.candidate_id, who, confidence=body.confidence, scope=body.scope)
 
 
 @router.get("/memory/health")

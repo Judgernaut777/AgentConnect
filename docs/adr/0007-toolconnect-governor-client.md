@@ -44,7 +44,9 @@ Add `core/toolconnect_client.py`, owned by AgentConnect:
   `bind_tool_governor`, mirroring `bind_observability`. `service_from_env` binds the
   governor when configured. An unbound governor changes nothing.
 
-An example `config/toolconnect.yaml` documents the shape.
+The shipped `config/toolconnect.yaml.example` template documents the shape; it is
+not auto-loaded — copy it to `config/toolconnect.yaml` (or point
+`AGENTCONNECT_TOOLCONNECT_CONFIG` at it) to activate.
 
 ## Consequences
 
