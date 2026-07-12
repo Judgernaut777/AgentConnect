@@ -35,6 +35,7 @@ from .memory import (
     MemoryAdapter,
     WikiBrainMemoryAdapter,
 )
+from .observability import ObservabilityConfig, ObservabilityEmitter
 from .routing import RoutePolicy
 from .service import AgentConnectService
 from .workers import EchoWorker, WorkerAdapter
@@ -172,6 +173,18 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
 DEFAULT_API_URL = "http://localhost:8790"
 
 
+def observability_from_env(service: AgentConnectService) -> ObservabilityEmitter:
+    """Build the configured observability emitter (default: effectively noop).
+
+    A standalone install sets nothing and gets a noop emitter — no provider is
+    required. The emitter's redactor is the service's own safety-backed one, so
+    `agents output` is bounded and redacted through AgentConnect's safety layer.
+    """
+    config = ObservabilityConfig.from_env()
+    composite = config.build_provider(redactor=service.observation_redactor())
+    return ObservabilityEmitter(composite, redactor=service.observation_redactor())
+
+
 def service_from_env(
     workers: Optional[list[WorkerAdapter]] = None,
     db_path: Optional[str] = None,
@@ -179,7 +192,7 @@ def service_from_env(
     workspace_dir: Optional[str] = None,
 ) -> AgentConnectService:
     adapters, memory_config = memory_from_env()
-    return AgentConnectService.create(
+    service = AgentConnectService.create(
         db_path=db_path or os.environ.get("AGENTCONNECT_DB_PATH"),
         artifact_dir=artifact_dir or os.environ.get("AGENTCONNECT_ARTIFACT_DIR"),
         workers=workers if workers is not None else workers_from_env(),
@@ -190,3 +203,5 @@ def service_from_env(
         api_url=os.environ.get("AGENTCONNECT_API_URL", DEFAULT_API_URL),
         safety_pipeline=safety_from_env(),
     )
+    service.bind_observability(observability_from_env(service))
+    return service

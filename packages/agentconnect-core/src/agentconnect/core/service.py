@@ -46,6 +46,17 @@ from .artifacts import FilesystemArtifactStore
 from .audit import AuditReport
 from .errors import Conflict, InvalidRequest, NotFound, PolicyViolation, Unauthenticated
 from .execution import DirectExecutionBackend, ExecutionBackend, ExecutionHandle, ExecutionState
+from .observability import (
+    AttachInformation,
+    CapturedOutput,
+    EventType,
+    ObservabilityEmitter,
+    ObservationHandle,
+    ObservationOutcome,
+    ObservationState,
+    SessionObservationRequest,
+    SpawnObservationRequest,
+)
 from .workspace import WorkspaceBuilder, mode_for
 from .models import (
     ApprovalRecord,
@@ -134,6 +145,7 @@ class AgentConnectService:
         api_url: str = "http://localhost:8790",
         safety_enabled: bool = True,
         safety_pipeline: Optional["safety.SafetyPipeline"] = None,
+        observability: Optional[ObservabilityEmitter] = None,
     ) -> None:
         self.storage = storage
         self.artifacts = artifact_store
@@ -178,6 +190,35 @@ class AgentConnectService:
         # working backplane with no workflow server. Adapters that want
         # durability call `bind_execution(TemporalExecutionBackend(...))`.
         self.execution: ExecutionBackend = execution or DirectExecutionBackend(self)
+        #: Provider-neutral observability (production handoff Parts II–V). Default is
+        #: an effectively-noop emitter: standalone AgentConnect requires no provider,
+        #: and emission is always safe to call. `bind_observability` swaps in a
+        #: configured emitter (structured-log, tmux, …). Emission NEVER corrupts the
+        #: ledger — under the advisory policy it cannot even raise.
+        self.observability: ObservabilityEmitter = observability or ObservabilityEmitter()
+
+    def bind_observability(self, emitter: ObservabilityEmitter) -> None:
+        self.observability = emitter
+
+    def observation_redactor(self) -> Callable[[str], tuple]:
+        """`(text) -> (redacted_text, was_redacted)` through the safety layer.
+
+        Bounded terminal output (`agents output`) is routed through this so a
+        credential that scrolled past in a pane is never surfaced verbatim.
+        """
+        def _redact(text: str) -> tuple:
+            if not self.safety_enabled:
+                return text, False
+            try:
+                result = safety.scan_text(
+                    text, surface=safety.CONTEXT_OUTPUT, policy=safety.CONTEXT_OUTPUT,
+                    pipeline=self.safety_pipeline,
+                )
+            except Exception:  # noqa: BLE001 — on scanner failure, withhold rather than leak
+                return "[output withheld: safety scan failed]", True
+            redacted = result.redacted_content != text
+            return result.redacted_content, redacted
+        return _redact
 
     def bind_execution(self, backend: ExecutionBackend) -> None:
         self.execution = backend
@@ -229,6 +270,7 @@ class AgentConnectService:
         api_url: str = "http://localhost:8790",
         safety_enabled: bool = True,
         safety_pipeline: Optional["safety.SafetyPipeline"] = None,
+        observability: Optional[ObservabilityEmitter] = None,
     ) -> "AgentConnectService":
         return cls(
             storage=SqliteStorage(db_path or default_db_path()),
@@ -244,6 +286,7 @@ class AgentConnectService:
             api_url=api_url,
             safety_enabled=safety_enabled,
             safety_pipeline=safety_pipeline,
+            observability=observability,
         )
 
     # ------------------------------------------------------------ internals
@@ -298,6 +341,8 @@ class AgentConnectService:
         self.storage.insert_task(task)
         for text in request.constraints:
             self.add_constraint(task.id, text, request.created_by)
+        self._observe(EventType.task_created, task_id=task.id, agent_id=request.created_by,
+                      agent_role="human", metadata={"title": task.title})
         return task
 
     def add_constraint(self, task_id: str, text: str, created_by: str = "unknown") -> Constraint:
@@ -333,6 +378,9 @@ class AgentConnectService:
             raise Conflict(f"task {task_id} is already {task.status.value}")
         self._touch(task_id, status=TaskStatus.cancelled.value)
         self.record_event(task_id, "task_cancelled", actor, {})
+        self._observe(EventType.task_cancelled, task_id=task_id, agent_id=actor,
+                      agent_role="operator", outcome=ObservationOutcome.cancelled)
+        self._reap_task_observation(task_id, ObservationOutcome.cancelled)
         return self._require_task(task_id)
 
     # ---------------------------------------------------------------- claims
@@ -374,6 +422,8 @@ class AgentConnectService:
                     (manager_id, status, now, task_id),
                 )
         self.record_event(task_id, "task_claimed", manager_id, {"role": role_enum.value})
+        self._observe(EventType.task_claimed, task_id=task_id, agent_id=manager_id,
+                      agent_role="manager", metadata={"role": role_enum.value})
         return claim
 
     def release_task(self, task_id: str, manager_id: str) -> None:
@@ -413,6 +463,9 @@ class AgentConnectService:
             for target in targets:
                 self.storage.mark_superseded(target.id, decision.id, conn=conn)
             conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        self._observe(EventType.decision_recorded, task_id=task_id, agent_id=request.made_by,
+                      agent_role="manager",
+                      metadata={"decision_id": decision.id, "locked": request.locked})
         return decision
 
     def list_decisions(self, task_id: str) -> list[Decision]:
@@ -432,6 +485,9 @@ class AgentConnectService:
         )
         self.storage.insert_attempt(attempt)
         self._touch(task_id)
+        self._observe(EventType.attempt_recorded, task_id=task_id, agent_id=request.actor_id,
+                      agent_role=request.actor_type.value,
+                      metadata={"attempt_id": attempt.id, "outcome": request.outcome})
         return attempt
 
     # ------------------------------------------------------------- artifacts
@@ -459,6 +515,9 @@ class AgentConnectService:
         )
         self.storage.insert_artifact(artifact)
         self._touch(task_id)
+        self._observe(EventType.artifact_created, task_id=task_id, agent_id=request.created_by,
+                      agent_role="worker",
+                      metadata={"artifact_id": artifact.id, "type": request.type.value})
         return artifact
 
     def _scan_artifact(self, content: str) -> tuple[str, dict[str, Any]]:
@@ -530,6 +589,9 @@ class AgentConnectService:
             assigned_to=request.assigned_to, status=ReviewStatus.open,
             criteria=request.criteria, artifact_refs=request.artifact_refs,
             created_at=now, updated_at=now,
+            delegation_id=self._new_delegation_id(),
+            parent_delegation_id=self._parent_delegation_for_task(
+                task_id, request.requested_by),
         )
         self.storage.insert_review(review)
         self.storage.insert_inbox_item(
@@ -542,6 +604,29 @@ class AgentConnectService:
         self._advance_task(task_id, TaskStatus.needs_review, _TO_NEEDS_REVIEW)
         self.record_event(task_id, "review_requested", request.requested_by,
                           {"review_id": review.id, "assigned_to": request.assigned_to})
+        self._observe(EventType.review_requested, task_id=task_id, review_id=review.id,
+                      delegation_id=review.delegation_id,
+                      parent_delegation_id=review.parent_delegation_id,
+                      agent_id=request.assigned_to, agent_role="reviewer",
+                      metadata={"requested_by": request.requested_by})
+        # Begin observing the reviewer as a live session (a real tmux pane).
+        if self.observability.enabled:
+            workspace = self.workspace_for(task_id=task_id)
+            handles = self.observability.begin_session(SessionObservationRequest(
+                trace_id=task_id, task_id=task_id, session_id=review.id, review_id=review.id,
+                delegation_id=review.delegation_id,
+                parent_delegation_id=review.parent_delegation_id,
+                agent_id=request.assigned_to, agent_role="reviewer",
+                workspace_id=workspace.id if workspace else None,
+                command=(f"sh -c 'echo \"[reviewer {request.assigned_to}] review {review.id}\"; "
+                         f"while :; do sleep 3600; done'"),
+                title=f"reviewer:{request.assigned_to}",
+            ))
+            self._record_observation_handles("review", review.id, task_id, handles,
+                                              state="reviewing")
+            self._observe(EventType.review_spawned, task_id=task_id, review_id=review.id,
+                          delegation_id=review.delegation_id, agent_id=request.assigned_to,
+                          agent_role="reviewer")
         self.execution.start_review(review.id)
         return review
 
@@ -558,7 +643,11 @@ class AgentConnectService:
             self.storage.update_review(
                 review_id, conn=conn, status=ReviewStatus.claimed.value, updated_at=now
             )
-        return self._require_review(review_id)
+        claimed = self._require_review(review_id)
+        self._observe(EventType.review_claimed, task_id=claimed.task_id, review_id=review_id,
+                      delegation_id=claimed.delegation_id, agent_id=manager_id,
+                      agent_role="reviewer", state=ObservationState.reviewing)
+        return claimed
 
     def complete_review(self, review_id: str, request: ReviewResultRequest) -> Review:
         review = self._require_review(review_id)
@@ -612,7 +701,16 @@ class AgentConnectService:
         self._signal_entity("review", review_id, "review_completed",
                             {"status": request.status.value,
                              "result_artifact_id": result_artifact_id})
-        return self._require_review(review_id)
+        completed = self._require_review(review_id)
+        review_outcome = (ObservationOutcome.succeeded
+                          if request.status is ReviewStatus.completed
+                          else ObservationOutcome.failed)
+        self._observe(EventType.review_completed, task_id=completed.task_id, review_id=review_id,
+                      delegation_id=completed.delegation_id, agent_id=request.completed_by,
+                      agent_role="reviewer", outcome=review_outcome,
+                      metadata={"status": request.status.value})
+        self._close_observation_handles("review", review_id, review_outcome)
+        return completed
 
     # ----------------------------------------------------------------- inbox
     def get_manager_inbox(self, manager_id: str) -> list[InboxItem]:
@@ -679,14 +777,26 @@ class AgentConnectService:
         if task.status in TERMINAL_TASK_STATUSES:
             raise Conflict(f"task {task_id} is {task.status.value}; cannot accept subtasks")
         now = self._now()
+        # A subtask is a delegation. It gets its own delegation id and points at the
+        # delegating manager session's delegation (or a caller-supplied parent, for
+        # hierarchical delegation), so the agent tree is reconstructable from records.
+        parent_delegation = request.metadata.get("parent_delegation_id") or \
+            self._parent_delegation_for_task(task_id)
         subtask = Subtask(
             id=ids.new_id(ids.SUBTASK), parent_task_id=task_id, title=request.title,
             instructions=request.instructions, status=SubtaskStatus.queued,
             privacy_tier=request.privacy_tier, preferred_worker=request.preferred_worker,
             created_at=now, updated_at=now, sandbox=request.sandbox,
             required_capabilities=request.required_capabilities, metadata=request.metadata,
+            delegation_id=self._new_delegation_id(), parent_delegation_id=parent_delegation,
         )
         self.storage.insert_subtask(subtask)
+        self._observe(EventType.subtask_created, task_id=task_id, subtask_id=subtask.id,
+                      delegation_id=subtask.delegation_id,
+                      parent_delegation_id=subtask.parent_delegation_id,
+                      agent_role="worker", agent_id=request.preferred_worker or "unrouted",
+                      metadata={"title": subtask.title,
+                                "privacy_tier": subtask.privacy_tier.value})
         self.execution.start_subtask(subtask.id)
         return self._require_subtask(subtask.id)
 
@@ -719,6 +829,10 @@ class AgentConnectService:
             subtask.parent_task_id, "subtask_approved", approved_by,
             {"subtask_id": subtask_id, "approval_id": approval.id, "max_cost_usd": max_cost_usd},
         )
+        self._observe(EventType.subtask_approved, task_id=subtask.parent_task_id,
+                      subtask_id=subtask_id, delegation_id=subtask.delegation_id,
+                      agent_id=approved_by, agent_role="operator",
+                      metadata={"approval_id": approval.id, "max_cost_usd": max_cost_usd})
         return self.storage.get_approval(approval.id) or approval
 
     def approve_subtask(
@@ -757,6 +871,11 @@ class AgentConnectService:
             {"subtask_id": subtask_id, "reason": reason},
         )
         self._signal_entity("subtask", subtask_id, "approval_denied", {"reason": reason})
+        self._observe(EventType.subtask_denied, task_id=subtask.parent_task_id,
+                      subtask_id=subtask_id, delegation_id=subtask.delegation_id,
+                      agent_id=denied_by, agent_role="operator",
+                      outcome=ObservationOutcome.denied, metadata={"reason": reason})
+        self._close_observation_handles("subtask", subtask_id, ObservationOutcome.denied)
         self._settle_parent_after_subtask(subtask.parent_task_id)
         return self._require_subtask(subtask_id)
 
@@ -845,6 +964,7 @@ class AgentConnectService:
                 self.execution.cancel(handle.handle_id)
             except Exception as exc:  # a dead workflow server must not strand the ledger
                 _log.warning("execution cancel(%s) failed: %s", handle.handle_id, exc)
+        self._close_observation_handles("subtask", subtask_id, ObservationOutcome.cancelled)
         self._settle_parent_after_subtask(subtask.parent_task_id)
 
     def explain_route(self, subtask_id: str) -> RouteExplanation:
@@ -889,6 +1009,16 @@ class AgentConnectService:
             self.storage.update_subtask(
                 subtask.id, status=SubtaskStatus.queued.value, updated_at=now
             )
+            self._observe(EventType.subtask_routed, task_id=subtask.parent_task_id,
+                          subtask_id=subtask.id, delegation_id=subtask.delegation_id,
+                          parent_delegation_id=subtask.parent_delegation_id,
+                          agent_id=explanation.selected_worker, agent_role="worker",
+                          metadata={"worker": explanation.selected_worker})
+            self._observe(EventType.compute_placed, task_id=subtask.parent_task_id,
+                          subtask_id=subtask.id, delegation_id=subtask.delegation_id,
+                          agent_id=explanation.selected_worker, agent_role="worker",
+                          metadata={"location": getattr(explanation, "selected_location", None)
+                                    or getattr(explanation, "approval_location", None) or "local"})
             return explanation
 
         if explanation.needs_approval:
@@ -950,6 +1080,36 @@ class AgentConnectService:
         )
         self._advance_task(subtask.parent_task_id, TaskStatus.in_progress, _TO_IN_PROGRESS)
 
+        # Begin observing this worker as a live process (a real tmux pane under the
+        # tmux provider). The pane is the observation surface for the run; it is
+        # torn down when the run reaches a terminal state in `_record_result`.
+        if self.observability.enabled:
+            workspace = self.workspace_for(task_id=subtask.parent_task_id)
+            command = subtask.metadata.get("observe_command") or (
+                f"sh -c 'echo \"[worker {caps.worker_id}] {subtask.title}\"; "
+                f"while :; do sleep 3600; done'"
+            )
+            handles = self.observability.begin_process(SpawnObservationRequest(
+                trace_id=subtask.parent_task_id, task_id=subtask.parent_task_id,
+                subtask_id=subtask.id, run_id=run.id, delegation_id=subtask.delegation_id,
+                parent_delegation_id=subtask.parent_delegation_id, agent_id=caps.worker_id,
+                agent_role="worker", workspace_id=workspace.id if workspace else None,
+                workspace_path=workspace.repo_path if workspace else None,
+                command=command, title=f"worker:{caps.worker_id}",
+            ))
+            self._record_observation_handles("subtask", subtask.id, subtask.parent_task_id,
+                                              handles, state="working")
+            self._observe(EventType.worker_spawned, task_id=subtask.parent_task_id,
+                          subtask_id=subtask.id, run_id=run.id,
+                          delegation_id=subtask.delegation_id,
+                          parent_delegation_id=subtask.parent_delegation_id,
+                          agent_id=caps.worker_id, agent_role="worker",
+                          metadata={"harness": caps.harness, "model": caps.model})
+            self._observe(EventType.worker_started, task_id=subtask.parent_task_id,
+                          subtask_id=subtask.id, run_id=run.id,
+                          delegation_id=subtask.delegation_id,
+                          agent_id=caps.worker_id, agent_role="worker")
+
         task = self._require_task(subtask.parent_task_id)
         subtask = self._require_subtask(subtask.id)
         context = WorkerContext(
@@ -1005,6 +1165,30 @@ class AgentConnectService:
                 outcome=result.status, artifact_refs=artifact_ids,
             ),
         )
+        # The worker reached a terminal state. Retitle the live pane to show the
+        # outcome and mark the handle, but leave the pane alive for post-hoc
+        # inspection until the task itself is completed/cancelled (which reaps all
+        # task panes). This mirrors a multiplexer's remain-on-exit behaviour.
+        if self.observability.enabled:
+            outcome = ObservationOutcome.succeeded if succeeded else ObservationOutcome.failed
+            for row in self.storage.observation_handles_for("subtask", subtask.id):
+                handle = ObservationHandle(**row["handle"])
+                self.observability.update_state(
+                    handle, ObservationState.done if succeeded else ObservationState.failed,
+                    outcome=outcome, detail=summary[:40],
+                )
+                self.storage.update_observation_handle_state(
+                    "subtask", subtask.id, handle.provider,
+                    "done" if succeeded else "failed", outcome.value, now,
+                )
+            self._observe(
+                EventType.worker_completed if succeeded else EventType.worker_failed,
+                task_id=subtask.parent_task_id, subtask_id=subtask.id, run_id=run.id,
+                delegation_id=subtask.delegation_id,
+                parent_delegation_id=subtask.parent_delegation_id,
+                agent_id=worker_id, agent_role="worker", outcome=outcome,
+                metadata={"summary": summary[:120]},
+            )
         self._settle_parent_after_subtask(subtask.parent_task_id)
         return self._require_subtask(subtask.id)
 
@@ -1108,6 +1292,264 @@ class AgentConnectService:
     def list_events(self, task_id: Optional[str] = None, limit: int = 100) -> list[Event]:
         return self.storage.list_events(task_id, limit)
 
+    # ------------------------------------------------------- observability
+    # Every AgentConnect lifecycle change is mirrored, provider-neutrally, into an
+    # observation event. The mirror is *derived* and off the transactional path:
+    # emission is guarded by `observability.enabled` (so a standalone install with
+    # no provider pays nothing) and, under the default advisory policy, cannot even
+    # raise — a provider outage never rolls back a ledger mutation.
+
+    def _new_delegation_id(self) -> str:
+        return ids.new_id(ids.DELEGATION)
+
+    def _parent_delegation_for_task(
+        self, task_id: Optional[str], manager_id: Optional[str] = None
+    ) -> Optional[str]:
+        """The delegation id of the session most plausibly delegating this work —
+        the latest live session on the task (optionally by a named manager). Used
+        so a subtask/review points at the manager that spawned it in the tree."""
+        if not task_id:
+            return None
+        try:
+            sessions = self.storage.list_sessions(task_id=task_id, manager_id=manager_id, limit=20)
+        except Exception:  # noqa: BLE001
+            return None
+        for session in sessions:  # newest first
+            if session.delegation_id:
+                return session.delegation_id
+        return None
+
+    def _observe(self, event_type: "EventType", **kwargs: Any) -> None:
+        """Fire one observation event. No-op (not even constructed) when no
+        provider is configured, so the hot path of a noop deployment is untouched."""
+        if not self.observability.enabled:
+            return
+        trace_id = kwargs.pop("trace_id", None) or kwargs.get("task_id") or "orphan"
+        try:
+            self.observability.observe(event_type, trace_id=trace_id, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — never let observability break a flow
+            _log.warning("observe(%s) failed: %s", event_type, exc)
+
+    def _record_observation_handles(
+        self, entity_type: str, entity_id: str, task_id: Optional[str],
+        handles: list["ObservationHandle"], state: str = "starting",
+    ) -> None:
+        for handle in handles:
+            try:
+                self.storage.upsert_observation_handle(
+                    entity_type, entity_id, handle, task_id, state=state, at=self._now()
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("recording observation handle failed: %s", exc)
+
+    def _close_observation_handles(
+        self, entity_type: str, entity_id: str, outcome: "ObservationOutcome",
+    ) -> None:
+        if not self.observability.enabled:
+            return
+        for row in self.storage.observation_handles_for(entity_type, entity_id):
+            handle = ObservationHandle(**row["handle"])
+            self.observability.close(handle, outcome)
+            self.storage.update_observation_handle_state(
+                entity_type, entity_id, handle.provider, "done" if outcome.value == "succeeded"
+                else outcome.value, outcome.value, self._now(),
+            )
+
+    def _reap_task_observation(
+        self, task_id: str, outcome: "ObservationOutcome",
+    ) -> None:
+        """Close every still-live observation pane for a task. Called when the task
+        reaches a terminal state so no agent pane outlives the work it observed."""
+        if not self.observability.enabled:
+            return
+        for row in self.storage.observation_handles_for_task(task_id):
+            if row["state"] in ("done", "failed", "cancelled"):
+                continue
+            handle = ObservationHandle(**row["handle"])
+            self.observability.close(handle, outcome)
+            self.storage.update_observation_handle_state(
+                row["entity_type"], row["entity_id"], handle.provider,
+                "done" if outcome.value == "succeeded" else outcome.value,
+                outcome.value, self._now(),
+            )
+
+    # ---------- read/control surface consumed by the `agents` CLI (Part IV) ----------
+    def observability_providers(self) -> list[dict[str, Any]]:
+        """The configured providers and their health, for `observability providers`."""
+        rows = []
+        for provider in self.observability.provider.providers:
+            try:
+                rows.append(provider.health().model_dump(mode="json"))
+            except Exception as exc:  # noqa: BLE001
+                rows.append({"provider": getattr(provider, "name", "?"),
+                             "available": False, "detail": str(exc)})
+        return rows
+
+    def observability_health(self) -> dict[str, Any]:
+        health = self.observability.provider.health()
+        return health.model_dump(mode="json")
+
+    def observation_events(
+        self, task_id: Optional[str] = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Observation events for a task, read from the structured-log provider
+        (the always-on JSONL). Re-sorted by `(sequence, timestamp)`."""
+        for provider in self.observability.provider.providers:
+            reader = getattr(provider, "read_events", None)
+            if reader is not None:
+                return reader(task_id=task_id, limit=limit)
+        return []
+
+    def list_agents(self, task_id: str) -> list[dict[str, Any]]:
+        """Every observed agent for a task: its delegation record, entity, state,
+        provider handle, and attach availability. Built from the ledger + handles."""
+        self._require_task(task_id)
+        agents: list[dict[str, Any]] = []
+        handle_index: dict[tuple[str, str], list[dict]] = {}
+        for row in self.storage.observation_handles_for_task(task_id):
+            handle_index.setdefault((row["entity_type"], row["entity_id"]), []).append(row)
+
+        def _emit(entity_type, entity_id, title, role, state, deleg, parent):
+            rows = handle_index.get((entity_type, entity_id), [])
+            agents.append({
+                "entity_type": entity_type, "entity_id": entity_id, "title": title,
+                "agent_role": role, "state": state,
+                "delegation_id": deleg, "parent_delegation_id": parent,
+                "handles": [
+                    {"provider": r["provider"], "target": r["handle"].get("target", ""),
+                     "state": r["state"], "outcome": r["outcome"]}
+                    for r in rows
+                ],
+            })
+
+        for session in self.storage.list_sessions(task_id=task_id, limit=100):
+            _emit("session", session.id, f"{session.manager_id} ({session.mode.value})",
+                  session.mode.value, session.status.value,
+                  session.delegation_id, session.parent_delegation_id)
+        for subtask in self.storage.list_subtasks(task_id):
+            _emit("subtask", subtask.id, subtask.title, "worker", subtask.status.value,
+                  subtask.delegation_id, subtask.parent_delegation_id)
+        for review in self.storage.list_reviews(task_id):
+            _emit("review", review.id, f"review by {review.assigned_to}", "reviewer",
+                  review.status.value, review.delegation_id, review.parent_delegation_id)
+        return agents
+
+    def agent_tree(self, task_id: str) -> dict[str, Any]:
+        """The delegation tree, built from delegation records (NOT tmux layout).
+
+        Root is the task. Children attach to their `parent_delegation_id` when set,
+        else to the task root — so the shape is reconstructable from the ledger
+        alone, with no timestamp guessing.
+        """
+        task = self._require_task(task_id)
+        agents = self.list_agents(task_id)
+        by_deleg: dict[str, dict] = {}
+        for a in agents:
+            node = {**a, "children": []}
+            if a["delegation_id"]:
+                by_deleg[a["delegation_id"]] = node
+        root = {"entity_type": "task", "entity_id": task_id, "title": task.title,
+                "state": task.status.value, "children": []}
+        for a in agents:
+            node = by_deleg.get(a["delegation_id"]) if a["delegation_id"] else {
+                **a, "children": []}
+            parent = a["parent_delegation_id"]
+            if parent and parent in by_deleg:
+                by_deleg[parent]["children"].append(node)
+            else:
+                root["children"].append(node)
+        return root
+
+    #: Providers that offer only a log/export surface, never a live pane to attach.
+    _NON_LIVE_PROVIDERS = frozenset({"structured_log", "otlp", "noop"})
+
+    def _pick_live_handle(self, rows: list[dict]) -> Optional[dict]:
+        """Prefer a handle from a live provider (tmux/herdr) over a log/export one,
+        so `attach`/`output`/`cancel` target the real terminal regardless of the
+        order providers were configured in."""
+        if not rows:
+            return None
+        live = [r for r in rows if r["provider"] not in self._NON_LIVE_PROVIDERS]
+        return (live or rows)[-1]
+
+    def _handle_for_entity(self, entity_id: str) -> tuple[str, Optional[dict]]:
+        """Resolve an id (subtask/session/review) to its entity type and best
+        (live-preferred) observation handle row, if any."""
+        entity_type = None
+        if entity_id.startswith(f"{ids.SUBTASK}_"):
+            entity_type = "subtask"
+        elif entity_id.startswith(f"{ids.SESSION}_"):
+            entity_type = "session"
+        elif entity_id.startswith(f"{ids.REVIEW}_"):
+            entity_type = "review"
+        if entity_type is None:
+            for etype in ("subtask", "session", "review"):
+                rows = self.storage.observation_handles_for(etype, entity_id)
+                if rows:
+                    return etype, self._pick_live_handle(rows)
+            return "unknown", None
+        rows = self.storage.observation_handles_for(entity_type, entity_id)
+        return entity_type, self._pick_live_handle(rows)
+
+    def attach_agent(self, entity_id: str) -> AttachInformation:
+        """Real attach instructions for a live agent, from its provider."""
+        _etype, row = self._handle_for_entity(entity_id)
+        if row is None:
+            return AttachInformation(
+                provider="none", available=False,
+                detail=f"no live observation handle for {entity_id!r}",
+            )
+        handle = ObservationHandle(**row["handle"])
+        return self.observability.attach_info(handle)
+
+    def agent_output(self, entity_id: str, max_lines: int = 200) -> CapturedOutput:
+        """Bounded, redacted terminal output for a live agent."""
+        _etype, row = self._handle_for_entity(entity_id)
+        if row is None:
+            return CapturedOutput(
+                provider="none", handle_id=entity_id,
+                detail=f"no live observation handle for {entity_id!r}",
+            )
+        handle = ObservationHandle(**row["handle"])
+        return self.observability.capture_output(handle, max_lines=max_lines)
+
+    def cancel_agent(self, entity_id: str) -> dict[str, Any]:
+        """Cancel an observed unit and propagate to the real process/pane.
+
+        Ledger-first: the subtask/session is marked terminal, then the live pane
+        is closed. Cancelling a subtask reuses `cancel_subtask` (which stops the
+        worker and the execution backend); the pane close follows.
+        """
+        entity_type, row = self._handle_for_entity(entity_id)
+        result: dict[str, Any] = {"entity_id": entity_id, "entity_type": entity_type}
+        # An already-terminal entity cannot be re-cancelled, but its live pane may
+        # still linger (remain-on-exit). Swallow the Conflict and still reap the pane
+        # below — "cancel" from the operator's view means "stop watching this".
+        if entity_type == "subtask":
+            try:
+                self.cancel_subtask(entity_id)
+                result["cancelled"] = True
+            except Conflict as exc:
+                result["cancelled"] = False
+                result["detail"] = str(exc)
+        elif entity_type == "session":
+            try:
+                self.end_shell(entity_id, exit_code=130)
+                result["cancelled"] = True
+            except Conflict as exc:
+                result["cancelled"] = False
+                result["detail"] = str(exc)
+        else:
+            result["cancelled"] = False
+            result["detail"] = f"cannot cancel entity of type {entity_type!r}"
+        if row is not None:
+            handle = ObservationHandle(**row["handle"])
+            self.observability.close(handle, ObservationOutcome.cancelled)
+            self.storage.update_observation_handle_state(
+                entity_type, entity_id, handle.provider, "cancelled", "cancelled", self._now(),
+            )
+        return result
+
     # -------------------------------------------------------------- privacy
     def effective_privacy(self, task_id: str) -> PrivacyTier:
         return self.get_task(task_id).effective_privacy
@@ -1132,6 +1574,10 @@ class AgentConnectService:
         # Re-apply visibility even if the adapter already did: a backend must not
         # be able to smuggle pending items into a manager's context.
         pack.items = memory_mod.apply_visibility(pack.items, request)
+        self._observe(EventType.memory_recalled, task_id=getattr(request, "task_id", None),
+                      agent_id=getattr(request, "manager_id", None) or "unknown",
+                      agent_role="manager",
+                      metadata={"backend": pack.backend, "items": len(pack.items)})
         return pack
 
     def capture_memory_candidate(self, request: CaptureRequest) -> CaptureResult:
@@ -1156,6 +1602,9 @@ class AgentConnectService:
                 {"candidate_id": result.candidate_id, "status": result.status,
                  "backend": result.backend},
             )
+            self._observe(EventType.memory_captured, task_id=request.task_id,
+                          agent_id=request.origin_actor_id or "unknown", agent_role="manager",
+                          metadata={"candidate_id": result.candidate_id, "status": result.status})
         return result
 
     def record_memory_feedback(self, request: MemoryFeedbackRequest) -> None:
@@ -1421,6 +1870,7 @@ class AgentConnectService:
             manager_id=manager_id, workspace_id=workspace.id, mode=mode,
             status=SessionStatus.prepared, claim_id=claim_id, started_at=now,
             launch_command=launch_command,
+            delegation_id=self._new_delegation_id(),  # a launched manager is a delegation root
         )
         self.storage.insert_session(session)
 
@@ -1457,6 +1907,29 @@ class AgentConnectService:
             {"session_id": session.id, "workspace_id": workspace.id, "mode": mode.value,
              "review_id": review_id, "claim_id": claim_id},
         )
+        self._observe(EventType.session_prepared, task_id=task_id, session_id=session.id,
+                      review_id=review_id, delegation_id=session.delegation_id,
+                      agent_id=manager_id, agent_role=mode.value,
+                      workspace_id=workspace.id, metadata={"mode": mode.value})
+        # Begin observing the manager/reviewer as a live session (a real tmux pane).
+        if self.observability.enabled:
+            # The observation pane is a live *monitor* of the managed session: the
+            # agent's own shell is launched separately (`agentconnect shell`). We run
+            # an idle monitor here that stays alive so the pane is attachable for the
+            # session's lifetime; a future tmux-backed execution backend would run the
+            # harness itself in this pane against the identical seam.
+            handles = self.observability.begin_session(SessionObservationRequest(
+                trace_id=task_id, task_id=task_id, session_id=session.id, review_id=review_id,
+                delegation_id=session.delegation_id, agent_id=manager_id, agent_role=mode.value,
+                workspace_id=workspace.id, workspace_path=str(repo_path),
+                command=(
+                    f"sh -c 'echo \"[{mode.value} {manager_id}] session {session.id}\"; "
+                    f"echo \"workspace: {workspace.id}\"; while :; do sleep 3600; done'"),
+                title=f"{mode.value}:{manager_id}",
+                metadata={"launch_command": launch_command},
+            ))
+            self._record_observation_handles("session", session.id, task_id, handles,
+                                              state="prepared")
         shell_flag = f"--review {review_id}" if review_id else f"--task {task_id}"
         return {
             "session": session.model_copy(update={"mode": mode}),
@@ -1480,6 +1953,9 @@ class AgentConnectService:
             session.task_id, "shell_started", session.manager_id,
             {"session_id": session_id, "command": shell_command},
         )
+        self._observe(EventType.session_started, task_id=session.task_id, session_id=session_id,
+                      delegation_id=session.delegation_id, agent_id=session.manager_id,
+                      agent_role=session.mode.value, workspace_id=session.workspace_id)
         return self._require_session(session_id)
 
     def end_shell(self, session_id: str, exit_code: int = 0) -> ManagerSession:
@@ -1493,6 +1969,13 @@ class AgentConnectService:
             session.task_id, "shell_ended", session.manager_id,
             {"session_id": session_id, "exit_code": exit_code, "status": status.value},
         )
+        session_outcome = (ObservationOutcome.succeeded if exit_code == 0
+                           else ObservationOutcome.failed)
+        self._observe(EventType.session_ended, task_id=session.task_id, session_id=session_id,
+                      delegation_id=session.delegation_id, agent_id=session.manager_id,
+                      agent_role=session.mode.value, outcome=session_outcome,
+                      metadata={"exit_code": exit_code})
+        self._close_observation_handles("session", session_id, session_outcome)
         return self._require_session(session_id)
 
     def active_session_for(
@@ -1595,6 +2078,12 @@ class AgentConnectService:
                     f"this session token is scoped to {name} {bound!r}; "
                     f"it cannot act on {requested!r}"
                 )
+        scoped_task = task_id or scope.get("task_id")
+        if scoped_task:
+            self._observe(EventType.tool_authorized, task_id=scoped_task,
+                          agent_id=scope.get("manager_id", "unknown"), agent_role=mode,
+                          session_id=scope.get("session_id"),
+                          metadata={"action": action})
         return scope
 
     def mint_operator_token(
@@ -1656,12 +2145,23 @@ class AgentConnectService:
             e.kind == "memory_candidate_captured"
             for e in self.storage.list_events(task_id, limit=200)
         )
-        return audit_mod.audit_task(
+        # Observability is a derived side-channel (JSONL/OTLP), NOT the ledger — so
+        # these emissions keep the "audit writes nothing to the ledger" guarantee.
+        self._observe(EventType.audit_started, task_id=task_id, agent_id="auditor",
+                      agent_role="system")
+        report = audit_mod.audit_task(
             detail, workspace, session, fresh.text, stored,
             linear_ref=linear_ref, linear_state=linear_state,
             memory_captured=captured,
             memory_enabled=self.memory_config.enabled and bool(self.memory_backends),
         )
+        self._observe(
+            EventType.audit_passed if report.passed else EventType.audit_failed,
+            task_id=task_id, agent_id="auditor", agent_role="system",
+            outcome=ObservationOutcome.succeeded if report.passed else ObservationOutcome.failed,
+            metadata={"problems": len(report.problems)},
+        )
+        return report
 
     def audit_review(self, review_id: str) -> AuditReport:
         review = self._require_review(review_id)
@@ -1704,6 +2204,11 @@ class AgentConnectService:
             {"forced": force, "warnings": report.warnings,
              "problems": report.problems if force else []},
         )
+        self._observe(EventType.task_completed, task_id=task_id, agent_id=completed_by,
+                      agent_role="operator", outcome=ObservationOutcome.succeeded,
+                      metadata={"forced": force})
+        # Reap every live agent pane for this task now that it is done.
+        self._reap_task_observation(task_id, ObservationOutcome.succeeded)
 
         # Only now does the tracker hear about it. Linear mirrors AgentConnect;
         # it never decides completion (§13).
