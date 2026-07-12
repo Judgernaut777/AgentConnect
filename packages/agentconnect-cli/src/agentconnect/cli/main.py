@@ -513,6 +513,105 @@ def _cmd_linear_webhook_test(svc: AgentConnectService, a: argparse.Namespace) ->
     _emit(handle_webhook(svc, payload))
 
 
+# ------------------------------------------------- live agent observability (Part IV)
+def _render_tree(node: dict, prefix: str = "", is_last: bool = True) -> list[str]:
+    """ASCII delegation tree from `agent_tree` records."""
+    connector = "" if not prefix and node.get("entity_type") == "task" else (
+        "└─ " if is_last else "├─ ")
+    label = (
+        f"{node.get('entity_type')}:{node.get('title', node.get('entity_id'))} "
+        f"[{node.get('state', '?')}]"
+    )
+    handles = node.get("handles") or []
+    if handles:
+        label += "  " + ", ".join(
+            f"{h['provider']}={h['target'] or '-'}" for h in handles
+        )
+    lines = [prefix + connector + label]
+    children = node.get("children", [])
+    child_prefix = prefix + ("" if node.get("entity_type") == "task" else
+                             ("   " if is_last else "│  "))
+    for i, child in enumerate(children):
+        lines.extend(_render_tree(child, child_prefix, i == len(children) - 1))
+    return lines
+
+
+def _cmd_agents_list(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.list_agents(a.task))
+
+
+def _cmd_agents_tree(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    tree = svc.agent_tree(a.task)
+    if a.json:
+        _emit(tree)
+        return
+    print("\n".join(_render_tree(tree)))
+
+
+def _cmd_agents_attach(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    info = svc.attach_agent(a.id)
+    if a.json:
+        _emit(info)
+        return
+    if not info.available:
+        print(f"# not attachable: {info.detail}")
+        return
+    print(f"# attach to {a.id} ({info.detail}):")
+    print(info.attach_command)
+    print(f"# read-only:\n{info.read_only_command}")
+
+
+def _cmd_agents_output(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    cap = svc.agent_output(a.id, max_lines=a.lines)
+    if a.json:
+        _emit(cap)
+        return
+    if cap.detail and not cap.lines:
+        print(f"# {cap.detail}")
+    for line in cap.lines:
+        print(line)
+    if cap.truncated:
+        print(f"# ... (truncated to last {a.lines} lines)")
+    if cap.redacted:
+        print("# note: output was redacted by the safety layer")
+
+
+def _cmd_agents_events(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.observation_events(task_id=a.task, limit=a.limit))
+
+
+def _cmd_agents_cancel(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.cancel_agent(a.id))
+
+
+def _cmd_agents_watch(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Poll the delegation tree on an interval (Ctrl-C to stop). One snapshot with
+    --once, which is what a script or a CI check uses."""
+    import time
+
+    while True:
+        tree = svc.agent_tree(a.task)
+        lines = _render_tree(tree)
+        if not a.once:
+            print("\033[2J\033[H", end="")  # clear screen for a live refresh
+        print(f"# agents for {a.task} @ {time.strftime('%H:%M:%S')}")
+        print("\n".join(lines))
+        if a.once:
+            return
+        try:
+            time.sleep(a.interval)
+        except KeyboardInterrupt:
+            return
+
+
+def _cmd_observability_providers(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.observability_providers())
+
+
+def _cmd_observability_health(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    _emit(svc.observability_health())
+
+
 # --------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -845,6 +944,57 @@ def build_parser() -> argparse.ArgumentParser:
     p = linear.add_parser("webhook-test", help="apply a saved webhook payload offline")
     p.add_argument("payload_file")
     p.set_defaults(func=_cmd_linear_webhook_test)
+
+    # ------------------------------------------------- live agents (Part IV)
+    agents = top.add_parser(
+        "agents", help="watch and control live managed agents",
+    ).add_subparsers(dest="cmd", required=True)
+
+    p = agents.add_parser("list", help="every observed agent for a task")
+    p.add_argument("--task", required=True)
+    p.set_defaults(func=_cmd_agents_list, group="agents")
+
+    p = agents.add_parser("tree", help="delegation tree (from ledger records)")
+    p.add_argument("--task", required=True)
+    p.add_argument("--json", action="store_true", help="emit the tree as JSON")
+    p.set_defaults(func=_cmd_agents_tree, group="agents")
+
+    p = agents.add_parser("watch", help="live-refresh the delegation tree")
+    p.add_argument("--task", required=True)
+    p.add_argument("--interval", type=float, default=2.0)
+    p.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    p.set_defaults(func=_cmd_agents_watch, group="agents")
+
+    p = agents.add_parser("attach", help="real attach instructions for a live agent")
+    p.add_argument("id", help="subtask/session/review id")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_cmd_agents_attach, group="agents")
+
+    p = agents.add_parser("output", help="bounded, redacted terminal output")
+    p.add_argument("id", help="subtask/session/review id")
+    p.add_argument("--lines", type=int, default=200)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=_cmd_agents_output, group="agents")
+
+    p = agents.add_parser("events", help="observation events for a task")
+    p.add_argument("--task", required=True)
+    p.add_argument("--limit", type=int, default=200)
+    p.set_defaults(func=_cmd_agents_events, group="agents")
+
+    p = agents.add_parser("cancel", help="cancel a live agent (propagates to the process)")
+    p.add_argument("id", help="subtask/session id")
+    p.set_defaults(func=_cmd_agents_cancel, group="agents")
+
+    # ------------------------------------------------- observability providers
+    obs = top.add_parser(
+        "observability", help="observability providers and health",
+    ).add_subparsers(dest="cmd", required=True)
+
+    p = obs.add_parser("providers", help="list configured providers and their health")
+    p.set_defaults(func=_cmd_observability_providers, group="observability")
+
+    p = obs.add_parser("health", help="aggregate observability health")
+    p.set_defaults(func=_cmd_observability_health, group="observability")
 
     return parser
 
