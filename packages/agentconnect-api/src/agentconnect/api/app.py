@@ -22,17 +22,24 @@ from . import (
     routes_managers,
     routes_memory,
     routes_reviews,
+    routes_route,
     routes_subtasks,
     routes_tasks,
     routes_temporal,
 )
 from .authz import PUBLIC_ROUTES, ROUTE_ACTIONS, WEBHOOK_ROUTES, enforce
-from .deps import linear_sync_from_env, status_for
+from .deps import linear_sync_from_env, router_from_env, status_for
+
+#: Sentinel: `router` was not passed, so build one from env. `None` is a legitimate
+#: caller-supplied value (a test that wants `/route/decide` to answer 503), so it
+#: cannot double as "not given".
+_UNSET = object()
 
 
 def create_app(
     service: Optional[AgentConnectService] = None,
     linear_sync: Optional[object] = None,
+    router: object = _UNSET,
 ) -> FastAPI:
     """Every route authenticates except `GET /health`.
 
@@ -50,6 +57,10 @@ def create_app(
     svc = service or service_from_env()
     app.state.service = svc
     app.state.linear_sync = linear_sync if linear_sync is not None else linear_sync_from_env(svc)
+    # The deterministic router for the decision-only `/route/decide` endpoint
+    # (BrainConnect Lane 4). Built once, guarded like linear_sync: a deployment
+    # without the router package/config degrades that one route to 503.
+    app.state.router = router_from_env() if router is _UNSET else router
 
     @app.exception_handler(AgentConnectError)
     async def _backplane_error(_: Request, exc: AgentConnectError) -> JSONResponse:
@@ -93,7 +104,7 @@ def create_app(
     for module in (
         routes_tasks, routes_artifacts, routes_reviews, routes_managers,
         routes_subtasks, routes_linear, routes_memory, routes_temporal,
-        routes_compliance,
+        routes_compliance, routes_route,
     ):
         app.include_router(module.router)
     return app

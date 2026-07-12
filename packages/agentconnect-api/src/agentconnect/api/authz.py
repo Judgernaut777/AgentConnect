@@ -53,6 +53,8 @@ ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/subtasks/{subtask_id}"): "get_subtask_status",
     ("POST", "/subtasks/{subtask_id}/cancel"): "cancel_subtask",
     ("GET", "/subtasks/{subtask_id}/route"): "explain_route",
+    # decision-only router surface (BrainConnect Lane 4 consumer — see routes_route.py)
+    ("POST", "/route/decide"): "decide_route",
     ("POST", "/subtasks/{subtask_id}/approve"): "approve_subtask",
     ("POST", "/subtasks/{subtask_id}/deny"): "deny_subtask",
     # reviews

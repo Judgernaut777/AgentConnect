@@ -43,7 +43,8 @@ _ORIENTATION_ACTIONS: frozenset[str] = frozenset({
 #: A manager drives the task: it decides, delegates, and asks for review.
 MANAGER_ACTIONS: frozenset[str] = _ORIENTATION_ACTIONS | frozenset({
     "create_task", "claim_task", "record_attempt", "record_decision",
-    "submit_subtask", "get_subtask_status", "explain_route", "get_handoff_summary",
+    "submit_subtask", "get_subtask_status", "explain_route", "decide_route",
+    "get_handoff_summary",
     "request_review", "release_task", "register_artifact", "add_constraint",
     "recall_memory", "capture_memory_candidate", "record_memory_feedback",
     # Explicit tool-use authorization surface (ToolConnect governor). A manager may

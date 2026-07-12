@@ -338,6 +338,30 @@ class RouterService:
             cloud_safe=redaction.cloud_safe,
         )
 
+    # ------------------------------------------------- decision-only routing
+    def decide_route(self, ctx: RoutingContext) -> RoutingDecision:
+        """Return a bare :class:`RoutingDecision` for a *decision-only* consumer
+        (BrainConnect Lane 4), with **no side effects**.
+
+        This mirrors the routing PREP of :meth:`submit_task` — refresh the
+        in-memory learned-quality prior and budget snapshot, take a local-status
+        snapshot — and then calls the deterministic engine directly. Unlike
+        ``submit_task``/``enqueue_task`` it never reaches ``memory.create_task``,
+        ``memory.record_routing_decision``, ``memory.enqueue`` or ``_dispatch``:
+        nothing is persisted, enqueued, or executed. All state it touches is read
+        (``evaluator.learned_quality`` / ``budget.*`` reads, ``local_client.status``)
+        or in-memory engine priors, so the call is idempotent and repeatable.
+
+        It also does **not** run the budget-prompt path (`_route_with_budget_prompt`):
+        an external decision query must not trigger an interactive spend prompt, so
+        paid/rented simply stay behind their fail-closed budget gate.
+        """
+        if self.evaluator is not None:
+            self.engine.set_learned_quality(self.evaluator.learned_quality())
+        self._refresh_budget_state()
+        status = self._local_status()
+        return self.engine.route(ctx, status)
+
     def _default_rented_client(self, cfg, handle) -> LocalClient:
         from .local_client import HttpLocalClient
 

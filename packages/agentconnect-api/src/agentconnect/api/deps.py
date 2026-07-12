@@ -40,6 +40,26 @@ def status_for(exc: AgentConnectError) -> int:
     return 500
 
 
+def router_from_env() -> Optional[object]:
+    """Build the deterministic router `RouterService` for the decision-only
+    `/route/decide` endpoint (BrainConnect Lane 4).
+
+    Returns None (never raises) when the router package or its config is absent, so
+    `/route/decide` degrades to a clear 503 instead of breaking app startup — the
+    same failure posture `linear_sync_from_env` uses. Construction is in-memory
+    (config load + provider registry + in-process quota/budget ledgers); it touches
+    no durable AgentConnect ledger, and the endpoint that uses it is side-effect-free.
+    """
+    try:
+        from agentconnect.router.service import RouterService
+    except Exception:
+        return None
+    try:
+        return RouterService.create()
+    except Exception:
+        return None
+
+
 def linear_sync_from_env(service: AgentConnectService) -> Optional[object]:
     """Build a `LinearSync` when the deployment is configured for it.
 
