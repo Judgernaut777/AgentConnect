@@ -80,10 +80,14 @@ def test_every_route_declares_an_action_and_no_declared_route_is_a_phantom(svc):
     assert phantom_routes(app) == []
 
 
-def test_health_is_the_only_route_served_without_a_token(anon, svc, task):
+def test_only_liveness_and_readiness_probes_serve_without_a_token(anon, svc, task):
+    # Liveness and readiness are the only unauthenticated routes: both are
+    # infrastructure probes that return no ledger contents.
     assert anon.get("/health").status_code == 200
+    assert anon.get("/ready").status_code in (200, 503)
     for method, path in declared_routes(create_app(service=svc, linear_sync=None)):
-        if (method, path) in (("GET", "/health"), ("POST", "/linear/webhook")):
+        if (method, path) in (("GET", "/health"), ("GET", "/ready"),
+                              ("POST", "/linear/webhook")):
             continue
         concrete = (path.replace("{task_id}", task.id)
                         .replace("{review_id}", "review_x")

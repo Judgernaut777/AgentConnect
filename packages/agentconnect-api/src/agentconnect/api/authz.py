@@ -23,9 +23,12 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, Request
 
-#: The only routes served without a token. Liveness, and nothing that names a task.
+#: The only routes served without a token. Liveness/readiness probes, and nothing
+#: that names a task or returns ledger contents. `/ready` reports only pass/fail of
+#: dependency checks — no task data — so a k8s/systemd probe needs no credential.
 PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/health"),
+    ("GET", "/ready"),
 })
 
 #: (method, path template) -> the action `authorize()` is asked about.
@@ -69,6 +72,7 @@ ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/memory/pending"): "list_pending_memory",
     ("POST", "/memory/promote"): "promote_memory_candidate",
     ("GET", "/memory/health"): "get_status",
+    ("GET", "/metrics"): "get_status",
     ("GET", "/tasks/{task_id}/context-pack"): "get_task_context_pack",
     # managers
     ("GET", "/managers/{manager_id}/inbox"): "get_inbox",

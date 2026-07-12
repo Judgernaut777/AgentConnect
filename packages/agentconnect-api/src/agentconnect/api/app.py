@@ -59,6 +59,9 @@ def create_app(
 
     @app.get("/health", tags=["meta"])
     def health() -> dict[str, object]:
+        """Liveness: the process is up and can answer. Does not touch the ledger,
+        so it stays green even while a dependency is degraded — that is readiness's
+        job, and conflating them makes an orchestrator kill a pod it should drain."""
         return {
             "status": "ok",
             "workers": [w.worker_id for w in svc.registry.all()],
@@ -66,6 +69,26 @@ def create_app(
             "execution_backend": svc.execution.name,
             "memory_backend": svc.memory.backend_name,
         }
+
+    @app.get("/ready", tags=["meta"])
+    def ready() -> JSONResponse:
+        """Readiness: can this instance serve real traffic? Probes the ledger with
+        a live query. 503 when a hard dependency is down, so a load balancer stops
+        routing to it without the orchestrator killing the process."""
+        report = svc.readiness()
+        code = 200 if report.get("ready") else 503
+        return JSONResponse(status_code=code, content={"status": "ok" if report["ready"]
+                                                        else "not_ready", **report})
+
+    @app.get("/metrics", tags=["meta"])
+    def metrics() -> dict[str, object]:
+        """Operational metrics as JSON (sessions/runs/errors/durations/queues).
+
+        JSON rather than Prometheus text is the deliberate pick (ADR 0005): the
+        rest of the HTTP surface is JSON, an operator curls it without a scraper,
+        and a Prometheus exporter can trivially transcode it. Authenticated —
+        counts are ledger data, not a public probe."""
+        return svc.metrics()
 
     for module in (
         routes_tasks, routes_artifacts, routes_reviews, routes_managers,
