@@ -13,6 +13,15 @@ Env:
   AGENTCONNECT_WORKSPACE_DIR  managed agent workspaces (default ~/.agentconnect/workspaces)
   AGENTCONNECT_API_URL        what a launched agent is told to call (default :8790)
 
+Config files are operator-created and OFF by default. The repo ships templates —
+`config/memory.yaml.example`, `config/compute.yaml.example`,
+`config/toolconnect.yaml.example` (same convention as `config/safety.yaml.example`)
+— which are NOT auto-loaded. A subsystem's yaml is read only from an explicitly set
+`AGENTCONNECT_*_CONFIG` path, or from the active `config/<name>.yaml` an operator
+copies into place; the shipped `.example` never takes over silently. So running
+`agentconnect-api` from the repo dir does NOT activate a memory backend from a
+checked-in file: env selection (e.g. `export BRAINCONNECT_URL=...`) is honored.
+
 Memory backend env (each optional; a backend with no URL set stays off):
   WIKIBRAIN_URL / BRAINCONNECT_URL   the trusted-authority base URL
   WIKIBRAIN_TOKEN / BRAINCONNECT_TOKEN  bearer token for a token-protected server

@@ -13,6 +13,14 @@ license-files = ["LICENSE"]
 dependencies = [
     "pydantic>=2.5",
     "pyyaml>=6.0",
+    # Runtime dependency of the shipped HTTP clients: the memory adapter
+    # (core/memory.py), the ComputeConnect provider (core/local_compute.py), and
+    # the ToolConnect governor (core/toolconnect_client.py) all reach their sibling
+    # service over httpx. It is imported lazily (only the network path needs it),
+    # but it is a real, non-optional dependency — a base agentconnect-core install
+    # must be able to talk to a memory/compute/tool backend without a combined venv
+    # transitively supplying httpx.
+    "httpx>=0.27",
 ]
 
 # Safety engines are opt-in. The default install carries the standard-library

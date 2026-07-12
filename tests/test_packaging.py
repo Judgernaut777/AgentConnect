@@ -15,9 +15,40 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:  # py311+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore[no-redef]
+
 import yaml
 
 from agentconnect.common import config as cfg
+
+
+def _core_pyproject() -> dict:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "packages" / "agentconnect-core" / "pyproject.toml"
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def test_core_declares_httpx_as_a_runtime_dependency():
+    """The three shipped HTTP clients (memory adapter, ComputeConnect provider,
+    ToolConnect governor) import httpx on their network path. A base
+    agentconnect-core install must therefore declare httpx — otherwise reaching a
+    sibling service raises `ModuleNotFoundError: No module named 'httpx'`, and it
+    only "works" in a combined venv where ComputeConnect transitively pulls it.
+    """
+    deps = _core_pyproject()["project"]["dependencies"]
+    names = {d.split(">=")[0].split("==")[0].split("[")[0].strip().lower() for d in deps}
+    assert "httpx" in names, f"agentconnect-core must declare httpx; has {sorted(names)}"
+
+
+def test_httpx_is_importable_by_the_shipped_clients():
+    """The clients that need it can actually reach httpx in this environment — the
+    thing the missing declaration silently broke on a base install."""
+    import httpx  # noqa: F401
+
+    from agentconnect.core import local_compute, memory, toolconnect_client  # noqa: F401
 
 
 def test_packaged_default_config_ships_all_three_files():

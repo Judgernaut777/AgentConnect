@@ -170,8 +170,13 @@ warning rather than failing the subtask. Soft user-preference memory is
 deliberately **not** in the core: hard preferences are AgentConnect config
 (`hard_policies`) or scoped WikiBrain claims.
 
-Config lives in `config/memory.yaml` (`AGENTCONNECT_MEMORY_CONFIG`), backend URLs
-in `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`. A token-protected backend
+Config is operator-created and OFF by default: the repo ships a
+`config/memory.yaml.example` template that is **not** auto-loaded. A memory yaml is
+read only from an explicit `AGENTCONNECT_MEMORY_CONFIG` path or from an active
+`config/memory.yaml` you copy into place — so running from the repo dir honors env
+selection (`export BRAINCONNECT_URL=...`) instead of a checked-in file silently
+taking over. Backend URLs come from
+`WIKIBRAIN_URL` / `BRAINCONNECT_URL`, `COGNEE_URL`, `GRAPHITI_URL`. A token-protected backend
 (`brainconnect serve --token`) takes a bearer token from the matching
 `WIKIBRAIN_TOKEN` / `BRAINCONNECT_TOKEN` / `COGNEE_TOKEN` / `GRAPHITI_TOKEN` env
 var (or a per-backend `token:` in `memory.yaml`); it is sent as the Authorization

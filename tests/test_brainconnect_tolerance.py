@@ -125,6 +125,44 @@ def test_bootstrap_env_registers_brainconnect(monkeypatch, tmp_path):
     assert adapter.backend_name == "brainconnect"  # reports the configured name
 
 
+def test_shipped_example_memory_yaml_is_not_auto_loaded(monkeypatch, tmp_path):
+    """A `config/memory.yaml.example` sitting in the cwd must NOT take over.
+
+    The Wave D deployment footgun: the repo shipped an ACTIVE `config/memory.yaml`
+    that `_load_memory_yaml` auto-loaded from cwd, so running from the repo dir
+    forced `memory_backend=wikibrain` and silently overrode a documented
+    `export BRAINCONNECT_URL=...`. The example file is now `.example` and is not
+    an implicit default path, so env selection wins: with BRAINCONNECT_URL set and
+    only the `.example` present, the brainconnect backend is the one selected.
+    """
+    import os
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    # The real shipped template, copied verbatim, sitting where cwd search looks.
+    example = cfg_dir / "memory.yaml.example"
+    example.write_text(
+        "memory:\n"
+        "  enabled: true\n"
+        "  trusted_authority: wikibrain\n"
+        "  backends:\n"
+        "    wikibrain:\n"
+        "      enabled: true\n"
+        "      base_url: http://localhost:8787\n",
+        encoding="utf-8",
+    )
+    # No active config/memory.yaml, and no explicit AGENTCONNECT_MEMORY_CONFIG.
+    monkeypatch.delenv("AGENTCONNECT_MEMORY_CONFIG", raising=False)
+    monkeypatch.setenv("BRAINCONNECT_URL", "http://localhost:8787")
+    for var in ("WIKIBRAIN_URL", "COGNEE_URL", "GRAPHITI_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert not (cfg_dir / "memory.yaml").exists()  # only the .example is present
+    adapters, _config = memory_from_env()
+    assert set(adapters) == {"brainconnect"}, (
+        "the shipped .example was auto-loaded and overrode env selection")
+
+
 def test_bootstrap_yaml_declared_brainconnect(monkeypatch, tmp_path):
     config_file = tmp_path / "memory.yaml"
     config_file.write_text(

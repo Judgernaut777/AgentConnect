@@ -39,7 +39,9 @@ exactly:
 - Optional adapter knobs (`worker_id`, `task_type`, `max_output_tokens`) are read from the
   yaml block; each has a safe default.
 
-An example `config/compute.yaml` documents the shape.
+The shipped `config/compute.yaml.example` template documents the shape; it is not
+auto-loaded — copy it to `config/compute.yaml` (or point
+`AGENTCONNECT_COMPUTE_CONFIG` at it) to activate.
 
 ## Consequences
 

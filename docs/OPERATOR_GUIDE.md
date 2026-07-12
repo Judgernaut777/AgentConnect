@@ -327,4 +327,5 @@ as the assignee.
 
 **Context pack warns `no project, repo scope is known for this task`.** Repo- and
 project-scoped memory cannot surface. Set `task.metadata` (`repo_id`, `project_id`) or
-`memory.default_scopes` in `config/memory.yaml`.
+`memory.default_scopes` in your active `config/memory.yaml` (copied from the shipped
+`config/memory.yaml.example`; the template is not auto-loaded).
