@@ -33,6 +33,18 @@ PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
      re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"
                 r"[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----"),
      "Private key block."),
+    # A lone PEM private-key delimiter — the `-----BEGIN … PRIVATE KEY-----`
+    # (or `-----END …-----`) line by itself, without a matching partner. Terminal
+    # capture is bounded, so scrollback can present the header while the body and
+    # footer have scrolled off; the block rule above needs both delimiters and
+    # would let that header through. No key material leaks either way (the base64
+    # body is caught on its own), but the bare delimiter is still an unredacted
+    # signal that a private key was present. Scoped to "PRIVATE KEY" markers so a
+    # CERTIFICATE or PUBLIC KEY delimiter is never treated as a secret. Overlaps
+    # the block rule on a whole key and is merged by the redactor.
+    ("secret.private_key_marker",
+     re.compile(r"-----(?:BEGIN|END) (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+     "PEM private-key delimiter."),
     ("secret.jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
      "JWT-like token."),
     ("secret.slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),

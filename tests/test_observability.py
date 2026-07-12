@@ -331,6 +331,32 @@ def test_tmux_bounded_output_capture_and_redaction():
 
 
 @requires_tmux
+def test_tmux_capture_redacts_a_bare_pem_private_key_delimiter(tmp_path):
+    """The real safety redactor (not a stub) wired into tmux capture must scrub a
+    lone `-----BEGIN … PRIVATE KEY-----` delimiter that scrolled past in a pane —
+    the block rule needs both delimiters, so a header on its own would otherwise
+    survive capture as an unredacted signal that a private key was present."""
+    socket = _tmux_socket()
+    svc = AgentConnectService.create(
+        db_path=":memory:", artifact_dir=str(tmp_path / "art"), workers=[EchoWorker()],
+    )
+    prov = TmuxObservabilityProvider(socket=socket, redactor=svc.observation_redactor())
+    try:
+        h = prov.spawn_process(SpawnObservationRequest(
+            trace_id="task_pem", task_id="task_pem", subtask_id="s", run_id="r",
+            workspace_id="w", agent_id="a", agent_role="worker",
+            command="sh -c 'echo -----BEGIN OPENSSH PRIVATE KEY-----; sleep 30'"))
+        import time
+        time.sleep(0.5)
+        cap = prov.capture_output(h, max_lines=10)
+        joined = "\n".join(cap.lines)
+        assert "PRIVATE KEY" not in joined
+        assert cap.redacted is True
+    finally:
+        prov.kill_server()
+
+
+@requires_tmux
 def test_tmux_close_kills_the_real_pane():
     import subprocess
     socket = _tmux_socket()
