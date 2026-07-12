@@ -19,6 +19,18 @@ Memory backend env (each optional; a backend with no URL set stays off):
                                      (`brainconnect serve --token`); sent as the
                                      Authorization header, never logged
   COGNEE_URL / COGNEE_TOKEN, GRAPHITI_URL / GRAPHITI_TOKEN   likewise
+
+Compute plane env (optional; unset => the local_model_manager worker stays off):
+  AGENTCONNECT_COMPUTE_URL     base URL of a ComputeConnect deployment (env wins over
+                               `config/compute.yaml` -> compute.base_url)
+  AGENTCONNECT_COMPUTE_TIMEOUT request timeout seconds (default 30)
+  AGENTCONNECT_COMPUTE_TOKEN   optional bearer token, Authorization header, never logged
+
+Tool governance env (optional; unset => no ToolGovernor, standalone unchanged):
+  AGENTCONNECT_TOOLCONNECT_URL   base URL of a `toolconnect serve` decision point
+                                 (env wins over `config/toolconnect.yaml`)
+  AGENTCONNECT_TOOLCONNECT_TOKEN optional bearer token, Authorization header, never logged
+  AGENTCONNECT_TOOLCONNECT_MODE  `required` (default) or `advisory`
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .context import MemoryConfig
+from .local_compute import HttpLocalComputeProvider, LocalModelManagerWorkerAdapter
 from .memory import (
     CogneeMemoryAdapter,
     GraphitiMemoryAdapter,
@@ -60,6 +73,8 @@ _MEMORY_BACKENDS: dict[str, tuple[type[MemoryAdapter], str, str, str]] = {
 
 MEMORY_CONFIG_PATH = "AGENTCONNECT_MEMORY_CONFIG"
 SAFETY_CONFIG_PATH = "AGENTCONNECT_SAFETY_CONFIG"
+COMPUTE_CONFIG_PATH = "AGENTCONNECT_COMPUTE_CONFIG"
+TOOLCONNECT_CONFIG_PATH = "AGENTCONNECT_TOOLCONNECT_CONFIG"
 
 #: Built-in, dependency-free workers. Real harnesses (LiteLLM, local model
 #: manager, Deep Agents, sandboxed shell) register themselves at runtime — the
@@ -102,6 +117,111 @@ def _load_memory_yaml() -> dict[str, Any]:
     except Exception as exc:
         _log.warning("could not read %s (%s); memory stays disabled", path, exc)
         return {}
+
+
+def _load_yaml_config(env_var: str, default_path: str, subsystem: str) -> dict[str, Any]:
+    """Read a `config/*.yaml` with the memory-backend discipline: absent file means
+    the feature is off, and a **malformed** file degrades to off with a warning — a
+    missing subsystem is a smaller problem than a wrong one."""
+    path = Path(os.environ.get(env_var, default_path))
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        _log.warning("could not read %s (%s); %s stays disabled", path, exc, subsystem)
+        return {}
+
+
+def _compute_timeout(block: dict[str, Any]) -> float:
+    raw = os.environ.get("AGENTCONNECT_COMPUTE_TIMEOUT")
+    if raw is None:
+        raw = block.get("timeout")
+    if raw is None:
+        return 30.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        _log.warning("compute timeout %r is not a number; defaulting to 30", raw)
+        return 30.0
+
+
+def compute_worker_from_env() -> Optional[WorkerAdapter]:
+    """Build the external local-compute worker from config, or `None` (subsystem off).
+
+    Mirrors `memory_from_env` byte-for-byte on precedence and failure: env
+    `AGENTCONNECT_COMPUTE_URL` wins over `config/compute.yaml`'s `compute.base_url`,
+    file wins over nothing, and absence leaves the `local_model_manager` worker
+    unregistered — exactly today's "optional subsystem" standalone behaviour. A
+    malformed `compute:` block degrades to off with a warning. The result, when not
+    `None`, is a `LocalModelManagerWorkerAdapter(HttpLocalComputeProvider(url))` —
+    both already exist; only the wiring from config was missing (ComputeConnect
+    docs/AGENTCONNECT_INTEGRATION.md). No engine choice is made here.
+    """
+    block = (_load_yaml_config(COMPUTE_CONFIG_PATH, "config/compute.yaml", "compute").get("compute")
+             or {})
+    env_url = os.environ.get("AGENTCONNECT_COMPUTE_URL")
+    if env_url:
+        url = env_url
+    elif block.get("enabled") is False:
+        return None  # explicitly disabled in yaml; env (checked above) can still force it on
+    else:
+        url = block.get("base_url")
+    if not url:
+        return None  # nothing configured — the subsystem stays off, as today
+
+    token = os.environ.get("AGENTCONNECT_COMPUTE_TOKEN") or block.get("token") or None
+    provider = HttpLocalComputeProvider(str(url), timeout=_compute_timeout(block), token=token)
+    kwargs: dict[str, Any] = {}
+    if block.get("worker_id"):
+        kwargs["worker_id"] = str(block["worker_id"])
+    if block.get("task_type"):
+        kwargs["task_type"] = str(block["task_type"])
+    if block.get("max_output_tokens") is not None:
+        try:
+            kwargs["max_output_tokens"] = int(block["max_output_tokens"])
+        except (TypeError, ValueError):
+            _log.warning(
+                "compute max_output_tokens %r is not an int; using adapter default",
+                block["max_output_tokens"])
+    return LocalModelManagerWorkerAdapter(provider, **kwargs)
+
+
+def toolconnect_governor_from_env() -> Optional[Any]:
+    """Build the optional ToolConnect governor from config, or `None` (unchanged).
+
+    Same env-over-file precedence and degrade-to-off-on-malformed discipline as memory:
+    env `AGENTCONNECT_TOOLCONNECT_URL` wins over `config/toolconnect.yaml`'s
+    `toolconnect.base_url`, and absence means no governor — standalone AgentConnect runs
+    exactly as before. The governor itself is fail-*closed* (an unreachable engine denies),
+    which is the one place AgentConnect deliberately departs from "adapters fail open"
+    (ToolConnect docs/AGENTCONNECT_CONTRACT.md §1).
+    """
+    from .toolconnect_client import ToolConnectGovernor
+
+    block = (_load_yaml_config(TOOLCONNECT_CONFIG_PATH, "config/toolconnect.yaml",
+                               "toolconnect governor").get("toolconnect") or {})
+    env_url = os.environ.get("AGENTCONNECT_TOOLCONNECT_URL")
+    if env_url:
+        url = env_url
+    elif block.get("enabled") is False:
+        return None
+    else:
+        url = block.get("base_url")
+    if not url:
+        return None
+
+    token = os.environ.get("AGENTCONNECT_TOOLCONNECT_TOKEN") or block.get("token") or None
+    mode = os.environ.get("AGENTCONNECT_TOOLCONNECT_MODE") or block.get("mode") or "required"
+    raw_timeout = os.environ.get("AGENTCONNECT_TOOLCONNECT_TIMEOUT") or block.get("timeout") or 10.0
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        _log.warning("toolconnect timeout %r is not a number; defaulting to 10", raw_timeout)
+        timeout = 10.0
+    return ToolConnectGovernor(str(url), token=token, mode=str(mode), timeout=timeout)
 
 
 def safety_from_env() -> Optional["safety.SafetyPipeline"]:
@@ -192,10 +312,16 @@ def service_from_env(
     workspace_dir: Optional[str] = None,
 ) -> AgentConnectService:
     adapters, memory_config = memory_from_env()
+    worker_list = list(workers if workers is not None else workers_from_env())
+    # Append the external local-compute worker when configured (env or compute.yaml);
+    # absent config leaves the list untouched, so standalone behaviour is unchanged.
+    compute_worker = compute_worker_from_env()
+    if compute_worker is not None:
+        worker_list.append(compute_worker)
     service = AgentConnectService.create(
         db_path=db_path or os.environ.get("AGENTCONNECT_DB_PATH"),
         artifact_dir=artifact_dir or os.environ.get("AGENTCONNECT_ARTIFACT_DIR"),
-        workers=workers if workers is not None else workers_from_env(),
+        workers=worker_list,
         policy=policy_from_env(),
         memory_backends=adapters,
         memory_config=memory_config,
@@ -204,4 +330,8 @@ def service_from_env(
         safety_pipeline=safety_from_env(),
     )
     service.bind_observability(observability_from_env(service))
+    # Optional, fail-closed tool governance. None when unconfigured — standalone unchanged.
+    governor = toolconnect_governor_from_env()
+    if governor is not None:
+        service.bind_tool_governor(governor)
     return service

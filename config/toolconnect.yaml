@@ -1,0 +1,38 @@
+# Optional tool-governance configuration (ToolConnect integration).
+#
+#   Every other AgentConnect adapter fails OPEN. This one fails CLOSED.
+#
+# A ToolConnect decision point authorizes tool calls and records their outcomes. It
+# is never on the invocation data path — AgentConnect's worker runtime is the only
+# thing that runs a tool. The governor only answers "may this principal call this
+# tool?" and closes the loop afterwards.
+#
+# The whole subsystem is optional: with nothing set, no governor is bound and
+# AgentConnect runs exactly as it does standalone. But when a governor IS configured,
+# a *missing* decision (unreachable engine, non-200, unreadable body, incompatible
+# contract) is a DENY, never an allow — a policy engine that fails open is not a
+# policy engine.
+#
+# Precedence (byte-for-byte with memory.yaml):
+#   AGENTCONNECT_TOOLCONNECT_URL (env)  ->  toolconnect.base_url (this file)  ->  off.
+# A malformed `toolconnect:` block degrades to no governor with a warning.
+toolconnect:
+  enabled: true
+
+  # Base URL of a running `toolconnect serve` (POST /authorize,
+  # POST /decisions/{id}/outcome, GET /health). Overridden by
+  # AGENTCONNECT_TOOLCONNECT_URL in the environment.
+  base_url: http://127.0.0.1:8095
+
+  # `required` (default): an unreachable engine is a denial and the subtask fails
+  # with a recorded reason. `advisory`: a caller may fall back to a pre-fetched,
+  # unexpired ToolsetPack — the client still never fabricates an allow.
+  # Overridden by AGENTCONNECT_TOOLCONNECT_MODE.
+  mode: required
+
+  # Optional request timeout in seconds. Overridden by AGENTCONNECT_TOOLCONNECT_TIMEOUT.
+  timeout: 10
+
+  # Optional bearer token, sent verbatim as the Authorization header, never logged.
+  # Overridden by AGENTCONNECT_TOOLCONNECT_TOKEN. Prefer the env var.
+  # token: Bearer <token>

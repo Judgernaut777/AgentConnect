@@ -196,9 +196,20 @@ class AgentConnectService:
         #: configured emitter (structured-log, tmux, …). Emission NEVER corrupts the
         #: ledger — under the advisory policy it cannot even raise.
         self.observability: ObservabilityEmitter = observability or ObservabilityEmitter()
+        #: Optional tool-governance seam (ToolConnect contract §3). ``None`` means no
+        #: governor is configured — standalone AgentConnect runs unchanged. Unlike every
+        #: other adapter it fails *closed*: a bound governor whose engine is unreachable
+        #: denies rather than degrades. It authorizes and records only; it is never on the
+        #: invocation data path. Bound from config by `toolconnect_governor_from_env`.
+        self.tool_governor: Optional[Any] = None
 
     def bind_observability(self, emitter: ObservabilityEmitter) -> None:
         self.observability = emitter
+
+    def bind_tool_governor(self, governor: Any) -> None:
+        """Bind an optional `ToolGovernor` (ToolConnect adapter). Fails closed by
+        contract: an unreachable governor denies. Absent one, nothing changes."""
+        self.tool_governor = governor
 
     def observation_redactor(self) -> Callable[[str], tuple]:
         """`(text) -> (redacted_text, was_redacted)` through the safety layer.

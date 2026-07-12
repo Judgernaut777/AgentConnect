@@ -131,18 +131,26 @@ class HttpLocalComputeProvider(LocalComputeProvider):
         base_url: str,
         transport: Optional[Callable[[str, str, Optional[dict]], dict]] = None,
         timeout: float = 30.0,
+        token: Optional[str] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._transport = transport
         self._timeout = timeout
+        #: Optional bearer credential, sent verbatim as the ``Authorization``
+        #: header (mirrors the memory adapters — the caller writes ``Bearer <t>``
+        #: if the server wants that prefix). Never logged. ComputeConnect is
+        #: unauthenticated on loopback today; this is forward-compat.
+        self._token = token or None
 
     def _call(self, method: str, path: str, payload: Optional[dict] = None) -> dict[str, Any]:
         if self._transport is not None:
             return self._transport(method, f"{self.base_url}{path}", payload) or {}
         import httpx  # lazy
 
+        headers = {"Authorization": self._token} if self._token else None
         response = httpx.request(
-            method, f"{self.base_url}{path}", json=payload, timeout=self._timeout
+            method, f"{self.base_url}{path}", json=payload, headers=headers,
+            timeout=self._timeout,
         )
         response.raise_for_status()
         return response.json() or {}
