@@ -20,7 +20,7 @@ goes wrong.
 The short version:
 
 ```bash
-git clone <this-repo> && cd mcp-agentconnect
+git clone <this-repo> && cd AgentConnect
 python -m venv .venv && source .venv/bin/activate
 
 # The CLI is required. Core alone gives you the library, not the command.
@@ -142,7 +142,10 @@ Python package, the `wiki` CLI, the adapter class `WikiBrainMemoryAdapter`, and 
 environment variables `WIKIBRAIN_URL` / `WIKIBRAIN_WRITE_TOKEN` all still say `wikibrain`.
 **Those names are load-bearing — do not "correct" them in a config file.** This
 documentation says BrainConnect when it means the product and `wikibrain` when it means
-an identifier you must type.
+an identifier you must type. When wiring the Connect ecosystem deployment, the same
+memory service values are expected under `BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN` —
+both names currently refer to the same underlying service, and this env-var naming
+reconciliation is pending.
 
 ---
 

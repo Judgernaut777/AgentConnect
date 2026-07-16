@@ -1,5 +1,10 @@
 # ToolConnect — integration contract
 
+> **Status: 2026-07-17 update** — ToolConnect now ships v0.1.0 runtime in the sibling
+> repository. AgentConnect consumes it via a fail-closed governor client. The historical
+> text below documents the contract and rationale; current reality: the sibling repos ship
+> working implementations that AgentConnect now integrates with.
+
 **Status: design note. ToolConnect does not exist.** No code moves as a result of this
 document. AgentConnect exposes a fixed MCP tool set today and runs standalone.
 

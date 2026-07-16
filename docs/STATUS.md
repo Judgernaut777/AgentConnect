@@ -9,7 +9,7 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `.venv/bin/python -m pytest -q` — **888 passing, 3 skipped** (the skips need the optional `safety-secrets` extra) |
+| Gate | `.venv/bin/python -m pytest -q` — **1060 passing, 3 skipped** (as of the latest commit; the skips need the optional `safety-secrets` extra) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
@@ -27,10 +27,14 @@ Nothing below is required. AgentConnect runs, and its gate is green, with none o
 
 * **BrainConnect** (trusted memory) — optional. Without it, AgentConnect uses local task
   state and the default no-op memory adapter.
-* **ComputeConnect** — **does not exist.** AgentConnect ships its own execution, routing,
-  and model seams. Contract: [COMPUTECONNECT_CONTRACT.md](COMPUTECONNECT_CONTRACT.md).
-* **ToolConnect** — **does not exist.** AgentConnect ships a fixed MCP tool set.
-  Contract: [TOOLCONNECT_CONTRACT.md](TOOLCONNECT_CONTRACT.md).
+* **ComputeConnect** — **Status: 2026-07-17** — ships v0.1.0 runtime in the sibling
+  repository; AgentConnect now consumes it via HTTP local-compute provider. AgentConnect
+  ships its own execution, routing, and model seams as fallbacks. Contract:
+  [COMPUTECONNECT_CONTRACT.md](COMPUTECONNECT_CONTRACT.md).
+* **ToolConnect** — **Status: 2026-07-17** — ships v0.1.0 runtime in the sibling
+  repository; AgentConnect now consumes it via a fail-closed governor client.
+  AgentConnect ships a fixed MCP tool set as fallback. Contract:
+  [TOOLCONNECT_CONTRACT.md](TOOLCONNECT_CONTRACT.md).
 * Linear, Temporal, Cognee, Graphiti, a local model manager — all optional, none
   configured by default.
 
@@ -40,7 +44,10 @@ without a decision recorded here.
 **On the name.** BrainConnect was renamed from *WikiBrain* on GitHub; its code was not.
 The package, the `wiki` CLI, `WikiBrainMemoryAdapter`, and `WIKIBRAIN_URL` /
 `WIKIBRAIN_WRITE_TOKEN` still say `wikibrain`, and those names are load-bearing. This
-documentation says BrainConnect for the product and `wikibrain` for identifiers.
+documentation says BrainConnect for the product and `wikibrain` for identifiers. When
+wiring the Connect ecosystem deployment, the same memory service values are expected
+under `BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN` — both names currently refer to the
+same underlying service, and this env-var naming reconciliation is pending.
 
 ## Memory boundary
 
