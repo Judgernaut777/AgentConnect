@@ -28,7 +28,7 @@ from . import (
     routes_temporal,
 )
 from .authz import PUBLIC_ROUTES, ROUTE_ACTIONS, WEBHOOK_ROUTES, enforce
-from .deps import linear_sync_from_env, router_from_env, status_for
+from .deps import linear_sync_from_env, linear_webhook_secret_from_env, router_from_env, status_for
 
 #: Sentinel: `router` was not passed, so build one from env. `None` is a legitimate
 #: caller-supplied value (a test that wants `/route/decide` to answer 503), so it
@@ -40,6 +40,7 @@ def create_app(
     service: Optional[AgentConnectService] = None,
     linear_sync: Optional[object] = None,
     router: object = _UNSET,
+    linear_webhook_secret: object = _UNSET,
 ) -> FastAPI:
     """Every route authenticates except `GET /health`.
 
@@ -61,6 +62,14 @@ def create_app(
     # (BrainConnect Lane 4). Built once, guarded like linear_sync: a deployment
     # without the router package/config degrades that one route to 503.
     app.state.router = router_from_env() if router is _UNSET else router
+    # The Linear webhook signing secret (see `routes_linear.webhook`). `_UNSET`
+    # (the normal case) reads the environment; a test may pass `None` explicitly
+    # to exercise the fail-closed "secret not configured" path, or a real secret to
+    # exercise signature verification, without touching `os.environ`.
+    app.state.linear_webhook_secret = (
+        linear_webhook_secret_from_env() if linear_webhook_secret is _UNSET
+        else linear_webhook_secret
+    )
 
     @app.exception_handler(AgentConnectError)
     async def _backplane_error(_: Request, exc: AgentConnectError) -> JSONResponse:

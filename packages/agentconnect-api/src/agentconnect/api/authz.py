@@ -98,8 +98,17 @@ ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/reviews/{review_id}/complete"): "complete_review",
 }
 
-#: Routes exempt from Linear's unauthenticated webhook problem are *not* exempt here.
-#: The webhook is signed by Linear, not by us, and it is registered separately below.
+#: Exempt from the *token* check performed here — not exempt from authentication.
+#: `routes_linear.webhook` verifies Linear's own signature (HMAC-SHA256 over the
+#: raw body against `LINEAR_WEBHOOK_SECRET`, delivered in `Linear-Signature`)
+#: itself, since Linear cannot mint a bearer token for this deployment. That
+#: verification is fail-closed: when `LINEAR_WEBHOOK_SECRET` is unset the route
+#: refuses to serve (503) rather than accept an unsigned payload — see
+#: `deps.linear_webhook_secret_from_env`. Previously this route had *no*
+#: signature check at all despite the comment claiming Linear signed it, which let
+#: any caller reaching the port forge `approve_subtask` / `deny_subtask` /
+#: `complete_task` / `request_review` calls; that gap is what this frozenset and
+#: the verification in `routes_linear.webhook` now close together.
 WEBHOOK_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/linear/webhook"),
 })

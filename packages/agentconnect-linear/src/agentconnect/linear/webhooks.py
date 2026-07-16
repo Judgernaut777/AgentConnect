@@ -132,6 +132,17 @@ def _issue_id(data: dict[str, Any]) -> Optional[str]:
 
 
 def _actor(data: dict[str, Any]) -> str:
+    """Who Linear says did this. Trustworthy only because the caller is verified.
+
+    This module has no way to check that itself — it is handed an already-parsed
+    payload, not the raw request. It relies on `agentconnect.api.routes_linear.webhook`
+    having verified the delivery's HMAC-SHA256 signature against
+    `LINEAR_WEBHOOK_SECRET` before `handle_webhook` is ever called with this data.
+    Once that holds, `data.user`/`data.actor` is Linear's own attribution (the same
+    name Linear's UI shows), not an arbitrary caller's unverified claim — but it is
+    still not an AgentConnect operator identity, so it is recorded as the
+    Linear-sourced actor string, never promoted to `Principal.is_operator`.
+    """
     user = data.get("user") or data.get("actor") or {}
     if isinstance(user, dict):
         return str(user.get("name") or user.get("displayName") or "linear")

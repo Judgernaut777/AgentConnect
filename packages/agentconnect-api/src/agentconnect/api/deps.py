@@ -80,3 +80,22 @@ def linear_sync_from_env(service: AgentConnectService) -> Optional[object]:
     return LinearSync(
         service, client, team_id, artifact_base_url=os.environ.get("AGENTCONNECT_BASE_URL")
     )
+
+
+def linear_webhook_secret_from_env() -> Optional[str]:
+    """The shared secret Linear signs `POST /linear/webhook` deliveries with.
+
+    Linear computes ``hmac_sha256(secret, raw_body)`` and sends the hex digest in
+    the ``Linear-Signature`` header (Settings -> API -> Webhooks in Linear). We
+    verify that in `routes_linear.webhook` against the *raw* body, before any JSON
+    parsing.
+
+    Returns `None` when unset. That is deliberately **not** treated as "webhooks
+    disabled but harmless": `routes_linear.webhook` fails closed and refuses to
+    serve (503) rather than accept an unsigned payload, because an unsigned
+    delivery on this route can drive `approve_subtask` / `deny_subtask` /
+    `complete_task` / `request_review` — the same operator-gated actions the rest
+    of the API requires a token for.
+    """
+    secret = os.environ.get("LINEAR_WEBHOOK_SECRET")
+    return secret if secret else None

@@ -125,6 +125,7 @@ def actions_for(mode: SessionMode) -> frozenset[str]:
 #: Credentials that must never reach a proprietary agent (compliance §8).
 SECRET_DENYLIST: frozenset[str] = frozenset({
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "LINEAR_API_KEY",
+    "LINEAR_WEBHOOK_SECRET",
     "TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_CLIENT_CERT",
     "TEMPORAL_CLIENT_KEY",
     "WIKIBRAIN_ADMIN_TOKEN", "WIKIBRAIN_WRITE_TOKEN",
