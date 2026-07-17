@@ -63,7 +63,7 @@ from agentconnect.core.workers import WorkerArtifactRef  # noqa: E402
 
 # The sibling ToolConnect checkout supplies the *server* (and its cedarpy dep) — the
 # demo stands up a real one. AgentConnect never imports it; it only speaks HTTP.
-TOOLCONNECT_ROOT = Path("/home/mini/ToolConnect")
+TOOLCONNECT_ROOT = Path(os.environ.get("TOOLCONNECT_ROOT", "/home/mini/ToolConnect"))
 TOOLCONNECT_PY = TOOLCONNECT_ROOT / ".venv" / "bin" / "python"
 
 HOST = "127.0.0.1"
