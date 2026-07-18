@@ -103,6 +103,22 @@ def test_mcp_round_trips_the_service(svc):
     assert "Keep validation in auth/session.py." in handoff["summary"]
 
 
+def test_mcp_submit_subtask_passes_depends_on_through(svc, task):
+    mcp = build_mcp_server(service=svc)
+    a = _call(mcp, "submit_subtask", task_id=task.id, title="A", instructions="i")
+    assert a["status"] == "succeeded"
+
+    b = _call(mcp, "submit_subtask", task_id=task.id, title="B", instructions="j",
+              depends_on=[a["subtask_id"]])
+    # `svc` only has echo_worker, so A already succeeded by the time B is
+    # submitted — this proves the field reaches the service, not that it
+    # blocks (that path is covered against a real approval gate elsewhere).
+    assert b["status"] == "succeeded"
+    assert b["depends_on"] == [a["subtask_id"]]
+    stored = svc.get_subtask(b["subtask_id"]).subtask
+    assert stored.depends_on == [a["subtask_id"]]
+
+
 def test_mcp_never_inlines_artifact_bodies(svc, task):
     mcp = build_mcp_server(service=svc)
     svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="secret body text"))

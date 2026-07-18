@@ -197,6 +197,7 @@ def _cmd_subtasks_submit(svc: AgentConnectService, a: argparse.Namespace) -> Non
             filesystem=FilesystemAccess(a.filesystem), network=a.network, shell=a.shell
         ),
         required_capabilities=a.capability or [],
+        depends_on=a.depends_on or [],
     )))
 
 
@@ -901,6 +902,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--network", action="store_true")
     p.add_argument("--shell", action="store_true")
     p.add_argument("--capability", action="append")
+    p.add_argument("--depends-on", dest="depends_on", action="append",
+                   help="subtask id this one must wait on (repeatable)")
     p.set_defaults(func=_cmd_subtasks_submit)
 
     p = subtasks.add_parser("show")

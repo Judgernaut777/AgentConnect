@@ -11,6 +11,15 @@ from .errors import Conflict
 from .models import SandboxSpec, Subtask, SubtaskStatus
 
 TRANSITIONS: dict[SubtaskStatus, frozenset[SubtaskStatus]] = {
+    # `blocked` is only ever entered at creation time (`submit_subtask` sets it
+    # directly, not via `check_transition`, since there is no prior status to
+    # transition from). From here it only ever moves to `queued` — released by
+    # `AgentConnectService.release_ready_subtasks` once every dependency has
+    # succeeded — or straight to a terminal state if cancelled/denied while
+    # still waiting.
+    SubtaskStatus.blocked: frozenset(
+        {SubtaskStatus.queued, SubtaskStatus.failed, SubtaskStatus.cancelled}
+    ),
     SubtaskStatus.queued: frozenset(
         {SubtaskStatus.running, SubtaskStatus.needs_approval, SubtaskStatus.failed,
          SubtaskStatus.cancelled}

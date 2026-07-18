@@ -102,6 +102,12 @@ class SubtaskStatus(str, Enum):
     failed = "failed"
     cancelled = "cancelled"
     needs_approval = "needs_approval"
+    #: Parked on an unmet `depends_on` entry (§9, subtask dependencies). Never
+    #: routed, never dispatched — distinct from `queued`, which is routable
+    #: immediately. `AgentConnectService.release_ready_subtasks` moves a
+    #: `blocked` subtask to `queued` (and dispatches it) once every dependency
+    #: reaches `succeeded`.
+    blocked = "blocked"
 
 
 class PrivacyTier(str, Enum):
@@ -320,6 +326,11 @@ class Subtask(BaseModel):
     approved_by: Optional[str] = None
     approved_max_cost_usd: Optional[float] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    #: Other subtask ids (within the same task) that must reach `succeeded`
+    #: before this one may be dispatched. Empty (the default) is today's
+    #: behavior unchanged: dispatch immediately on submit. See
+    #: `AgentConnectService.submit_subtask` / `release_ready_subtasks`.
+    depends_on: list[str] = Field(default_factory=list)
     #: Observability delegation record (Part IV): this subtask's own delegation id
     #: and its delegating parent (the manager session, or a parent subtask under
     #: hierarchical delegation), so the tree is built from records not tmux layout.
@@ -600,6 +611,10 @@ class SubtaskRequest(BaseModel):
     sandbox: SandboxSpec = Field(default_factory=SandboxSpec)
     required_capabilities: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    #: Subtask ids (already submitted, in this same task) this one must wait
+    #: on. Default empty — omitting it is byte-identical to today's behavior:
+    #: `submit_subtask` dispatches immediately. See `Subtask.depends_on`.
+    depends_on: list[str] = Field(default_factory=list)
 
 
 class SubtaskDetail(BaseModel):

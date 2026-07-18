@@ -56,6 +56,12 @@ class EventType(str, Enum):
     subtask_routed = "subtask.routed"
     subtask_approved = "subtask.approved"
     subtask_denied = "subtask.denied"
+    #: Parked at creation on an unmet `depends_on` entry — never routed, no
+    #: worker spawned (subtask dependencies, §9).
+    subtask_blocked = "subtask.blocked"
+    #: Every `depends_on` entry reached `succeeded`; the subtask just moved
+    #: `blocked -> queued` and was handed to the execution backend.
+    subtask_released = "subtask.released"
 
     # Worker run
     worker_spawned = "worker.spawned"
@@ -153,6 +159,8 @@ DEFAULT_STATE_FOR_EVENT: dict[EventType, ObservationState] = {
     EventType.subtask_routed: ObservationState.starting,
     EventType.subtask_approved: ObservationState.working,
     EventType.subtask_denied: ObservationState.blocked,
+    EventType.subtask_blocked: ObservationState.blocked,
+    EventType.subtask_released: ObservationState.starting,
     EventType.worker_spawned: ObservationState.starting,
     EventType.worker_started: ObservationState.working,
     EventType.worker_completed: ObservationState.done,

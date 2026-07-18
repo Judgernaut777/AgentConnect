@@ -15,6 +15,7 @@ from agentconnect.core import (
     CreateTaskRequest,
     EchoWorker,
     FilesystemAccess,
+    InvalidRequest,
     PrivacyTier,
     RawModelWorker,
     RoutePolicy,
@@ -323,6 +324,118 @@ def test_local_free_worker_wins_without_any_approval(tmp_path):
         title="t", instructions="i", privacy_tier=PrivacyTier.public))
     assert subtask.status is SubtaskStatus.succeeded
     assert subtask.assigned_worker == "local_qwen_worker"
+
+
+# ------------------------------------------------------- subtask dependencies
+def test_dependent_subtask_is_blocked_and_never_dispatched(tmp_path):
+    # `required_capabilities=["generate"]` filters echo_worker out of A's
+    # routing (it lacks that tag), so only the cloud worker is eligible — and
+    # a cloud worker always needs approval, which keeps A open (not succeeded)
+    # long enough to submit a dependent against it.
+    svc = make_service(
+        tmp_path, [cloud_worker(), EchoWorker()], policy=RoutePolicy(max_cost_usd=10.0))
+    task = svc.create_task(CreateTaskRequest(title="t"))
+    a = svc.submit_subtask(task.id, SubtaskRequest(
+        title="A", instructions="i", privacy_tier=PrivacyTier.public,
+        required_capabilities=["generate"],
+    ))
+    assert a.status is SubtaskStatus.needs_approval  # not yet succeeded
+
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.blocked
+    assert b.depends_on == [a.id]
+    assert b.metadata.get("blocked_on") == [a.id]
+    # Never dispatched: no worker run, no execution handle.
+    assert svc.storage.list_runs(b.id) == []
+    assert svc.executions_for("subtask", b.id) == []
+    assert "subtask_blocked" in [e.kind for e in svc.list_events(task.id)]
+
+
+def test_dependent_subtask_releases_and_runs_once_dependency_succeeds(tmp_path):
+    svc = make_service(
+        tmp_path, [cloud_worker(), EchoWorker()], policy=RoutePolicy(max_cost_usd=10.0))
+    task = svc.create_task(CreateTaskRequest(title="t"))
+    a = svc.submit_subtask(task.id, SubtaskRequest(
+        title="A", instructions="i", privacy_tier=PrivacyTier.public,
+        required_capabilities=["generate"],
+    ))
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.blocked
+
+    approved = svc.approve_subtask(a.id, "matthew", max_cost_usd=3.0)
+    assert approved.status is SubtaskStatus.succeeded
+
+    # B was released and actually ran (via echo_worker, the only eligible
+    # worker with no `required_capabilities` gate) — not merely relabeled.
+    released = svc.get_subtask(b.id).subtask
+    assert released.status is SubtaskStatus.succeeded
+    assert released.assigned_worker == "echo_worker"
+    assert "blocked_on" not in released.metadata
+    assert svc.storage.list_runs(b.id)
+
+    # Order proof: blocked, then A approved, then B released — in that order.
+    # `list_events` returns newest-first, so oldest-first is the reverse.
+    kinds = [e.kind for e in reversed(svc.list_events(task.id))]
+    assert (
+        kinds.index("subtask_blocked")
+        < kinds.index("subtask_approved")
+        < kinds.index("subtask_released")
+    )
+
+
+def test_depends_on_already_satisfied_dispatches_immediately(task_svc):
+    """A dependency that already succeeded before the dependent is submitted
+    is not a wait at all — the dependent runs right away, same as `queued`."""
+    svc, task = task_svc
+    a = svc.submit_subtask(task.id, SubtaskRequest(title="A", instructions="i"))
+    assert a.status is SubtaskStatus.succeeded
+
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.succeeded
+    assert b.depends_on == [a.id]
+
+
+def test_depends_on_unknown_id_is_invalid_request(task_svc):
+    svc, task = task_svc
+    with pytest.raises(InvalidRequest):
+        svc.submit_subtask(task.id, SubtaskRequest(
+            title="B", instructions="j", depends_on=["subtask_doesnotexist"]))
+    # Rejected before anything was written.
+    assert svc.get_task(task.id).subtasks == []
+
+
+def test_dependency_cycle_is_invalid_request(task_svc):
+    svc, task = task_svc
+    a = svc.submit_subtask(task.id, SubtaskRequest(title="A", instructions="i"))
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+
+    # Manufacture a cycle directly in storage. This cannot happen through
+    # `submit_subtask` alone — dependency ids are server-minted at submission
+    # time, so a caller can only ever name something that already exists, and
+    # a graph built purely from "point at something that already exists"
+    # edges is necessarily a DAG. A cycle could still reach storage via a
+    # future batch/plan API or a direct edit, so the guard is real; this is
+    # how a test forces one into existence to prove the guard fires.
+    svc.storage.update_subtask(a.id, depends_on=[b.id])
+
+    with pytest.raises(InvalidRequest):
+        svc.submit_subtask(task.id, SubtaskRequest(
+            title="C", instructions="k", depends_on=[a.id]))
+
+
+def test_depends_on_omitted_is_unchanged_from_before(task_svc):
+    """Regression guard: default (empty) `depends_on` must be byte-identical
+    to pre-dependency behavior — dispatched immediately, no blocked status,
+    no blocked_on metadata."""
+    svc, task = task_svc
+    subtask = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+    assert subtask.status is SubtaskStatus.succeeded
+    assert subtask.depends_on == []
+    assert "blocked_on" not in subtask.metadata
 
 
 # ------------------------------------------------------------------ subtask ops

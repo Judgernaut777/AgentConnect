@@ -789,22 +789,45 @@ class AgentConnectService:
         This returns as soon as the backend has a handle. Under Temporal that is
         immediately after `start_workflow` — the worker has not run yet and the
         caller must poll. Under the direct backend the work has already happened
-        by the time we return, because there is nothing to wait on."""
+        by the time we return, because there is nothing to wait on.
+
+        `request.depends_on` (default empty — unchanged behavior) names other
+        subtasks in this task that must reach `succeeded` first. Validated and
+        resolved *before* anything is persisted: an unknown id or a dependency
+        cycle raises `InvalidRequest` and nothing is written. If any dependency
+        has not yet succeeded, the subtask is created `blocked` and never
+        dispatched — no routing, no governor spend, no worker — until
+        `release_ready_subtasks` moves it to `queued`.
+        """
         task = self._require_task(task_id)
         if task.status in TERMINAL_TASK_STATUSES:
             raise Conflict(f"task {task_id} is {task.status.value}; cannot accept subtasks")
+        self._validate_dependencies(task_id, request.depends_on)
         now = self._now()
         # A subtask is a delegation. It gets its own delegation id and points at the
         # delegating manager session's delegation (or a caller-supplied parent, for
         # hierarchical delegation), so the agent tree is reconstructable from records.
         parent_delegation = request.metadata.get("parent_delegation_id") or \
             self._parent_delegation_for_task(task_id)
+        unmet = self._unmet_dependencies(request.depends_on)
+        # Representation choice for "waiting on a dependency": a dedicated
+        # `SubtaskStatus.blocked` (so every other reader — inbox, handoff,
+        # `list_subtasks` — sees an honest status instead of a `queued` subtask
+        # that mysteriously never runs) *plus* a `blocked_on` metadata entry
+        # naming exactly which ids are still outstanding, which costs nothing
+        # extra (metadata is already a stored column) and saves a human from
+        # re-deriving the unmet set from `depends_on` + sibling lookups.
+        metadata = dict(request.metadata)
+        if unmet:
+            metadata["blocked_on"] = unmet
         subtask = Subtask(
             id=ids.new_id(ids.SUBTASK), parent_task_id=task_id, title=request.title,
-            instructions=request.instructions, status=SubtaskStatus.queued,
+            instructions=request.instructions,
+            status=SubtaskStatus.blocked if unmet else SubtaskStatus.queued,
             privacy_tier=request.privacy_tier, preferred_worker=request.preferred_worker,
             created_at=now, updated_at=now, sandbox=request.sandbox,
-            required_capabilities=request.required_capabilities, metadata=request.metadata,
+            required_capabilities=request.required_capabilities, metadata=metadata,
+            depends_on=list(request.depends_on),
             delegation_id=self._new_delegation_id(), parent_delegation_id=parent_delegation,
         )
         self.storage.insert_subtask(subtask)
@@ -813,9 +836,122 @@ class AgentConnectService:
                       parent_delegation_id=subtask.parent_delegation_id,
                       agent_role="worker", agent_id=request.preferred_worker or "unrouted",
                       metadata={"title": subtask.title,
-                                "privacy_tier": subtask.privacy_tier.value})
+                                "privacy_tier": subtask.privacy_tier.value,
+                                "depends_on": subtask.depends_on})
+        if subtask.status is SubtaskStatus.blocked:
+            self.record_event(
+                task_id, "subtask_blocked", "system",
+                {"subtask_id": subtask.id, "blocked_on": unmet},
+            )
+            self._observe(EventType.subtask_blocked, task_id=task_id, subtask_id=subtask.id,
+                          delegation_id=subtask.delegation_id,
+                          parent_delegation_id=subtask.parent_delegation_id,
+                          agent_role="worker", metadata={"blocked_on": unmet})
+            # Parked: no execution handle is created, so `get_status`/inbox never
+            # show a phantom in-flight run. `release_ready_subtasks` (called from
+            # `_record_result` whenever a sibling subtask in this task succeeds)
+            # is what eventually calls `execution.start_subtask` for this id.
+            return self._require_subtask(subtask.id)
         self.execution.start_subtask(subtask.id)
         return self._require_subtask(subtask.id)
+
+    def _unmet_dependencies(self, depends_on: list[str]) -> list[str]:
+        """Dependency ids not (yet) `succeeded`. Empty means dispatch now."""
+        unmet = []
+        for dep_id in depends_on:
+            dep = self.storage.get_subtask(dep_id)
+            if dep is None or dep.status is not SubtaskStatus.succeeded:
+                unmet.append(dep_id)
+        return unmet
+
+    def _validate_dependencies(self, task_id: str, depends_on: list[str]) -> None:
+        """Reject an unknown dependency id or a dependency cycle before anything
+        about the new subtask is persisted.
+
+        A *true* cycle cannot actually be constructed through this API alone:
+        subtask ids are minted server-side at submission time, so a caller can
+        only ever name ids that already exist, and a dependency graph built
+        purely from "point at something that already exists" edges is
+        necessarily a DAG. The walk below is still real, not decorative — it
+        protects against a future batch/plan submission API (or a direct
+        storage edit) introducing a cycle that this single-subtask path alone
+        cannot, and it is exercised in tests via exactly that route.
+        """
+        for dep_id in depends_on:
+            dep = self.storage.get_subtask(dep_id)
+            if dep is None or dep.parent_task_id != task_id:
+                raise InvalidRequest(
+                    f"depends_on references unknown subtask {dep_id!r} in task {task_id!r}"
+                )
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def walk(subtask_id: str) -> None:
+            if subtask_id in visited:
+                return
+            if subtask_id in visiting:
+                raise InvalidRequest(
+                    f"dependency cycle detected at subtask {subtask_id!r}"
+                )
+            visiting.add(subtask_id)
+            dep = self.storage.get_subtask(subtask_id)
+            for next_id in (dep.depends_on if dep is not None else ()):
+                walk(next_id)
+            visiting.discard(subtask_id)
+            visited.add(subtask_id)
+
+        for dep_id in depends_on:
+            walk(dep_id)
+
+    def release_ready_subtasks(self, task_id: str) -> list[Subtask]:
+        """Dispatch every `blocked` subtask in this task whose `depends_on` are
+        now all `succeeded`.
+
+        Called from `_record_result` each time a subtask succeeds. The direct
+        execution backend has no standing scheduler loop to hang a real
+        event-driven dispatch off, so the completion path drives release
+        itself — this method is that hook, and it is what actually runs a
+        dependent, not just relabels it.
+
+        A single scan of `list_subtasks` is enough even for a dependency chain
+        or fan-out: dispatching a newly-released subtask can itself complete
+        synchronously (the direct backend runs inline) and recursively land
+        back in this method for the *same* task before this call returns. Each
+        candidate here therefore re-fetches its live status immediately before
+        mutating it — a stale snapshot would otherwise re-release (or clobber)
+        a subtask a nested call already finished.
+        """
+        released: list[Subtask] = []
+        candidates = [
+            s for s in self.storage.list_subtasks(task_id)
+            if s.status is SubtaskStatus.blocked and not self._unmet_dependencies(s.depends_on)
+        ]
+        for candidate in candidates:
+            current = self._require_subtask(candidate.id)
+            if current.status is not SubtaskStatus.blocked:
+                continue  # a nested release (see above) already handled it
+            if self._unmet_dependencies(current.depends_on):
+                continue  # went stale between the scan and now
+            subtasks_policy.check_transition(current, SubtaskStatus.queued)
+            metadata = dict(current.metadata)
+            metadata.pop("blocked_on", None)
+            self.storage.update_subtask(
+                current.id, status=SubtaskStatus.queued.value, metadata=metadata,
+                updated_at=self._now(),
+            )
+            self.record_event(
+                task_id, "subtask_released", "system",
+                {"subtask_id": current.id, "depends_on": current.depends_on},
+            )
+            self._observe(EventType.subtask_released, task_id=task_id, subtask_id=current.id,
+                          delegation_id=current.delegation_id,
+                          parent_delegation_id=current.parent_delegation_id,
+                          agent_role="worker",
+                          metadata={"depends_on": current.depends_on})
+            self.execution.start_subtask(current.id)
+            released.append(self._require_subtask(current.id))
+        return released
 
     def grant_approval(
         self, subtask_id: str, approved_by: str, max_cost_usd: Optional[float] = None
@@ -1226,6 +1362,12 @@ class AgentConnectService:
                 metadata={"summary": summary[:120]},
             )
         self._settle_parent_after_subtask(subtask.parent_task_id)
+        if succeeded:
+            # Auto-release (spec: subtask dependencies): a sibling subtask that
+            # was `blocked` on this one may now have every dependency satisfied.
+            # This is the one place a subtask ever reaches `succeeded`, so it is
+            # the correct — and only needed — hook for the completion path.
+            self.release_ready_subtasks(subtask.parent_task_id)
         return self._require_subtask(subtask.id)
 
     def _block_subtask_on_governor(

@@ -116,7 +116,12 @@ def compact_subtask(subtask: Subtask, handle: Optional[Any] = None) -> dict[str,
             "estimated_cost_usd": reason.get("estimated_cost_usd"),
         }
 
-    if subtask.status is SubtaskStatus.needs_approval:
+    if subtask.status is SubtaskStatus.blocked:
+        next_action = (
+            f"nothing to do — waiting on {subtask.metadata.get('blocked_on') or subtask.depends_on}"
+            " to succeed; it will start automatically"
+        )
+    elif subtask.status is SubtaskStatus.needs_approval:
         next_action = "a human must approve this route in Linear or via the CLI/API"
     elif subtask.status is SubtaskStatus.succeeded and subtask.result_artifact_id:
         next_action = f"read_artifact_chunk({subtask.result_artifact_id})"
@@ -131,6 +136,7 @@ def compact_subtask(subtask: Subtask, handle: Optional[Any] = None) -> dict[str,
         "privacy_tier": subtask.privacy_tier.value,
         "assigned_worker": subtask.assigned_worker,
         "result_artifact_id": subtask.result_artifact_id,
+        "depends_on": subtask.depends_on,
         "route": route,
         "next_action": next_action,
     }

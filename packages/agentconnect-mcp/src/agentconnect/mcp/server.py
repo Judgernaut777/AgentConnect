@@ -282,11 +282,15 @@ def build_mcp_server(
         network: bool = False,
         shell: bool = False,
         required_capabilities: Optional[list[str]] = None,
+        depends_on: Optional[list[str]] = None,
     ) -> str:
         """Delegate bounded work to a worker. Routing is deterministic and runs
         immediately; the response tells you which worker took it and where the
         output landed. If the only eligible worker costs money, the subtask parks
-        in needs_approval until a human approves it."""
+        in needs_approval until a human approves it. Pass `depends_on` (other
+        subtask ids in this task) to gate this one on them finishing first: it is
+        created `blocked` and dispatched automatically once every dependency
+        succeeds, instead of running immediately."""
         try:
             subtask = svc.submit_subtask(_task(task_id), SubtaskRequest(
                 title=title, instructions=instructions,
@@ -295,6 +299,7 @@ def build_mcp_server(
                     filesystem=FilesystemAccess(filesystem), network=network, shell=shell
                 ),
                 required_capabilities=required_capabilities or [],
+                depends_on=depends_on or [],
             ))
         except (AgentConnectError, ValueError) as exc:
             return _err(exc)

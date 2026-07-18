@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS subtasks (
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
     approved_by TEXT, approved_max_cost_usd REAL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    delegation_id TEXT, parent_delegation_id TEXT
+    delegation_id TEXT, parent_delegation_id TEXT,
+    depends_on_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS worker_runs (
     id TEXT PRIMARY KEY, subtask_id TEXT NOT NULL, worker_id TEXT NOT NULL,
@@ -193,7 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_task ON observation_handles(task_id);
 #: delegation ids make the agent tree and cross-entity correlation reconstructable
 #: from the ledger without guessing from timestamps (observability handoff §Part IV).
 _MIGRATIONS: dict[str, tuple[str, ...]] = {
-    "subtasks": ("delegation_id", "parent_delegation_id"),
+    "subtasks": ("delegation_id", "parent_delegation_id", "depends_on_json"),
     "reviews": ("delegation_id", "parent_delegation_id"),
     "manager_sessions": ("delegation_id", "parent_delegation_id"),
 }
@@ -582,14 +583,15 @@ class SqliteStorage:
                 "INSERT INTO subtasks (id,parent_task_id,title,instructions,status,privacy_tier,"
                 "preferred_worker,assigned_worker,created_at,updated_at,result_artifact_id,"
                 "route_reason_json,sandbox_json,required_capabilities_json,approved_by,"
-                "approved_max_cost_usd,metadata_json,delegation_id,parent_delegation_id)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "approved_max_cost_usd,metadata_json,delegation_id,parent_delegation_id,"
+                "depends_on_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.id, s.parent_task_id, s.title, s.instructions, s.status.value,
                  s.privacy_tier.value, s.preferred_worker, s.assigned_worker, s.created_at,
                  s.updated_at, s.result_artifact_id, _j(s.route_reason),
                  _j(s.sandbox.model_dump(mode="json")), _j(s.required_capabilities),
                  s.approved_by, s.approved_max_cost_usd, _j(s.metadata),
-                 s.delegation_id, s.parent_delegation_id),
+                 s.delegation_id, s.parent_delegation_id, _j(s.depends_on)),
             )
         return s
 
@@ -607,6 +609,8 @@ class SqliteStorage:
             fields["route_reason_json"] = _j(fields.pop("route_reason"))
         if "metadata" in fields:
             fields["metadata_json"] = _j(fields.pop("metadata"))
+        if "depends_on" in fields:
+            fields["depends_on_json"] = _j(fields.pop("depends_on"))
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE subtasks SET {cols} WHERE id=?", (*fields.values(), subtask_id))
@@ -632,6 +636,10 @@ class SqliteStorage:
             approved_by=r["approved_by"], approved_max_cost_usd=r["approved_max_cost_usd"],
             metadata=_u(r["metadata_json"], {}),
             delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
+            #: NULL on a database migrated forward from before this column existed
+            #: (a plain `ALTER TABLE ADD COLUMN`, backfilled with no default);
+            #: `_u` treats that exactly like an absent key: no dependencies.
+            depends_on=_u(r["depends_on_json"], []),
         )
 
     # --------------------------------------------------------- worker runs
