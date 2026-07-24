@@ -26,7 +26,11 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agentconnect.common.schemas import Priority, PrivacyClass, RoutingDecision
-from agentconnect.router.routing import RoutingContext
+
+# ``RoutingContext`` is imported lazily inside the handler: the router package is an
+# optional install (README: without it this route degrades to a 503), so a module-top
+# import would crash app startup with ``ModuleNotFoundError`` on a core+api-only
+# deployment before the documented 503 ever had a chance to answer.
 
 router = APIRouter(tags=["route"])
 
@@ -67,6 +71,10 @@ def _router(request: Request):
 @router.post("/route/decide", response_model=RoutingDecision)
 def decide_route(body: RouteDecideBody, request: Request) -> RoutingDecision:
     """Compute a routing decision for ``body`` without executing anything."""
+    built = _router(request)  # 503 first — only a deployment WITH a router proceeds
+    # Safe here: a built router proves the router package is importable.
+    from agentconnect.router.routing import RoutingContext
+
     ctx = RoutingContext(
         task_id=body.task_id,
         privacy_class=body.privacy_class,
@@ -83,4 +91,4 @@ def decide_route(body: RouteDecideBody, request: Request) -> RoutingDecision:
         pending_same_model_batch=body.pending_same_model_batch,
         allow_rented=body.allow_rented,
     )
-    return _router(request).decide_route(ctx)
+    return built.decide_route(ctx)

@@ -138,8 +138,9 @@ class HttpLocalComputeProvider(LocalComputeProvider):
         self._timeout = timeout
         #: Optional bearer credential, sent verbatim as the ``Authorization``
         #: header (mirrors the memory adapters — the caller writes ``Bearer <t>``
-        #: if the server wants that prefix). Never logged. ComputeConnect is
-        #: unauthenticated on loopback today; this is forward-compat.
+        #: if the server wants that prefix). Never logged. ComputeConnect v0.1.0
+        #: enforces bearer auth when its ``COMPUTECONNECT_TOKEN`` is set, so the
+        #: value must then carry the ``Bearer `` prefix.
         self._token = token or None
 
     def _call(self, method: str, path: str, payload: Optional[dict] = None) -> dict[str, Any]:

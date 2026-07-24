@@ -8,8 +8,10 @@ per-tier access model.
 The memory store is [BrainConnect](https://github.com/Judgernaut777/BrainConnect) — a
 human-gated knowledge base exposed over MCP (`brain_capture` to write, `brain_recall` /
 `brain_search` / `brain_graph` / `brain_hybrid` to read). It is **optional**; AgentConnect
-runs without it. BrainConnect was renamed from *WikiBrain* and its code still says
-`wikibrain` — the `wiki` CLI below is not a typo.
+runs without it. BrainConnect was renamed from *WikiBrain*; the installed console
+script is `brainconnect` (the old `wiki` entry point no longer ships —
+`McpStdioMemorySink` auto-discovers `brainconnect` and falls back to `wiki` only when
+no command is given).
 
 ## The one-way rule
 
@@ -34,12 +36,12 @@ the hardest part of a symmetric design.
 
 ## Two faces of the same brain
 
-BrainConnect gates its MCP tools by mode (`wiki mcp serve [--read-only|--contribute-only]`):
+BrainConnect gates its MCP tools by mode (`brainconnect mcp serve [--read-only|--contribute-only]`):
 
 | Face | Command | Tools exposed |
 |---|---|---|
-| **Worker-facing** | `wiki mcp serve --contribute-only` | `brain_capture` **only** — write-only, no recall |
-| **Manager-facing** | `wiki mcp serve` (or `--read-only`) | full recall (`brain_recall` / `search` / `graph` / `hybrid`) |
+| **Worker-facing** | `brainconnect mcp serve --contribute-only` | `brain_capture` **only** — write-only, no recall |
+| **Manager-facing** | `brainconnect mcp serve` (or `--read-only`) | full recall (`brain_recall` / `search` / `graph` / `hybrid`) |
 
 `--contribute-only` is the inverse of the existing `--read-only` mode; the two flags are
 mutually exclusive. The worker fleet points at the contribute-only server; the manager
@@ -80,9 +82,9 @@ from agentconnect.runtime import (
 )
 
 sink = McpStdioMemorySink(
-    command="wiki",
+    command="brainconnect",
     args=["mcp", "serve", "--contribute-only"],
-    cwd="/path/to/your/wiki-brain/repo",
+    cwd="/path/to/your/brainconnect/repo",
     harness="agentconnect",
 )
 runtime = LangGraphAgentRuntime(
@@ -92,5 +94,5 @@ runtime = LangGraphAgentRuntime(
 )
 ```
 
-The manager, separately, adds a **recall-capable** BrainConnect (`wiki mcp serve`) to its
-own MCP client config — never exposed to workers.
+The manager, separately, adds a **recall-capable** BrainConnect (`brainconnect mcp serve`)
+to its own MCP client config — never exposed to workers.
