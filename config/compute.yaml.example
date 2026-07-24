@@ -8,8 +8,10 @@
 # routing simply never sees a `local_model_manager` worker and AgentConnect runs
 # exactly as it does standalone.
 #
-# Precedence (byte-for-byte with memory.yaml):
+# Precedence (env wins over file for the URL):
 #   AGENTCONNECT_COMPUTE_URL (env)  ->  compute.base_url (this file)  ->  off.
+# Unlike memory backends, the env URL activates the subsystem even when this
+# file says `enabled: false`.
 # A malformed `compute:` block degrades to off with a warning — a missing compute
 # plane is a smaller problem than a wrong one.
 compute:

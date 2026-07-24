@@ -16,7 +16,9 @@ transport double — but it serves canned responses and never touches WikiBrain.
 job is to prove the wire works, not the ledger. Real WikiBrain semantics are pinned
 in `test_wikibrain_integration.py`, which drives `wiki.api` in-process through a
 transport shim. Neither test has both halves at once: nothing here exercises real
-WikiBrain over real HTTP, and nothing will until WikiBrain ships `wiki serve`.
+WikiBrain over real HTTP. BrainConnect now ships `brainconnect serve` (HTTP,
+default 127.0.0.1:8787), so a both-halves test is unblocked — it just does not
+exist yet.
 
 The twelve steps of the loop, in order:
 

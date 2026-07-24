@@ -105,8 +105,9 @@ class NeverRunWorker(WorkerAdapter):
 class ToolWorker(WorkerAdapter):
     """A worker with a declared multi-tool set that DOES run when authorized."""
 
-    def __init__(self, tools):
+    def __init__(self, tools, location=WorkerLocation.local):
         self._tools = list(tools)
+        self._location = location
         self.ran = False
 
     @property
@@ -118,7 +119,7 @@ class ToolWorker(WorkerAdapter):
             worker_id="tool_worker", harness="demo_harness", tools=self._tools,
             privacy_tiers=list(PrivacyTier),
             capability_tags=["echo", "inspect", "summarize", "generate"],
-            location=WorkerLocation.local,
+            location=self._location,
         )
 
     def run(self, subtask, context) -> WorkerResult:
@@ -185,6 +186,24 @@ def test_allowed_declared_set_runs_and_fires_a_real_decision(tmp_path):
     assert all(e["metadata"]["allowed"] is True for e in ta)
     # Outcome recorded best-effort as a grant (not a fabricated invocation result).
     assert {o for _, o, _ in gov.records} == {"authorized"}
+    # A local worker authorizes as a "local" principal — passed through unchanged.
+    assert all(p["privacy_tier"] == "local" for _, _, p, _ in gov.calls)
+
+
+def test_cloud_worker_principal_uses_toolconnects_trusted_cloud_tier(tmp_path):
+    # ToolConnect's tier vocabulary is {local, trusted-cloud, rented}; a raw "cloud"
+    # would rank as unknown (worst) and be unmatchable by Cedar policies written
+    # against "trusted-cloud". The chokepoint must translate the one mismatched value.
+    gov = FakeGovernor()
+    svc = _service(tmp_path, [ToolWorker(["generate"], location=WorkerLocation.cloud)],
+                   observe=False)
+    svc.bind_tool_governor(gov)
+    task = svc.create_task(CreateTaskRequest(title="T"))
+    sub = svc.submit_subtask(task.id, SubtaskRequest(title="t", instructions="i"))
+
+    assert sub.status is SubtaskStatus.succeeded
+    assert gov.calls and all(p["privacy_tier"] == "trusted-cloud"
+                             for _, _, p, _ in gov.calls)
 
 
 # ------------------------------------------------------------ governor denies a tool

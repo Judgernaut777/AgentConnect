@@ -105,9 +105,14 @@ def capture(body: CaptureBody, request: Request) -> dict[str, Any]:
 
 @router.post("/memory/feedback", status_code=202)
 def feedback(body: FeedbackBody, request: Request) -> dict[str, Any]:
+    # Resolve the actor at the route, like `capture` does: a missing actor_id
+    # defaults to the token's principal (BrainConnect refuses feedback without one,
+    # and the service swallows backend errors — so forwarding None would be a
+    # silent no-op), and a spoofed actor_id is a 403.
+    who = assert_actor(request, body.actor_id)
     service(request).record_memory_feedback(MemoryFeedbackRequest(
         task_id=body.task_id, memory_item_id=body.memory_item_id, source_id=body.source_id,
-        feedback=body.feedback, actor_id=body.actor_id, note=body.note,
+        feedback=body.feedback, actor_id=who, note=body.note,
     ))
     return {"recorded": True}
 

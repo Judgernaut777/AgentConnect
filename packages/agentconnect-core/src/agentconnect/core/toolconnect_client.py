@@ -146,7 +146,8 @@ class ToolGovernor(Protocol):
 
     Note the absence of ``invoke`` — AgentConnect still calls tools; the governor only
     authorizes and records. ``mode`` is the caller's declared posture (``required`` or
-    ``advisory``); ToolConnect enforces the semantics of whichever is chosen.
+    ``advisory``); today it is recorded with the decision, and enforcement is identical
+    in both modes — every deny, outage included, blocks the subtask.
     """
 
     mode: str
@@ -187,9 +188,10 @@ class ToolConnectGovernor:
         #: Optional bearer credential, sent verbatim as ``Authorization`` (mirrors the
         #: memory adapters). Never logged — a token in a warning line is a leak.
         self.token = token or None
-        #: ``required`` (an outage is a denial) or ``advisory`` (a caller may fall back to
-        #: a cached pack). The *client* never fabricates an allow in either mode; the mode
-        #: only tells a caller what an ``unavailable`` deny means for the workflow.
+        #: ``required`` or ``advisory``. No cached-pack fallback is built: in both modes
+        #: every deny — outage included — blocks the subtask. The *client* never
+        #: fabricates an allow; the mode is recorded so the audit trail shows the
+        #: caller's declared posture.
         self.mode = mode if mode in ("required", "advisory") else "required"
         self.timeout = timeout
         self._transport = transport

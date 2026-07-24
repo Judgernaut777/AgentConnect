@@ -57,6 +57,24 @@ def test_malformed_yaml_degrades_to_off(monkeypatch, tmp_path):
     assert bootstrap.compute_worker_from_env() is None
 
 
+def test_non_mapping_compute_block_degrades_to_off(monkeypatch, tmp_path):
+    # Well-formed YAML of the wrong shape (`compute: notamapping`) must degrade to
+    # off with a warning exactly like an unparseable file, not crash startup.
+    bad = tmp_path / "compute.yaml"
+    bad.write_text("compute: notamapping\n", encoding="utf-8")
+    monkeypatch.setenv(bootstrap.COMPUTE_CONFIG_PATH, str(bad))
+
+    assert bootstrap.compute_worker_from_env() is None
+
+
+def test_list_rooted_compute_document_degrades_to_off(monkeypatch, tmp_path):
+    bad = tmp_path / "compute.yaml"
+    bad.write_text("- compute\n- oops\n", encoding="utf-8")
+    monkeypatch.setenv(bootstrap.COMPUTE_CONFIG_PATH, str(bad))
+
+    assert bootstrap.compute_worker_from_env() is None
+
+
 def test_yaml_base_url_and_knobs_honored(monkeypatch, tmp_path):
     cfg = tmp_path / "compute.yaml"
     cfg.write_text(

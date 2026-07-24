@@ -71,10 +71,21 @@ def test_idle_reaper_terminates_warm_node():
     svc, _ = _rented_svc()
     _submit_rented(svc)
     assert "rented_h100_pool" in svc.node_pool.live_nodes()
-    # Far past the idle window -> reaped.
-    reaped = svc.reap_idle_nodes(now=10_000)
+    # Far past the idle window (relative to the node's real last-used stamp) -> reaped.
+    reaped = svc.reap_idle_nodes(now=time.time() + 10_000)
     assert "rented_h100_pool" in reaped
     assert "rented_h100_pool" not in svc.node_pool.live_nodes()
+
+
+def test_idle_reaper_spares_recently_used_node():
+    # Regression: acquire/release must stamp wall-clock time, so a node used
+    # just now survives a real-time sweep instead of looking idle since epoch 0.
+    svc, _ = _rented_svc()
+    _submit_rented(svc)
+    assert "rented_h100_pool" in svc.node_pool.live_nodes()
+    reaped = svc.reap_idle_nodes(now=time.time())
+    assert reaped == []
+    assert "rented_h100_pool" in svc.node_pool.live_nodes()
 
 
 class _SlowBackend(StubBackend):

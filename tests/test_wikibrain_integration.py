@@ -28,9 +28,18 @@ from pathlib import Path
 import pytest
 
 # --- locate the sibling WikiBrain / BrainConnect checkout --------------------
-WIKIBRAIN_REPO = Path(
-    os.environ.get("WIKIBRAIN_REPO", Path(__file__).resolve().parents[2] / "WikiBrain")
-)
+def _default_repo() -> Path:
+    """First repo-parent sibling under the published name BrainConnect, then the
+    pre-rename WikiBrain; keep WikiBrain as the final fallback so the skip
+    message still names a concrete path."""
+    siblings = Path(__file__).resolve().parents[2]
+    for name in ("BrainConnect", "WikiBrain"):
+        if (siblings / name).is_dir():
+            return siblings / name
+    return siblings / "WikiBrain"
+
+
+WIKIBRAIN_REPO = Path(os.environ.get("WIKIBRAIN_REPO") or _default_repo())
 _CLI = WIKIBRAIN_REPO / "cli"
 if _CLI.is_dir() and str(_CLI) not in sys.path:
     sys.path.insert(0, str(_CLI))
@@ -126,14 +135,17 @@ RIVAL = "Refresh token rotation happens only on expiry."
 def ledger(monkeypatch):
     """A WikiBrain repo on a scratch DB, seeded across every trust state.
 
-    WIKIBRAIN_DB is mandatory: Repo.open() migrates whatever DB it resolves to, and
-    a temp repo root does NOT isolate it (see WikiBrain docs/MIGRATIONS.md).
+    The DB env var is mandatory: Repo.open() migrates whatever DB it resolves to,
+    and a temp repo root does NOT isolate it (see WikiBrain docs/MIGRATIONS.md).
+    Set BOTH names: a renamed BrainConnect checkout prefers BRAINCONNECT_DB, while
+    a pre-rename WikiBrain checkout (module `wiki`) reads only WIKIBRAIN_DB.
     """
     root = Path(tempfile.mkdtemp(prefix="wb-integration-"))
     for d in ("raw", "inbox", "db"):
         (root / d).mkdir(parents=True)
     (root / "log.md").write_text("# log\n", encoding="utf-8")
     (root / "config.toml").write_text('[paths]\ndb = "unused.db"\n', encoding="utf-8")
+    monkeypatch.setenv("BRAINCONNECT_DB", str(root / "scratch.db"))
     monkeypatch.setenv("WIKIBRAIN_DB", str(root / "scratch.db"))
     wiki_init_db(start=root).close()
 

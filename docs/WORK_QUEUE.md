@@ -60,7 +60,7 @@ This is the identical mapping the router uses to decide which provider tiers may
 
 **Tier cannot self-elevate.** The tier used for authorization is ALWAYS the *attested* tier from the caller's authenticated identity (MCP config, HTTP certificate CN). A tier in the request body is ignored; a lower tier in the body is rejected.
 
-**Unknown identity → rejected.** Identity not in the MCP `worker_id→tier` map (or HTTP client cert not recognized) → `403` / `ERROR: unknown_worker`.
+**Unknown identity → rejected.** Identity not in the MCP `worker_id→tier` map (or HTTP client cert not recognized) → `403` / `ERROR: unknown_worker`. That map is configured in `config/workers.yaml` (key `workers`; see `config/workers.yaml.example`), overridable for local wiring/tests via the `AGENTCONNECT_WORKER_TIERS` JSON env var.
 
 **Empty tier set → claims nothing.** An unmapped tier (or tier not in any config class list) yields an empty admissible-class set → zero-length `IN (?)` clause → claims nothing.
 

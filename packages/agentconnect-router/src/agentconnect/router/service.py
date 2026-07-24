@@ -213,7 +213,7 @@ class RouterService:
 
         pool = self.node_pool or NodePool()
         spec = spec_from_provider(cfg, model_id=gen_req.model_id)
-        handle, reused = pool.acquire(cfg, self.provisioner, spec)
+        handle, reused = pool.acquire(cfg, self.provisioner, spec, now=time.time())
         factory = self.rented_client_factory or self._default_rented_client
         client = factory(cfg, handle)
         resp = client.generate(gen_req)
@@ -222,7 +222,7 @@ class RouterService:
         if not reused:
             window = cfg.rental.min_rental_seconds if cfg.rental else 0
             self.quota.record_rental_window(cfg, gen_req.task_id, seconds=window)
-        pool.release(cfg)
+        pool.release(cfg, now=time.time())
         self.memory.append_log(
             gen_req.task_id,
             f"rented_node={handle.node_id} endpoint={handle.manager_endpoint} reused={reused}",
@@ -383,10 +383,6 @@ class RouterService:
         assert_transition(current, dst)
         self.memory.update_task(task_id, state=dst.value)
         return dst
-
-    def _clamp(self, text: str) -> str:
-        hard = int(self.routing_cfg.mcp_output_policy.get("hard_max_chars", 12000))
-        return text if len(text) <= hard else text[:hard]
 
     # --------------------------------------------------------- MCP: submit_task
     def submit_task(self, submission: TaskSubmission) -> TaskSummary:
@@ -647,7 +643,7 @@ class RouterService:
                 # Mask secret/PII spans, and spotlight-wrap if the output carries
                 # an injection payload aimed at the manager (see guard_hook).
                 stored_output = guard_hook.safe_output(guard_out, result.output_text)
-        output_ref = self.memory.put_artifact(task_id, "output", self._clamp(stored_output))
+        output_ref = self.memory.put_artifact(task_id, "output", stored_output)
         state = self._transition(task_id, state, TaskState.ARTIFACTS_WRITTEN)
         state = self._transition(task_id, state, TaskState.CHECKS_RUN)
         state = self._transition(task_id, state, TaskState.REVIEW_READY)
@@ -756,7 +752,7 @@ class RouterService:
         )
 
         output_ref = self.memory.put_artifact(
-            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+            task_id, "output", worker.model_dump_json(indent=2)
         )
         self.memory.append_log(
             task_id, f"agentic_remote worker={worker_cfg.worker_id} model={model_id} "
@@ -844,7 +840,7 @@ class RouterService:
 
         # Full structured result to shared memory; the manager sees only a summary.
         output_ref = self.memory.put_artifact(
-            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+            task_id, "output", worker.model_dump_json(indent=2)
         )
         self.memory.append_log(
             task_id, f"agentic provider={cfg.provider_id} model={model_id} steps={meter['calls']} "
@@ -952,7 +948,7 @@ class RouterService:
             # Child output lands under the PARENT task's artifacts (it's a sub-run, not
             # a first-class queued task) so the whole tree is inspectable from the root.
             self.memory.put_artifact(
-                task_id, "child_output", self._clamp(child_worker.model_dump_json(indent=2))
+                task_id, "child_output", child_worker.model_dump_json(indent=2)
             )
             pc_label = child_pc.value if hasattr(child_pc, "value") else (child_pc or "inherit")
             self.memory.append_log(
@@ -1084,7 +1080,7 @@ class RouterService:
         handle = None
         started = time.perf_counter()
         try:
-            handle, reused = pool.acquire(cfg, self.provisioner, spec)
+            handle, reused = pool.acquire(cfg, self.provisioner, spec, now=time.time())
             client = factory(cfg, handle)
             # Bill the rental window once, at spin-up (mirrors _dispatch); warm reuse is free.
             if not reused:
@@ -1113,7 +1109,7 @@ class RouterService:
             return self._summary(task_id)
         finally:
             # Free the node for the idle reaper even if setup or the loop raised.
-            pool.release(cfg)
+            pool.release(cfg, now=time.time())
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         in_tok, out_tok = source.total_input_tokens, source.total_output_tokens
@@ -1125,7 +1121,7 @@ class RouterService:
         )
 
         output_ref = self.memory.put_artifact(
-            task_id, "output", self._clamp(worker.model_dump_json(indent=2))
+            task_id, "output", worker.model_dump_json(indent=2)
         )
         self.memory.append_log(
             task_id, f"agentic provider={cfg.provider_id} model={model_id} "
