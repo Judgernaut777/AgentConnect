@@ -10,11 +10,11 @@ what exists.**
 * `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
 * `docs/BACKPLANE_SPEC_COMPLIANCE.md` — easiest useful Level 4: launch, shell, audit
 
-Gate: `.venv/bin/python -m pytest -q` → **1035 passed, 11 skipped** at this commit,
+Gate: `.venv/bin/python -m pytest -q` → **1041 passed, 11 skipped** at this commit,
 in a container with every optional extra installed. Skip counts are
 environment-dependent, not universal: optional scanner binaries (`trufflehog`,
 `gitleaks`), the `fascia-guard` extra, and a sibling BrainConnect checkout each gate
-a handful of tests (with `WIKIBRAIN_REPO` pointing at one: 1070 passed, 7 skipped),
+a handful of tests (with `WIKIBRAIN_REPO` pointing at one: 1075 passed, 7 skipped),
 and a minimal install without the optional extras skips more. The suite runs offline.
 
 ## The one rule

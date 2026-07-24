@@ -2717,9 +2717,11 @@ class AgentConnectService:
         """Sweep sessions/runs whose process died without a terminal event.
 
         A record is an *orphan* when it is still in a live status but either (a) a
-        live-surface provider proves its process/pane is dead, or (b) an age gate
-        (``older_than_seconds``, a heartbeat timeout) has elapsed with no evidence
-        it is alive. Orphans are swept to a terminal, reconcilable state — sessions
+        live-surface provider proves its process/pane is dead, or (b) no such
+        provider can prove it is alive and its ``started_at`` is older than
+        ``older_than_seconds`` — a maximum-lifetime bound measured from start, not
+        a heartbeat/idle timeout (there is no last-activity timestamp to time out
+        against). Orphans are swept to a terminal, reconcilable state — sessions
         to ``abandoned``, runs to ``failed`` — tagged ``reconciled`` in metadata so
         an operator can tell a crash-swept record from a clean finish, and their
         live panes/tokens are reaped. A crash therefore leaves the ledger

@@ -19,7 +19,7 @@ acted on under the [STATUS.md](STATUS.md) feature freeze.
 
 ### EF-1 — ToolConnect: `AGENTCONNECT_CONTRACT.md` status header says nothing is implemented; §6b of the same file says the wiring shipped
 
-**Severity: low. Status: OPEN — ToolConnect's to fix.**
+**Severity: low. Status: CLOSED — fixed in ToolConnect at `8853b3c`.**
 
 `docs/AGENTCONNECT_CONTRACT.md:3` reads:
 
@@ -47,7 +47,7 @@ primitives list alone — it is accurate.
 
 ### EF-2 — ComputeConnect: `AGENTCONNECT_INTEGRATION.md` still frames the AgentConnect wiring as to-do, and repeats a stale "unauthenticated on loopback" claim
 
-**Severity: low. Status: OPEN — ComputeConnect's to fix.**
+**Severity: low. Status: CLOSED — fixed in ComputeConnect at `0cf9624`.**
 
 Two staleness problems in `docs/AGENTCONNECT_INTEGRATION.md`, both overtaken by shipped
 code on both sides:
@@ -80,7 +80,7 @@ change on either side.
 
 ### EF-3 — BrainConnect: `serve` does not drain the request body on pre-parse refusals, corrupting HTTP/1.1 keep-alive connections
 
-**Severity: low. Status: OPEN — BrainConnect's to fix.** Reproduced on the wire.
+**Severity: low. Status: CLOSED — fixed in BrainConnect at `9b3b6fc`.** Reproduced on the wire.
 
 `cli/brainconnect/server.py` sets `protocol_version = "HTTP/1.1"` (line 216), so
 connections are keep-alive by default. `do_POST` calls `_require_authorized()` (line 361)
@@ -112,7 +112,7 @@ instead.
 
 ### EF-4 — Connect: `.env.example` and `COMBINED_INSTALL.md` falsely claim `advisory` governor mode means an outage does not block
 
-**Severity: medium. Status: OPEN — Connect's to fix.** The worst of the Connect batch: an
+**Severity: medium. Status: CLOSED — fixed in Connect at `cd23876`.** The worst of the Connect batch: an
 operator relying on it gets a surprise outage-time failure.
 
 `deploy/.env.example:33-36` says "`advisory` = the governor is consulted and logged but
@@ -139,7 +139,7 @@ AgentConnect feature work, explicitly deferred by its ADRs 0007/0008.
 
 ### EF-5 — Connect: compose/CI require sibling checkouts named `mcp-agentconnect` and `WikiBrain`, but Connect's own quickstarts clone `AgentConnect` and `BrainConnect`
 
-**Severity: medium. Status: OPEN — Connect's to fix.** Breaks the documented quickstart
+**Severity: medium. Status: CLOSED — fixed in Connect at `cd23876`.** Breaks the documented quickstart
 path at `docker compose build`.
 
 `deploy/docker-compose.yml:22` and `:110` set build contexts `../../WikiBrain` and
@@ -165,7 +165,7 @@ the Dockerfile-relative paths, all currently self-consistent.
 
 ### EF-6 — Connect: stale "agentconnect-core does not declare httpx" caveat in three documents; the dependency is declared upstream and Connect's own `deploy/README.md` says so
 
-**Severity: low. Status: OPEN — Connect's to fix.**
+**Severity: low. Status: CLOSED — fixed in Connect at `cd23876`.**
 
 `README.md:266-270` ("lazily imports **httpx** … but does not declare it as a dependency
 … The Compose image installs it explicitly. Reported upstream."),
@@ -185,7 +185,7 @@ fix, keeping at most a historical note, matching `deploy/README.md`.
 
 ### EF-7 — Connect: `agentconnect.Dockerfile` header says "three of the nine AC packages" but installs four; `deploy/README.md`'s layout table omits `-router` and keeps "(+ httpx)"
 
-**Severity: low. Status: OPEN — Connect's to fix.**
+**Severity: low. Status: CLOSED — fixed in Connect at `cd23876`.**
 
 `deploy/agentconnect.Dockerfile:4` says "We install three of the nine AC packages" and
 the header list names only core/api/cli — but lines 20–23 `COPY` four
@@ -210,7 +210,7 @@ to answer instead of 503), and fix the README row to "core + `-router` + `-api` 
 
 ### EF-8 — Connect: `deploy/README.md`'s reproducible-build loop checks out tag `v0.1.0-rc2` in all four sibling repos; no repo carries that tag
 
-**Severity: low. Status: OPEN — Connect's to fix.**
+**Severity: low. Status: CLOSED — fixed in Connect at `cd23876`.**
 
 `deploy/README.md:45-47`:
 
