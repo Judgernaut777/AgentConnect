@@ -19,6 +19,7 @@ class ClaimReviewBody(BaseModel):
 
 @router.post("/tasks/{task_id}/reviews", response_model=Review, status_code=201)
 def request_review(task_id: str, body: ReviewRequest, request: Request) -> Review:
+    assert_actor(request, body.requested_by)
     return service(request).request_review(task_id, body)
 
 
