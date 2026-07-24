@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — 2026-07-24 — ecosystem review: review-finding fixes and doc reconciliation
+
+A sweep over the Connect ecosystem's loose ends: the two remaining code defects
+from `REVIEW.md` are fixed, several small hardening gaps are closed, and the
+documentation is reconciled with what the code (and the sibling repos) now do.
+Defects found in the sibling repositories during the review are registered in
+[docs/ECOSYSTEM_FINDINGS.md](docs/ECOSYSTEM_FINDINGS.md).
+
+### Code fixes
+
+* **Rented-node last-used timestamps are real** (`REVIEW.md` finding 4). The
+  router service now passes `time.time()` at all four `pool.acquire`/`pool.release`
+  sites, so the idle reaper no longer sees warm rented nodes as ancient.
+  Regression: `tests/test_nodepool_concurrency.py::test_idle_reaper_spares_recently_used_node`.
+* **Artifacts store the full output** (`REVIEW.md` finding 3). The pre-storage
+  `hard_max_chars` clamp is removed (`RouterService._clamp` deleted); artifacts
+  persist complete and `read_artifact_chunk` pages them back bounded.
+  Regression: `tests/test_artifact_full_storage.py`.
+* **Governor principal speaks ToolConnect's vocabulary.** `WorkerLocation.cloud`
+  now translates to ToolConnect privacy tier `trusted-cloud` (`local`/`rented`
+  pass verbatim), per ADR 0008.
+* **Config bootstrap degrades instead of crashing.** The compute, toolconnect,
+  and memory bootstraps treat a non-mapping YAML block as "off", with a warning.
+* **`POST /memory/feedback` resolves its actor via `assert_actor`.** A missing
+  `actor_id` defaults to the token's principal; a spoofed one is a 403.
+* **`agentconnect-api` no longer hard-imports `agentconnect.router`** at module
+  import; `/route/decide` answers 503 when no router is installed.
+* **Sibling-checkout discovery.** The contract cross-check and wikibrain
+  integration tests honor `WIKIBRAIN_REPO` and auto-find a sibling checkout named
+  `BrainConnect` or `WikiBrain`; the hard-coded absolute path is gone.
+* **Config corrections.** `quota_scarcity_threshold_pct` moved from `budget:` to
+  `scoring:` in both `routing.yaml` copies; `config/workers.yaml.example` is new;
+  `toolconnect.yaml.example` no longer promises an advisory-mode ToolsetPack
+  fallback (advisory is metadata-only today — every deny blocks).
+
+### Documentation reconciliation
+
+* The registers and contracts now match the shipped code and siblings:
+  `brainconnect serve` closed AC-7 upstream (`docs/INTEGRATION_ISSUES.md`), the
+  LiteLLM cloud transport replaces the "missing adapter" table
+  (`docs/MODEL_ADAPTERS.md`), ToolConnect/ComputeConnect contract status lines,
+  tool counts, and line citations are current, and `REVIEW.md` /
+  `docs/REVIEW_FINDINGS.md` carry per-finding status against today's code.
+* Gate at this commit, with every optional extra installed: **1035 passed,
+  11 skipped** (`1070 passed, 7 skipped` with `WIKIBRAIN_REPO` pointing at a real
+  BrainConnect checkout). Skip counts are environment-dependent.
+
 ## 0.1.0 — 2026-07-12 — first coherent Connect-family release
 
 The first release cut of AgentConnect as part of the Connect product family
@@ -83,7 +130,8 @@ verified empirically in the wheels-only venv.
 
 ### Known gaps
 
-* **No LICENSE file.** Package metadata says MIT; the repository ships no license
-  text. Ecosystem licensing is decided at the Connect level.
+* ~~**No LICENSE file.**~~ Closed since: the repository ships an Apache-2.0
+  `LICENSE` and a `NOTICE`, and all nine packages declare
+  `license = "Apache-2.0"` with `license-files = ["LICENSE"]`.
 * The packaged default config means a bare `agentconnect-router` runs with zero
   providers until `AGENTCONNECT_CONFIG_DIR` names a real config.

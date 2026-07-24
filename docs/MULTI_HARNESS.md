@@ -18,6 +18,9 @@ Model B is a transport mode.
 
 Each harness spawns its own **stdio** `agentconnect-router`, but they all point at the
 **same `AGENTCONNECT_DB`**. Shared tasks, queue, artifacts, and subagents.
+(`AGENTCONNECT_DB` is the router's shared-memory sqlite, default
+`data/shared_memory.sqlite` — a different store from the core ledger's
+`AGENTCONNECT_DB_PATH`, default `~/.agentconnect/agentconnect.db`.)
 
 Put the same DB path in each harness's MCP config (`.mcp.json` or equivalent):
 
@@ -32,7 +35,10 @@ Put the same DB path in each harness's MCP config (`.mcp.json` or equivalent):
   Per-harness crash isolation.
 - ⚠️ Single box only. Each process keeps its own warm state, so two harnesses can
   **double-provision a paid/rented node** (spend). Cross-process writes serialize at the
-  SQLite level (`busy_timeout` handles contention).
+  SQLite level (`busy_timeout` handles contention). Quota reservations are likewise
+  held per-process — only *committed* usage lands in the shared DB — so concurrent
+  routers can briefly oversubscribe a shared provider quota between reserve and
+  commit; another reason to prefer Model B for paid tiers.
 
 ## Model B — one shared HTTP server (the coherent instance)
 
@@ -64,6 +70,9 @@ Harnesses connect to `http://<host>:8760/mcp` (streamable-HTTP) or `/sse`. Confi
 
 `AGENTCONNECT_MCP_TRANSPORT` is `stdio` (default) | `sse` | `streamable-http`;
 `AGENTCONNECT_MCP_HOST` / `AGENTCONNECT_MCP_PORT` bind the network transports.
+The same triple is also read by the `agentconnect-mcp` backplane server
+(default `:8765`, vs the router's `:8760`) — when both run on one machine,
+set these per-process rather than exporting them globally.
 
 ## Which to use
 

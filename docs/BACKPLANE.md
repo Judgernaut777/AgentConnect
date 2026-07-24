@@ -10,7 +10,12 @@ what exists.**
 * `docs/BACKPLANE_SPEC_MEMORY_STACK.md` — Temporal + WikiBrain + Cognee + Graphiti
 * `docs/BACKPLANE_SPEC_COMPLIANCE.md` — easiest useful Level 4: launch, shell, audit
 
-Gate: `.venv/bin/python -m pytest -q` → **684 passed**, all offline.
+Gate: `.venv/bin/python -m pytest -q` → **1035 passed, 11 skipped** at this commit,
+in a container with every optional extra installed. Skip counts are
+environment-dependent, not universal: optional scanner binaries (`trufflehog`,
+`gitleaks`), the `fascia-guard` extra, and a sibling BrainConnect checkout each gate
+a handful of tests (with `WIKIBRAIN_REPO` pointing at one: 1070 passed, 7 skipped),
+and a minimal install without the optional extras skips more. The suite runs offline.
 
 ## The one rule
 
@@ -386,7 +391,8 @@ TEMPORAL_ADDRESS=localhost:7233 agentconnect-temporal-worker &
 agentconnect-api            # :8790
 agentconnect-mcp            # stdio, or AGENTCONNECT_MCP_TRANSPORT=streamable-http
 
-# Linear mirror:
+# Linear mirror (webhook ingest additionally needs LINEAR_WEBHOOK_SECRET —
+# POST /linear/webhook fails closed with 503 when it is unset):
 export LINEAR_API_KEY=... LINEAR_TEAM_ID=...
 agentconnect linear sync TASK_ID
 ```
@@ -394,8 +400,27 @@ agentconnect linear sync TASK_ID
 Environment: `AGENTCONNECT_DB_PATH`, `AGENTCONNECT_ARTIFACT_DIR`,
 `AGENTCONNECT_MAX_COST_USD`, `AGENTCONNECT_WORKERS`, `TEMPORAL_ADDRESS`,
 `AGENTCONNECT_TEMPORAL_TASK_QUEUE`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID`,
-`AGENTCONNECT_MEMORY_CONFIG`, `WIKIBRAIN_URL`, `COGNEE_URL`, `GRAPHITI_URL`,
+`LINEAR_WEBHOOK_SECRET`,
+`AGENTCONNECT_MEMORY_CONFIG`, `WIKIBRAIN_URL` / `BRAINCONNECT_URL`, `COGNEE_URL`, `GRAPHITI_URL`,
 `WIKIBRAIN_TOKEN` / `BRAINCONNECT_TOKEN` / `COGNEE_TOKEN` / `GRAPHITI_TOKEN`.
+
+Beyond the backplane's own list above, the other packages read these
+operator-facing variables (each documented with its component):
+
+- core: `AGENTCONNECT_CONFIG_DIR` (master config-dir override),
+  `OP_CLI` (path to the 1Password CLI for `op://` secret refs)
+- router: `AGENTCONNECT_DATA_DIR` (shared-memory fallback dir),
+  `AGENTCONNECT_LOCAL_TLS_MODE`, `AGENTCONNECT_LOCAL_SERVER_NAME`,
+  `FASCIA_GUARD`, `FASCIA_GUARD_ENFORCE`, and — via `providers.yaml`
+  expansion — `AGENTCONNECT_RENTED_CA` / `AGENTCONNECT_RENTED_CLIENT_CERT` /
+  `AGENTCONNECT_RENTED_CLIENT_KEY`
+- api / cli: `AGENTCONNECT_BASE_URL` (artifact links in Linear mirrors)
+- temporal worker: `AGENTCONNECT_LOG_LEVEL`
+- model-manager: `MODEL_MANAGER_HOST`, `MODEL_MANAGER_PORT`,
+  `MODEL_MANAGER_TLS_MODE`, `MODEL_BACKEND_MODELS`
+- compute / toolconnect consumers: `AGENTCONNECT_COMPUTE_TIMEOUT`,
+  `AGENTCONNECT_TOOLCONNECT_TOKEN`, `AGENTCONNECT_TOOLCONNECT_MODE`,
+  `AGENTCONNECT_TOOLCONNECT_TIMEOUT`
 
 ```bash
 # Memory is opt-in. With no config file and no *_URL set, packs are task state only.

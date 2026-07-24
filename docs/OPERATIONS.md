@@ -63,7 +63,7 @@ Scraping with Prometheus: transcode the JSON in a sidecar; the core deliberately
 serves JSON (ADR 0004), not the Prometheus text format.
 
 ```bash
-TOKEN=$(agentconnect tokens issue operator | jq -r .token)
+TOKEN=$(agentconnect tokens issue --actor operator | jq -r .token)
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/metrics | jq .
 ```
 
@@ -144,6 +144,10 @@ No data is rewritten; every existing row survives (proven: `demo_h`,
 The live-terminal provider runs on a **dedicated tmux socket**
 (`AGENTCONNECT_OBSERVABILITY_TMUX_SOCKET`, default `agentconnect-obs`) — never the
 operator's default tmux server, so reconcile/close can never kill a human's panes.
+`AGENTCONNECT_OBSERVABILITY_TMUX_LAYOUT` sets the pane layout hint (default `tiled`).
+For export beyond the local JSONL log, `AGENTCONNECT_OTLP_ENDPOINT` names an OTLP
+collector base URL — each event is posted to its `/v1/logs` carrying the full
+correlation-id set; unset, the OTLP provider does nothing.
 
 ```bash
 agentconnect observability providers        # configured providers + health

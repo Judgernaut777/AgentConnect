@@ -238,8 +238,13 @@ OpenAI-compatible backend, real concurrency admission, **federated work queue** 
 open surface with trust × privacy boundary), and CI (3.10–3.12 + standalone-router job).
 
 Cloud generation and the local backend degrade to deterministic stubs when
-endpoints/credentials are absent, so the full pipeline is exercisable offline;
-supply real endpoints/keys (env or `config/secrets.yaml`) to make live calls.
+endpoints/credentials are absent — and also when a cloud call fails after a
+key *was* resolved (a provider error degrades to the same stub) — so the full
+pipeline is exercisable offline; supply real endpoints/keys (env or
+`config/secrets.yaml`) to make live calls.
+
+See [STATUS.md](STATUS.md) for the authoritative statement of current
+maturity, known test-fidelity limits, and deferred work.
 
 ## Federated work queue (pull-based surface)
 

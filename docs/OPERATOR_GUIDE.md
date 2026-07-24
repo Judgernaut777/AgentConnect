@@ -40,9 +40,16 @@ a database path, and a coding agent. It needs **no** memory backend, **no** trac
 workflow server, and **no** GPU.
 
 BrainConnect (trusted memory), Linear, Temporal, Cognee, Graphiti, and a local model
-manager are all optional and unconfigured by default. ComputeConnect and ToolConnect do
-not exist; AgentConnect ships those seams itself. If an instruction below seems to require
-one of them, that is a documentation bug — report it.
+manager are all optional and unconfigured by default. ComputeConnect and ToolConnect
+exist as optional v0.1.0 sibling services; the loop requires neither — AgentConnect
+ships those seams itself and uses the services only when configured. To wire them in:
+`AGENTCONNECT_COMPUTE_URL` (optionally `AGENTCONNECT_COMPUTE_TOKEN` /
+`AGENTCONNECT_COMPUTE_TIMEOUT`, or copy `config/compute.yaml.example` — env wins over
+the file) enables the compute plane, and `AGENTCONNECT_TOOLCONNECT_URL` (optionally
+`AGENTCONNECT_TOOLCONNECT_TOKEN` / `AGENTCONNECT_TOOLCONNECT_MODE`) enables the tool
+governor, which is fail-closed once configured. Absent these, both planes are simply
+off. Detail lives in [COMPUTECONNECT_CONTRACT.md](COMPUTECONNECT_CONTRACT.md),
+[TOOLCONNECT_CONTRACT.md](TOOLCONNECT_CONTRACT.md), and ADR 0006.
 
 ## Install
 
@@ -271,7 +278,7 @@ the token decides — the same `authorize()` the MCP server calls.
 
 ```sh
 agentconnect tokens issue --actor matthew      # printed once; store it like a password
-curl -H "Authorization: Bearer act_…" http://127.0.0.1:8130/tasks/$TASK
+curl -H "Authorization: Bearer act_…" http://127.0.0.1:8790/tasks/$TASK
 # or: curl -H "X-AgentConnect-Token: $AGENTCONNECT_SESSION_TOKEN" …
 ```
 
