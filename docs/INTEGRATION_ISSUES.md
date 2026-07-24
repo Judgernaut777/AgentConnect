@@ -347,6 +347,7 @@ Adding the name to the denylist would be defense in depth, not a fix.
 
 ## Reproduction environment
 
-`origin/main`, gate `888 passed, 3 skipped` (`891 passed` with the `safety-secrets`
-extra installed). BrainConnect checked out at `e75cb83` (its `docs/CONTRACT.md` and
-`tests/contract/` fixtures).
+Reconciled at the merged head, gate `1041 passed, 11 skipped` with the optional extras
+installed (matching [STATUS.md](STATUS.md) / [BACKPLANE.md](BACKPLANE.md); the earlier
+snapshot of this note read `888 passed, 3 skipped` against `origin/main`). BrainConnect
+checked out at `e75cb83` (its `docs/CONTRACT.md` and `tests/contract/` fixtures).
