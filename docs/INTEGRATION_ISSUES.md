@@ -2,10 +2,13 @@
 
 Defects found while validating AgentConnect's integrations against real BrainConnect and
 against its own MCP/HTTP surface. Every entry below was **reproduced**, not inferred; the
-reproduction is given so it can be re-run or disputed.
+reproduction is given so it can be re-run or disputed. Defects found in the *sibling*
+repositories during the 2026-07 ecosystem review are registered separately, in
+[ECOSYSTEM_FINDINGS.md](ECOSYSTEM_FINDINGS.md).
 
 **AC-1 through AC-6 are now closed**, each with a test that fails against the old code.
-AC-7 remains open and belongs to BrainConnect. Status is recorded per issue below rather
+AC-7 — the one entry that was never AgentConnect's to close — has since been closed
+upstream by BrainConnect. Status is recorded per issue below rather
 than by deleting the entry: a defect register that forgets what was wrong cannot tell you
 whether the fix still holds.
 
@@ -141,6 +144,14 @@ cover the rest; an unrecognized failure is re-raised untouched rather than relab
 `promote_candidate` accepts `safety_override` + `override_reason` and refuses the first
 without the second. AgentConnect never sets the override on its own behalf.
 
+One scope note on that override, now that a real wire exists: BrainConnect's HTTP
+surface (`brainconnect serve`) refuses any promote payload carrying
+`safety_override`/`override_reason` with `403 forbidden` **by design** — the override is
+human-only, at BrainConnect's own CLI (`brainconnect promote --safety-override
+--override-reason …`) — so over HTTP the forwarded override surfaces as a
+`MemoryAuthorizationError`, not a `MemorySafetyRefused`. The adapter's override path
+works only via an in-process/injected transport.
+
 Per-item `safety` survives recall on `MemoryItem.safety`; `quarantined` and `safety`
 survive capture on `CaptureResult`. Quarantine is a field, never inferred from `message`.
 Safety cannot set `trusted`: `tests/test_memory_safety_metadata.py` pins a flagged-but-
@@ -226,25 +237,36 @@ name. Do **not** invent a default actor — that forges provenance on a memory c
 to `http://localhost:8787`. Follow both defaults and the HTTP adapter and BrainConnect
 contend for one port.
 
-Moot today only because BrainConnect ships no HTTP server (below).
+When filed, this was moot in practice because BrainConnect shipped no HTTP server.
+It no longer is: `brainconnect serve` now exists and defaults to `127.0.0.1:8787`
+(below), so the corrected `:8130` example is load-bearing, not cosmetic.
 
 ---
 
-## AC-7 — BrainConnect still has no HTTP server; the adapter still defaults to one
+## AC-7 — BrainConnect had no HTTP server; the adapter defaulted to one
 
-**Severity: low. Status: OPEN, and not AgentConnect's to close.**
+**Severity: low. Status: CLOSED — fixed upstream by BrainConnect.**
 
-`WikiBrainMemoryAdapter` defaults to `http://localhost:8787` (`core/memory.py:362`,
-`bootstrap.py:39`). BrainConnect ships **no HTTP server**: its only `serve` is
-`wiki mcp serve`, which is stdio. BrainConnect's own `docs/STATUS.md` states it outright.
+**Fix (theirs, not ours).** BrainConnect now ships `brainconnect serve`
+(`cli/brainconnect/server.py`): an HTTP transport defaulting to `127.0.0.1:8787` —
+exactly the adapter's default — with bearer auth via `--token`/`BRAINCONNECT_TOKEN`,
+serving precisely the routes `WikiBrainMemoryAdapter` calls (`/recall`, `/capture`,
+`/candidates/{id}/promote`, `/candidates`, `/feedback`, `/registry`, `/health`).
+BrainConnect's own
+gate wire-tests it, cross-checked against this adapter. A deployment that lets the
+adapter fall through to `httpx` now reaches a real server instead of
+connection-refused.
 
-Consequently nothing exercises this contract on the wire. `tests/test_wikibrain_integration.py`
-injects a transport that dispatches into `wiki.api` in-process (real semantics, no wire),
-and `tests/test_agent_loop_e2e.py` runs a real HTTP server serving canned responses (real
-wire, no semantics). No test has both halves — as `docs/STATUS.md` already says.
+As filed: `WikiBrainMemoryAdapter` defaults to `http://localhost:8787` and BrainConnect
+shipped **no HTTP server** — its only `serve` was `wiki mcp serve`, which is stdio — so
+nothing exercised this contract on the wire.
 
-A deployment that lets the adapter fall through to `httpx` gets connection-refused.
-`wiki serve` belongs to BrainConnect; **do not build it from this side.**
+Residual gap, deliberately left: no AgentConnect test yet exercises real semantics over
+the real wire. `tests/test_wikibrain_integration.py` dispatches into the sibling's API
+in-process (real semantics, no wire) and `tests/test_agent_loop_e2e.py` runs a real HTTP
+server serving canned responses (real wire, no semantics). The both-halves test is newly
+unblocked by `brainconnect serve`, but it is new test infrastructure, not a correction,
+so it is not added under the stabilization freeze.
 
 ---
 
@@ -253,7 +275,7 @@ A deployment that lets the adapter fall through to `httpx` gets connection-refus
 **Severity: low (latent, no wire path exists). Status: RESOLVED by tolerating both
 shapes.** Found validating against BrainConnect's `docs/CONTRACT.md` (`e75cb83`).
 
-The refusal envelope a future `brainconnect serve` will return was described two ways
+The refusal envelope `brainconnect serve` would return (then still unbuilt) was described two ways
 at once. BrainConnect's `docs/CONTRACT.md` documented a **nested** body —
 `{"error": {"code": "safety_refused", "safety": {…}}}` at HTTP 409 — while its server
 intent (and the flat fixture in its working tree) is **flat**: `error` is the code
@@ -261,8 +283,8 @@ string, `safety` is top-level. BrainConnect chose flat deliberately, to match th
 adapter's *original* reader, which compared `body["error"]` to `"safety_refused"`.
 
 So there was never a shipped defect: against the flat shape BrainConnect actually
-intends, the original adapter was correct, and there is no `brainconnect serve` to
-exercise either shape yet. The risk was purely that the two repos could drift — one
+intended at the time, the original adapter was correct, and no `brainconnect serve`
+existed yet to exercise either shape. The risk was purely that the two repos could drift — one
 side changing the nesting would silently turn a safety refusal into an
 `invalid_request`, the exact trust-versus-retry confusion the taxonomy exists to
 prevent.
@@ -281,6 +303,12 @@ whichever shape BrainConnect ships cannot break this adapter and cannot go unnot
 committed `docs/CONTRACT.md` (nested) and its working-tree `errors.py` + fixture (flat)
 disagree. That is BrainConnect's to reconcile; this adapter is correct either way. No
 GitHub issue was filed — `gh` is unavailable here — so it is recorded only as this note.
+
+*2026-07-24:* BrainConnect has since reconciled on the **nested** shape — its
+`errors.py` `envelope()`, its `tests/contract/promotion_safety_refusal.json` fixture,
+and its `docs/CONTRACT.md` now agree, and `brainconnect serve` answers every refusal
+with `errors.envelope(exc)`. The adapter's flat-shape reading remains for defensiveness
+only.
 
 ---
 

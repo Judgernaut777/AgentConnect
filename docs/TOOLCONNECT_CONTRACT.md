@@ -5,8 +5,9 @@
 > text below documents the contract and rationale; current reality: the sibling repos ship
 > working implementations that AgentConnect now integrates with.
 
-**Status: design note. ToolConnect does not exist.** No code moves as a result of this
-document. AgentConnect exposes a fixed MCP tool set today and runs standalone.
+**Original status (historical, pre-2026-07-17): design note; ToolConnect did not yet
+exist.** When first written, no code moved as a result of this document, and
+AgentConnect exposed a fixed MCP tool set and ran standalone.
 
 This is an inventory of AgentConnect's tool surface as it actually is, followed by a
 proposed division of responsibility. It was first written against a surface with three
@@ -33,7 +34,7 @@ There are **two** MCP servers in this repository, and they are not interchangeab
 Only the first is written into a managed workspace's `.mcp.json` (`core/workspace.py`).
 The forbidden-tool guarantee below concerns that server.
 
-`build_mcp_server()` (`mcp/server.py`) registers **17** tools, and its docstring now
+`build_mcp_server()` (`mcp/server.py`) registers **18** tools, and its docstring now
 points at `core.tools.MCP_TOOLS` as the source of truth rather than naming a count. (It
 once claimed "thirteen"; that drift is gone — see AC-3, closed.)
 
@@ -43,22 +44,27 @@ Mutating (write to the ledger): `create_task`, `claim_task`, `release_task`,
 persists the summary it computes, so it is a write despite its name.
 
 Read-only: `open_task`, `get_status`, `list_artifacts`, `read_artifact_chunk`,
-`explain_route`, `recall_memory`, `get_task_context_pack`.
+`explain_route`, `recall_memory`, `get_task_context_pack`, and `authorize_tool` — the
+ToolConnect chokepoint itself, which authorizes a declared tool set but never invokes
+one, so it mutates nothing. When the governor is consulted, the worker location is
+translated to ToolConnect's privacy-tier vocabulary: `cloud` becomes `trusted-cloud`;
+`local` and `rented` pass verbatim (ADR 0008).
 
 **Every tool body calls a method on `AgentConnectService` and nothing else.** No tool
 touches storage, the filesystem, or a backend directly; `mcp/tools.py` is pure response
 shaping with no I/O. This is the single most important property to preserve in a split:
 the service is the only door.
 
-### The forbidden six
+### The forbidden seven
 
-`temporal_signal`, `wikibrain_promote`, `cognee_write`, `graphiti_write`,
+`temporal_signal`, `wikibrain_promote`, `brainconnect_promote` (the same backend
+renamed — the old spelling stays denied), `cognee_write`, `graphiti_write`,
 `local_model_generate`, `secrets_read` must never be exposed. They are listed in
 `DENIED_MCP_TOOLS` (`core/tools.py`), written into `.mcp.json` as `deniedTools` so the
 denial is auditable, and independently listed in `AGENT_FORBIDDEN_ACTIONS` /
 `NEVER_TOKEN_ACTIONS` (`core/sessions.py`).
 
-Verified: none of the six is registered by either MCP server. The denial is **structural**
+Verified: none of the seven is registered by either MCP server. The denial is **structural**
 — no server offers them — and the denylist is a statement of intent, not the mechanism.
 A ToolConnect that introduced dynamic registration would convert this from a structural
 guarantee into a policy check, which is a real loss. If it must, the denylist has to

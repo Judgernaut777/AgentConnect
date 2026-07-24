@@ -9,7 +9,7 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `.venv/bin/python -m pytest -q` — **1060 passing, 3 skipped** (as of the latest commit; the skips need the optional `safety-secrets` extra) |
+| Gate | `pytest -q` — **1035 passing, 11 skipped** (as of this commit, with the optional extras installed; skip counts are environment-dependent — the remaining skips need `fascia-guard`, the `trufflehog`/`gitleaks` binaries, and a BrainConnect sibling checkout, which lifts the gate to 1070 passing, 7 skipped) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
@@ -41,13 +41,17 @@ Nothing below is required. AgentConnect runs, and its gate is green, with none o
 Optional integrations add capability. None is a dependency, and none may become one
 without a decision recorded here.
 
-**On the name.** BrainConnect was renamed from *WikiBrain* on GitHub; its code was not.
-The package, the `wiki` CLI, `WikiBrainMemoryAdapter`, and `WIKIBRAIN_URL` /
-`WIKIBRAIN_WRITE_TOKEN` still say `wikibrain`, and those names are load-bearing. This
-documentation says BrainConnect for the product and `wikibrain` for identifiers. When
-wiring the Connect ecosystem deployment, the same memory service values are expected
-under `BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN` — both names currently refer to the
-same underlying service, and this env-var naming reconciliation is pending.
+**On the name.** BrainConnect was renamed from *WikiBrain*, and the rename has since
+reached its code: the sibling's package and CLI are `brainconnect` (there is no `wiki`
+CLI). AgentConnect's own identifiers still say `wikibrain` — `WikiBrainMemoryAdapter`
+and `WIKIBRAIN_URL` / `WIKIBRAIN_TOKEN` — and those names are load-bearing. This
+documentation says BrainConnect for the product and `wikibrain` for identifiers. The
+env-var naming reconciliation is done, not pending: bootstrap registers both spellings
+as first-class backends of the same service (`wikibrain` under `WIKIBRAIN_URL` /
+`WIKIBRAIN_TOKEN`, `brainconnect` under `BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN`;
+configure one, not both — `tests/test_brainconnect_tolerance.py` pins the tolerance).
+The Connect ecosystem deployment wires `BRAINCONNECT_*`, which is the preferred spelling
+for new deployments; `WIKIBRAIN_*` remains supported, with no deprecation scheduled.
 
 ## Memory boundary
 
@@ -85,14 +89,23 @@ enforced.
 
 Worth stating plainly, because a green suite invites more confidence than it has earned.
 
-* **No test exercises real BrainConnect over real HTTP.** `tests/test_agent_loop_e2e.py`
-  runs a real HTTP server on a real port that serves *canned* responses — it proves the
-  adapter's httpx path, not the ledger. `tests/test_wikibrain_integration.py` drives real
-  `wiki.api` **in-process** through a transport shim — it proves the semantics, not the
-  wire. Nothing has both halves. Closing that needs `wiki serve`, which belongs to
-  BrainConnect.
+* **No AgentConnect test exercises real BrainConnect over real HTTP.**
+  `tests/test_agent_loop_e2e.py` runs a real HTTP server on a real port that serves
+  *canned* responses — it proves the adapter's httpx path, not the ledger.
+  `tests/test_wikibrain_integration.py` drives the sibling's real ledger code
+  **in-process** through a transport shim — it proves the semantics, not the wire (it
+  finds a sibling checkout named `BrainConnect` or `WikiBrain` automatically, or honors
+  `WIKIBRAIN_REPO`). The wire half now exists upstream — BrainConnect ships
+  `brainconnect serve`, and its own gate cross-checks it against this repo's real
+  `WikiBrainMemoryAdapter` — but nothing in *this* repo's gate has both halves: no test
+  here drives the adapter against a live `brainconnect serve`.
 * **Cognee and Graphiti are exercised only through transport doubles.** Field names and
   shapes are asserted; no real service has ever answered.
+* **Quota reservations are per-process.** Only committed usage lands in the shared
+  store; live reservations stay in router memory, so concurrent routers sharing one
+  store can briefly oversubscribe a shared provider quota. Persisting reservations is
+  feature work, deliberately not taken under the freeze (see
+  [ECOSYSTEM_FINDINGS.md](ECOSYSTEM_FINDINGS.md)).
 * **Temporal is tested against the in-process time-skipping test server**, never a
   deployed cluster.
 * **The compliance layer is not a sandbox.** It makes AgentConnect the normal path and
@@ -119,8 +132,9 @@ Worth stating plainly, because a green suite invites more confidence than it has
   `attempt_decision_notes` are named and have no policy.
 * **Containment / spotlighting** for `context_output` — deferred, with reasoning in
   SAFETY.md.
-* `wiki serve` — BrainConnect's HTTP transport. **Deferred, and not AgentConnect's task.**
-  Tracked here only as a known integration gap. Do not build it from this side.
+* BrainConnect's HTTP transport — **delivered upstream as `brainconnect serve`**, and
+  never AgentConnect's task. What stays tracked here is the wire-level test gap above.
+  Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is
   designed for and deliberately unbuilt).
 * `TaskWorkflow`, `ManagerHandoffWorkflow`, `WorkerPipelineWorkflow`.
@@ -156,8 +170,10 @@ Found by validating the integrations. Full detail and reproductions in
 
 **Open:**
 
-* **AC-7 (low)** — BrainConnect still ships no HTTP server, and the adapter still defaults
-  to `:8787`. Nothing exercises the memory contract on the wire. Not AgentConnect's task.
+* **AC-7 (low)** — BrainConnect now ships `brainconnect serve`, defaulting to
+  `127.0.0.1:8787` — the same port the adapter defaults to. What remains open is on this
+  side: nothing in AgentConnect's own gate exercises the memory contract on the wire
+  against it. The gap is a test, not a server, and closing it is still not urgent.
 
 BrainConnect has since published a formal contract — `docs/CONTRACT.md` and seven
 `tests/contract/*.json` fixtures — pinning the `safety`, `quarantined`, and refusal shapes.

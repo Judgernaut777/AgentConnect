@@ -26,8 +26,10 @@ compute:
   timeout: 30
 
   # Optional bearer token, sent verbatim as the Authorization header, never logged.
-  # Overridden by AGENTCONNECT_COMPUTE_TOKEN. ComputeConnect is unauthenticated on
-  # loopback today; this is forward-compat. Prefer the env var so no token hits disk.
+  # Overridden by AGENTCONNECT_COMPUTE_TOKEN. ComputeConnect v0.1.0 enforces
+  # bearer auth when its COMPUTECONNECT_TOKEN is set — the value here must then
+  # include the scheme prefix, exactly as below. Prefer the env var so no token
+  # hits disk.
   # token: Bearer <token>
 
   # Optional worker-registration knobs (all have safe defaults in the adapter).
