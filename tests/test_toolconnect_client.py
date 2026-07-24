@@ -70,7 +70,9 @@ class _StubHandler(BaseHTTPRequestHandler):
             decision_id = self.path.split("/")[2]
             body = self._read_json()
             type(self).recorded.append((decision_id, body))
-            self._send(200, {"recorded": True, "decision_id": decision_id})
+            # The real server's wire shape: {"decision_id", "audit_seq"} — no
+            # "recorded" key; that one is adapter-synthesized on outages only.
+            self._send(200, {"decision_id": decision_id, "audit_seq": 1})
         else:
             self._send(404, {"error": "not found"})
 
@@ -122,7 +124,8 @@ def test_health_over_stub(stub_server):
 def test_record_outcome_over_stub(stub_server):
     gov = ToolConnectGovernor(stub_server)
     result = gov.record("dec-ok", "succeeded", detail={"artifact": "a-1"})
-    assert result["recorded"] is True
+    assert result["decision_id"] == "dec-ok"  # the server's shape, passed through
+    assert "audit_seq" in result
     assert _StubHandler.recorded == [("dec-ok", {"outcome": "succeeded",
                                                  "detail": {"artifact": "a-1"}})]
 

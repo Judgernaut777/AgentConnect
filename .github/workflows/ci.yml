@@ -21,12 +21,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the three packages (editable) + test deps
+      - name: Install all nine packages (editable) + test deps
+        # The suite covers every adapter (api, cli, linear, mcp, runtime,
+        # temporal), so all of them must be installed or their tests fail on
+        # missing third-party deps (langgraph, mcp, fastapi, ...).
         run: |
           python -m pip install --upgrade pip
           pip install -e packages/agentconnect-core \
                       -e packages/agentconnect-router \
-                      -e packages/agentconnect-model-manager
+                      -e packages/agentconnect-model-manager \
+                      -e packages/agentconnect-api \
+                      -e packages/agentconnect-cli \
+                      -e packages/agentconnect-linear \
+                      -e packages/agentconnect-mcp \
+                      -e packages/agentconnect-runtime \
+                      -e packages/agentconnect-temporal
           pip install pytest
 
       - name: Run tests (offline; openssl present for the mTLS suite)

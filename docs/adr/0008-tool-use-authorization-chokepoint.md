@@ -68,8 +68,10 @@ one place a tool-use authorization is decided:
 A worker declares tools as bare names, so each is attributed to the worker's
 **harness** as its `source_id` (`split_tool_ref` also accepts a `"source:name"`
 qualifier). The principal is `{id: worker_id, kind: agent, privacy_tier:
-worker.location}` — a `local` worker authorizes as a `local` principal, which maps
-directly onto ToolConnect's principal model.
+worker.location}` — with the one vocabulary translation ToolConnect's principal model
+requires: a `cloud` worker authorizes as a `trusted-cloud` principal (ToolConnect's
+tier vocabulary is `{local, trusted-cloud, rented}`; a literal `cloud` would rank as
+unknown and be unmatchable by policies). `local` and `rented` pass through unchanged.
 
 ### 2. Wired into a real path: worker preparation (`_execute`)
 

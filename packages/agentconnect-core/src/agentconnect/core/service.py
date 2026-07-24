@@ -134,6 +134,13 @@ _LIVE_EXECUTION_STATES = frozenset({
     ExecutionState.running, ExecutionState.waiting_approval, ExecutionState.waiting_review,
 })
 
+#: `WorkerLocation` value -> ToolConnect principal `privacy_tier`. ToolConnect's tier
+#: vocabulary is {local, trusted-cloud, rented} (its policy engine ranks anything else
+#: as unknown/worst and Cedar policies written against "trusted-cloud" can never match
+#: a literal "cloud"), so the one mismatched value is translated at the principal
+#: construction site; "local" and "rented" pass through unchanged.
+_GOVERNOR_PRIVACY_TIERS = {"cloud": "trusted-cloud"}
+
 
 class AgentConnectService:
     def __init__(
@@ -1232,7 +1239,8 @@ class AgentConnectService:
         authz = self._consult_tool_governor(
             list(caps.tools), source_id=caps.harness,
             principal={"id": caps.worker_id, "kind": "agent",
-                       "privacy_tier": caps.location.value},
+                       "privacy_tier": _GOVERNOR_PRIVACY_TIERS.get(
+                           caps.location.value, caps.location.value)},
             task_id=subtask.parent_task_id, subtask_id=subtask.id,
             context={"subtask_privacy_tier": subtask.privacy_tier.value,
                      "worker_harness": caps.harness},

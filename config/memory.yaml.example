@@ -16,9 +16,12 @@ memory:
       enabled: true
       base_url: http://localhost:8787
       # Bearer token for a token-protected server (`brainconnect serve --token`).
-      # Overridden by WIKIBRAIN_TOKEN / BRAINCONNECT_TOKEN in the environment;
-      # omit it entirely for an unauthenticated server. Sent as the Authorization
-      # header, never logged. Prefer the env var so the token is not written to disk.
+      # Overridden by WIKIBRAIN_TOKEN in the environment (this backend's own env
+      # pair). BRAINCONNECT_URL/BRAINCONNECT_TOKEN apply only when the backend is
+      # configured under the `brainconnect` name — declared as `brainconnect:`
+      # here, or env-only with no memory.yaml at all. Omit the token entirely for
+      # an unauthenticated server. Sent as the Authorization header, never
+      # logged. Prefer the env var so the token is not written to disk.
       # token: Bearer <token>
     cognee:
       enabled: true

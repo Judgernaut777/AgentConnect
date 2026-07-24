@@ -120,32 +120,37 @@ AgentConnect is standalone. None of these is required, and none is configured by
 **BrainConnect** is an optional trusted-memory ledger integration. AgentConnect works
 without it, using local task state and the default no-op memory adapter. Also optional:
 Linear (tracker mirror), Temporal (durable workflows), Cognee (broad retrieval), Graphiti
-(temporal graph), and a local model manager. `wiki serve` — real BrainConnect over real
-HTTP — is deferred and belongs to the BrainConnect repository.
+(temporal graph), and a local model manager. Real BrainConnect over real HTTP is served
+by `brainconnect serve`, which ships in the BrainConnect repository.
 
-Two sibling projects are **planned, not built**. AgentConnect runs, today, with neither:
+Two sibling projects ship **v0.1.0 runtimes in their own repositories**, and AgentConnect
+consumes each of them optionally. It runs, today, with neither:
 
-* **ComputeConnect** would own model providers, local inference, and execution backends.
-  AgentConnect currently ships those seams itself. The contract it will publish is
+* **ComputeConnect** owns model providers, local inference, and execution backends.
+  AgentConnect consumes it through an HTTP local-compute provider, and ships its own
+  execution, routing, and model seams as fallbacks. The contract is
   [docs/COMPUTECONNECT_CONTRACT.md](docs/COMPUTECONNECT_CONTRACT.md).
-* **ToolConnect** would own tool discovery, permission, and invocation. AgentConnect
-  currently ships a fixed MCP tool set. The contract is
-  [docs/TOOLCONNECT_CONTRACT.md](docs/TOOLCONNECT_CONTRACT.md).
+* **ToolConnect** owns tool discovery, permission, and invocation. AgentConnect consumes
+  it through a fail-closed governor client, and ships a fixed MCP tool set as fallback.
+  The contract is [docs/TOOLCONNECT_CONTRACT.md](docs/TOOLCONNECT_CONTRACT.md).
 
-Neither exists as a dependency, neither is importable, and nothing in this repository
-requires them.
+Neither is a Python dependency, neither is configured by default, and nothing in this
+repository requires them.
 
 ### On the name `wikibrain`
 
-BrainConnect was renamed from *WikiBrain*, and the rename has not reached its code. The
-Python package, the `wiki` CLI, the adapter class `WikiBrainMemoryAdapter`, and the
-environment variables `WIKIBRAIN_URL` / `WIKIBRAIN_WRITE_TOKEN` all still say `wikibrain`.
+BrainConnect was renamed from *WikiBrain*, and the rename has since reached its code:
+the sibling's package and CLI are `brainconnect` (there is no `wiki` CLI). AgentConnect's
+own identifiers still say `wikibrain` — the adapter class `WikiBrainMemoryAdapter` and
+the environment variables `WIKIBRAIN_URL` / `WIKIBRAIN_TOKEN`.
 **Those names are load-bearing — do not "correct" them in a config file.** This
 documentation says BrainConnect when it means the product and `wikibrain` when it means
-an identifier you must type. When wiring the Connect ecosystem deployment, the same
-memory service values are expected under `BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN` —
-both names currently refer to the same underlying service, and this env-var naming
-reconciliation is pending.
+an identifier you must type. The env-var naming reconciliation is done, not pending:
+bootstrap registers both spellings as first-class backends of the same service
+(`wikibrain` under `WIKIBRAIN_URL` / `WIKIBRAIN_TOKEN`, `brainconnect` under
+`BRAINCONNECT_URL` / `BRAINCONNECT_TOKEN`; configure one, not both). The Connect
+ecosystem deployment wires `BRAINCONNECT_*`, which is the preferred spelling for new
+deployments; `WIKIBRAIN_*` remains supported, with no deprecation scheduled.
 
 ---
 
@@ -268,7 +273,7 @@ config/                      # policy & registry (edit these, not code)
   secrets.example.yaml       #   §7  CLOUD secret_ref → resolver (local nodes carry none)
 
 packages/
-  agentconnect-core/         # shared, framework-free (pydantic + pyyaml only)
+  agentconnect-core/         # shared, framework-free (pydantic + pyyaml + httpx only)
     …/common/{schemas,state,memory,quota,privacy,providers,secrets,config,tokens,workqueue}.py
   agentconnect-router/       # the PRIMARY product — Agent Router MCP control plane
     …/router/{routing,gateway,service,mcp_server,local_client,provisioning}.py
@@ -341,8 +346,12 @@ A-vs-B tradeoffs.
 | `queue_add(task, privacy_class, …)` | ticket + status |
 | `queue_next(worker_id, capabilities)` | list of claimable tickets |
 | `queue_claim(worker_id, ticket_id)` | claimed ticket or error |
+| `queue_update(worker_id, ticket_id, lease_token, extend_seconds)` | renewed lease, or refusal if the holder/token doesn't match or the lease expired |
 | `queue_report(worker_id, ticket_id, lease_token, result)` | ticket/result status |
+| `queue_link(ticket_id, depends_on)` | dependency edge (privacy monotonicity enforced) |
 | `queue_status(ticket_id, …)` | ticket metadata + audit trail |
+| `queue_approve(reviewer_id, ticket_id)` | in_review ticket promoted to done (`local_only` reviewer only) |
+| `queue_reject(reviewer_id, ticket_id, reason)` | ticket requeued while attempts remain, else failed (`local_only` reviewer only) |
 | `queue_list(status, privacy_class, …)` | payload-free ticket listing (operator view) |
 | `queue_pending(limit)` | in_review backlog (operator view) |
 | `queue_stats()` | queue counts + capability requirements (operator view) |
@@ -355,6 +364,7 @@ A-vs-B tradeoffs.
 | `get_provider_scorecards()` | learned per-provider quality/latency (Phase 6) |
 | `set_budget(amount_usd, period)` / `get_budget_status()` | global spend budget + pacing |
 | `promote_task(task_id)` / `cancel_task(task_id)` | control |
+| `enqueue_task(task, privacy_class, …)` | ticket: classify/redact + queue in one call, routing decision recorded as an *advisory* assignee hint |
 
 ## Context virtualization
 

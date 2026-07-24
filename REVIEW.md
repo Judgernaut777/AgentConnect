@@ -1,5 +1,30 @@
 # Repository Review
 
+> **Status note (2026-07-24).** This is a historical point-in-time review of the
+> pre-rename repository (`mcp-agentconnect`, 89-test era). The finding bodies below
+> are preserved as written; their current status against the code:
+>
+> 1. **Fixed** — the gateway now routes cloud calls through LiteLLM
+>    (`_call_via_litellm` in `gateway.py`); `ProviderConfig.litellm_model` selects a
+>    native provider handler (e.g. `gemini/…`), with OpenAI-compatible mode as the
+>    default. Pinned by `tests/test_gateway_cloud.py`.
+> 2. **Still true, and deliberate** — the `[cloud-stub:…]` fallback remains,
+>    documented in the `_call_cloud` docstring and test-pinned
+>    (`tests/test_gateway_cloud.py`); a production build would remove it.
+> 3. **Fixed** — the pre-storage clamp is removed; artifacts store the full output
+>    and `read_artifact_chunk` pages it back bounded. Regression:
+>    `tests/test_artifact_full_storage.py`.
+> 4. **Fixed** — the router service passes `time.time()` at all four
+>    `pool.acquire`/`pool.release` sites. Regression:
+>    `tests/test_nodepool_concurrency.py::test_idle_reaper_spares_recently_used_node`.
+> 5. **Still true** — quota reservations are per-process; documented as a known
+>    limitation (`docs/MULTI_HARNESS.md`, Model A caveats).
+> 6. **Largely addressed** — `docs/STATUS.md` states the stabilization boundary and
+>    test-fidelity limits; `README.md` leads with the trust boundary.
+>
+> The verification counts below predate the current suite; see the changelog for
+> the measured gate at head.
+
 Scope: `mcp-agentconnect` as checked out in this workspace.
 
 ## Summary
@@ -38,7 +63,8 @@ The privacy and spend controls are serious work, not decorative. The tests show 
 
 ## Verification
 
-Local verification in this workspace:
+Local verification in this workspace (historical — the suite has since grown to
+four figures; see the changelog for the current gate):
 
 - Full suite: `89 passed, 1 warning`
 - mTLS tests pass with local socket permission

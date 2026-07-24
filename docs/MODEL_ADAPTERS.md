@@ -12,22 +12,36 @@ The list below separates those surfaces so “adapter” means something concret
 
 These determine how the router turns a generic generation request into a provider-specific API call.
 
+The cloud transport is **LiteLLM**: `_call_via_litellm`
+(`packages/agentconnect-router/src/agentconnect/router/gateway.py`) delegates every
+live cloud call to it, behind the `[cloud]` extra. `ProviderConfig.litellm_model`
+selects a **native** provider handler (e.g. `litellm_model: "gemini/gemini-1.5-flash"`
+in `config/providers.yaml`); when it is unset, the call goes out in OpenAI-compatible
+mode (`openai/{model}`) against `cfg.endpoint` — the prior behavior, now maintained by
+LiteLLM. The API key is resolved at call time and passed per-call, never via the
+environment.
+
 | Adapter | Status | Where | Purpose | Notes |
 |---|---|---|---|---|
-| OpenAI-compatible cloud call | Implemented | `packages/agentconnect-router/src/agentconnect/router/gateway.py` | Calls `/chat/completions` with OpenAI-shaped payloads | Works for OpenAI, Groq, and other compatible endpoints |
-| Gemini native adapter | Missing | N/A | Translate router requests to Gemini’s native API | Needed because Gemini is not OpenAI-shaped |
-| Anthropic native adapter | Missing | N/A | Translate router requests to Anthropic’s Messages API | Same reason: request/response shape differs |
-| OpenRouter adapter | Missing | N/A | Call OpenRouter’s API directly or through compatible routing | Useful if you want provider multiplexing behind one endpoint |
-| Bedrock adapter | Missing | N/A | Use AWS Bedrock model invocation APIs | Requires its own auth and payload mapping |
-| Azure OpenAI adapter | Missing | N/A | Call Azure-hosted OpenAI endpoints | Endpoint and auth differ from raw OpenAI |
-| Mistral adapter | Missing | N/A | Call Mistral’s API directly | Native API shape is not guaranteed to match OpenAI-compatible behavior |
-| Cohere adapter | Missing | N/A | Call Cohere’s native generation/chat APIs | Useful if you want native Cohere features or tool semantics |
-| xAI adapter | Missing | N/A | Call xAI’s API directly | Separate auth and model naming from OpenAI-compatible providers |
-| DeepSeek adapter | Missing | N/A | Call DeepSeek’s API directly | May be OpenAI-compatible in some deployments, but a native adapter keeps the boundary explicit |
-| Perplexity adapter | Missing | N/A | Call Perplexity’s API directly | Useful if the provider exposes provider-specific search/chat behavior |
-| Vertex AI adapter | Missing | N/A | Call Google Cloud Vertex AI model endpoints | Distinct from Gemini native API, depending on deployment path |
-| Hugging Face inference adapter | Missing | N/A | Call HF Inference Endpoints / hosted model APIs | Good for arbitrary hosted models with provider-specific routing |
+| OpenAI-compatible cloud call | Implemented | `gateway.py` (LiteLLM, `litellm_model` unset) | Calls `/chat/completions` with OpenAI-shaped payloads | Works for OpenAI, Groq, and other compatible endpoints |
+| Gemini native adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Translate router requests to Gemini’s native API | Needed because Gemini is not OpenAI-shaped; `config/providers.yaml` names `gemini/…` for exactly this reason |
+| Anthropic native adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Translate router requests to Anthropic’s Messages API | Same reason: request/response shape differs |
+| OpenRouter adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` (or OpenAI-compatible mode) | Call OpenRouter’s API directly or through compatible routing | Useful if you want provider multiplexing behind one endpoint |
+| Bedrock adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Use AWS Bedrock model invocation APIs | LiteLLM carries the auth and payload mapping |
+| Azure OpenAI adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call Azure-hosted OpenAI endpoints | Endpoint and auth differ from raw OpenAI |
+| Mistral adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call Mistral’s API directly | Native API shape is not guaranteed to match OpenAI-compatible behavior |
+| Cohere adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call Cohere’s native generation/chat APIs | Useful if you want native Cohere features or tool semantics |
+| xAI adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call xAI’s API directly | Separate auth and model naming from OpenAI-compatible providers |
+| DeepSeek adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` (or OpenAI-compatible mode) | Call DeepSeek’s API directly | Often OpenAI-compatible; the named handler keeps the boundary explicit |
+| Perplexity adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call Perplexity’s API directly | Useful if the provider exposes provider-specific search/chat behavior |
+| Vertex AI adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call Google Cloud Vertex AI model endpoints | Distinct from Gemini native API, depending on deployment path |
+| Hugging Face inference adapter | Covered via LiteLLM | `gateway.py` + `litellm_model` | Call HF Inference Endpoints / hosted model APIs | Good for arbitrary hosted models with provider-specific routing |
 | Local/stub cloud adapter | Implemented as fallback | `gateway.py` | Returns deterministic stub output when cloud is unavailable | Good for offline demos, not a real provider adapter |
+
+“Covered via LiteLLM” means: no per-provider code exists in this repo, and none is
+needed — the provider is reached by naming its LiteLLM handler in
+`ProviderConfig.litellm_model`. Untested handlers stay untested until configured; the
+table records the transport, not a validation claim per provider.
 
 ### Cloud Provider Classes
 
@@ -37,7 +51,7 @@ Many “models” are actually accessed through one of these provider classes:
 - Native chat/generation APIs: Gemini, Anthropic, Cohere, Mistral, xAI, Perplexity
 - Cloud model platforms: AWS Bedrock, Google Vertex AI, Hugging Face endpoints
 
-If a provider speaks the OpenAI-compatible shape, you can usually cover it with the existing adapter. If it does not, it needs its own adapter or a compatibility shim.
+If a provider speaks the OpenAI-compatible shape, the default (`litellm_model` unset) covers it. If it does not, name its native LiteLLM handler in `ProviderConfig.litellm_model` — no in-repo adapter is required either way.
 
 ### Broker / Router Layers
 
@@ -46,7 +60,7 @@ These are not model providers in the same sense. They are aggregation layers tha
 | Layer | Status | Adapter need | Notes |
 |---|---|---|---|
 | OpenRouter | Implemented by compatibility, not first-class here | Usually no separate adapter | Use the existing OpenAI-compatible cloud adapter unless you need OpenRouter-specific routing metadata |
-| LiteLLM | Implemented by compatibility, not first-class here | Usually no separate adapter | LiteLLM explicitly presents a unified OpenAI-style interface and translates to many provider endpoints |
+| LiteLLM | **First-class: it is the gateway’s cloud transport** (`_call_via_litellm`) | No separate adapter | LiteLLM presents a unified interface and translates to many provider endpoints; the router rides that translation directly |
 | 9router | Likely broker/proxy | Usually no separate adapter if OpenAI-compatible | Treat as a proxy layer unless its API shape differs |
 | OmniRoute | Likely broker/proxy | Usually no separate adapter if OpenAI-compatible | Same rule as other routers/proxies |
 | cliproxyapi | Likely proxy | Usually no separate adapter if OpenAI-compatible | Same rule as other routers/proxies |

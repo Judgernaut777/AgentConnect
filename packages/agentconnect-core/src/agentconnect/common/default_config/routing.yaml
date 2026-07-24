@@ -18,16 +18,23 @@ privacy:
     restricted:     [local_only]                            # unless explicitly approved
   # Classes that require the redaction pass to succeed before any external route.
   require_redaction: [low_sensitive]
-  # Classes that must never reach an LLM at all — block or redact.
+  # Classes that must never reach an LLM at all — block or redact. Informational,
+  # not yet read by code: the block is enforced by `classes` mapping
+  # secret_sensitive to [] above (fail-closed), not by this flag.
   block_from_llm: [secret_sensitive]
   # A repo_sensitive task may use a rented node only with explicit opt-in AND when
   # the node satisfies its trust policy (ephemeral/encrypted/own-image/no-logging).
+  # Informational, not yet read by code: the opt-in + trust check is enforced
+  # unconditionally (fail-closed) regardless of this flag.
   rented_repo_sensitive_requires_optin: true
 
 # --- MCP output policy: context virtualization (§9) --------------------------
 mcp_output_policy:
   default_max_chars: 4000
   hard_max_chars: 12000
+  # The booleans below are informational, not yet read by code: only the two
+  # char limits above are enforced; the whole block is echoed back verbatim as
+  # `output_policy` metadata on tool results.
   never_return_full_logs: true
   never_return_full_repo_files: true
   never_return_full_traces: true
@@ -36,17 +43,22 @@ mcp_output_policy:
 
 # --- Local model residency / switching (§16) ---------------------------------
 model_switching:
+  # Informational, not yet read by code: the live default resident model comes
+  # from profiles.yaml `default_resident_model`.
   default_resident_model: qwen3.6-35b-a3b
   prefer_resident_model: true
   avoid_switch_if_current_queue_nonempty: true
   min_batch_size_for_switch: 4
-  min_residency_seconds: 600
+  min_residency_seconds: 600              # not yet read by code
   urgent_switch_allowed: true
-  specialist_review_can_wait: true
-  switch_back_to_default_when_idle: true
+  specialist_review_can_wait: true        # not yet read by code
+  switch_back_to_default_when_idle: true  # not yet read by code
 
 # --- Local inference admission defaults (§18) --------------------------------
 local_inference_defaults:
+  # main_model / max_active_sequences / max_model_len are informational, not yet
+  # read by code — the model manager takes its admission limits from its own
+  # constructor defaults. Only default_max_output_tokens is read (by the router).
   main_model: qwen3.6-35b-a3b
   max_active_sequences: 4
   max_model_len: 16384
@@ -64,6 +76,8 @@ scoring:
     residency_bonus: 2.5
     quota_scarcity_penalty: 2.0
     queue_delay_penalty: 1.5
+    # A resident-model task pays no switch penalty; a specialist that is not loaded
+    # pays the full model_switch_penalty unless the batch threshold is met.
     model_switch_penalty: 3.0
     cost_penalty: 2.0
     opportunity_cost: 1.5
@@ -78,6 +92,7 @@ scoring:
     budget_pressure_penalty: 3.0
   # Minimum observations before a provider's learned signal is used at all.
   learned_min_samples: 5
+  quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains
 
 # --- Global spend budget: policy only, NO amount (handoff budget feature) --------
 # The amount + period are set by the user at runtime via the set_budget MCP tool and
@@ -87,6 +102,3 @@ scoring:
 budget:
   require_explicit: true        # paid/rented ineligible until a budget is set
   suggested_period: monthly     # daily | weekly | monthly (hint for the prompt)
-  # A resident-model task pays no switch penalty; a specialist that is not loaded
-  # pays the full model_switch_penalty unless the batch threshold is met.
-  quota_scarcity_threshold_pct: 0.20   # penalize when <20% of a quota remains

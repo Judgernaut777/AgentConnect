@@ -13,8 +13,10 @@
 # contract) is a DENY, never an allow — a policy engine that fails open is not a
 # policy engine.
 #
-# Precedence (byte-for-byte with memory.yaml):
+# Precedence (env wins over file for the URL):
 #   AGENTCONNECT_TOOLCONNECT_URL (env)  ->  toolconnect.base_url (this file)  ->  off.
+# Unlike memory backends, the env URL activates the subsystem even when this
+# file says `enabled: false`.
 # A malformed `toolconnect:` block degrades to no governor with a warning.
 toolconnect:
   enabled: true
@@ -25,8 +27,11 @@ toolconnect:
   base_url: http://127.0.0.1:8095
 
   # `required` (default): an unreachable engine is a denial and the subtask fails
-  # with a recorded reason. `advisory`: a caller may fall back to a pre-fetched,
-  # unexpired ToolsetPack — the client still never fabricates an allow.
+  # with a recorded reason. `advisory`: currently identical in enforcement —
+  # every deny (including an engine outage) still blocks the subtask; the mode
+  # is only recorded in observation metadata (`governor_mode`) and reserved for
+  # a future cached-ToolsetPack fallback that ADR 0007/0008 explicitly leave
+  # out of scope (no /resolve_toolset route exists).
   # Overridden by AGENTCONNECT_TOOLCONNECT_MODE.
   mode: required
 

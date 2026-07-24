@@ -1,7 +1,8 @@
 # ComputeConnect — integration contract
 
-**Status: contract under implementation.** A ComputeConnect implementation is being
-built concurrently (2026-07); its `docs/CONTRACT.md` is the naming authority for the
+**Status: contract implemented on both sides.** ComputeConnect ships v0.1.0 in the
+sibling repository (2026-07-17), and AgentConnect consumes it through the HTTP
+local-compute provider; its `docs/CONTRACT.md` is the naming authority for the
 shared surface, and two amendments are ratified and implemented on this side (see
 §2). Still true and load-bearing: nothing in this repository imports ComputeConnect,
 depends on it, or degrades without it. AgentConnect ships every seam below itself,
@@ -31,7 +32,7 @@ that other modules import directly. The distinction is the whole cost estimate.
 | Seam | Kind | Location | Real? |
 |---|---|---|---|
 | `ExecutionBackend` | `abc.ABC` | `core/execution.py:67` | **Yes** |
-| `LocalComputeProvider` | `abc.ABC` | `core/local_compute.py:92` | **Yes** |
+| `LocalComputeProvider` | `abc.ABC` | `core/local_compute.py:101` | **Yes** |
 | `WorkerAdapter` | `abc.ABC` | `core/workers.py:90` | **Yes** |
 | `LocalClient` | `abc.ABC` | `router/local_client.py:33` | **Yes** |
 | `ModelBackend` | `abc.ABC` | `model_manager/backends.py:20` | **Yes** |
@@ -82,15 +83,15 @@ retried; it may **not** reorder it. Specifically:
 * `signal` must accept `approval_granted`, `approval_denied`, `cancel_requested`.
 
 **Known gap, stated so ComputeConnect does not inherit it.** The seam is clean but
-selection is not wired: `service.py:178` defaults to `DirectExecutionBackend` and
+selection is not wired: `service.py:205` defaults to `DirectExecutionBackend` and
 `bootstrap.service_from_env()` never binds Temporal. There is no `AGENTCONNECT_EXECUTION`
-environment variable. Outside tests, `bind_execution()` (`service.py:180`) is called by
+environment variable. Outside tests, `bind_execution()` (`service.py:247`) is called by
 nobody. A ComputeConnect integration should supply the missing configuration path rather
 than assume one exists.
 
 ## 2. Local inference
 
-`LocalComputeProvider` (`core/local_compute.py:92`) is already written as a contract for
+`LocalComputeProvider` (`core/local_compute.py:101`) is already written as a contract for
 an *external* engine — it is exactly the ComputeConnect-shaped hole:
 
 ```python
@@ -102,13 +103,20 @@ class LocalComputeProvider(abc.ABC):
     def health(self) -> dict: ...          # concrete default
 ```
 
-`HttpLocalComputeProvider` (`local_compute.py:109`) is the reference implementation and
-pins the HTTP surface a ComputeConnect service would serve:
+`HttpLocalComputeProvider` (`local_compute.py:118`) is the reference implementation and
+pins the HTTP surface a ComputeConnect service serves:
 
 ```
 GET  /health          GET  /models        GET  /models/loaded
 POST /route/estimate  POST /generate      POST /runs/{id}/cancel
 ```
+
+ComputeConnect v0.1.0 enforces bearer auth on this surface: when `COMPUTECONNECT_TOKEN`
+(or its config `token`) is set, every route but `GET /health` requires it, and a
+non-loopback bind refuses to start without one. On this side the credential comes from
+`AGENTCONNECT_COMPUTE_TOKEN` (or the compute config's `token:`), sent **verbatim** as
+the `Authorization` header and never logged — so the value must include the
+`Bearer ` prefix itself. A tokenless loopback deployment remains open by default.
 
 ### Ratified amendments (2026-07-12; ComputeConnect `docs/CONTRACT.md` is the naming authority)
 
@@ -132,7 +140,7 @@ a real ComputeConnect is integration-tested against the same shapes separately).
   `/generate` remains a thin streaming proxy per ComputeConnect invariant 3.
 
 The provider does not participate in routing directly. It is wrapped by
-`LocalModelManagerWorkerAdapter` (`local_compute.py:200`) and registered as one worker in
+`LocalModelManagerWorkerAdapter` (`local_compute.py:223`) and registered as one worker in
 the router's `WorkerRegistry`. **AgentConnect defines the contract and does not own the
 engine** — that boundary is deliberate and predates this note.
 
@@ -204,7 +212,7 @@ deterministic** — a scorer that consults an LLM breaks `explain_route`.
 a provider path of its own and never touches a secret.
 
 One invariant worth writing down because the wire format enforces it: `RuntimeConfig`
-(`runtime/agent.py:41`) is **server-side only** and never crosses the remote boundary
+(`runtime/agent.py:42`) is **server-side only** and never crosses the remote boundary
 (`transport.py:9-13`). The wire carries `{task_id, TaskSubmission}` and returns
 `WorkerResult`. Therefore a router — or a future ComputeConnect — **cannot remotely relax
 `allow_shell`, `allow_tests`, or `allow_browser`**. Keep it that way.

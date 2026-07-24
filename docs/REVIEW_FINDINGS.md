@@ -1,5 +1,18 @@
 # Review Findings
 
+> **Status note (2026-07-24).** A historical snapshot from the pre-rename,
+> 89-test-era review; the numbered items mirror `REVIEW.md`. Current status:
+> **1 fixed** (cloud calls go through LiteLLM — `_call_via_litellm` in
+> `gateway.py`, native handlers via `ProviderConfig.litellm_model`, pinned by
+> `tests/test_gateway_cloud.py`); **2 still true and deliberate** (the stub
+> fallback is documented and test-pinned); **3 fixed** (pre-storage clamp
+> removed; regression `tests/test_artifact_full_storage.py`); **4 fixed**
+> (`time.time()` passed at all four `pool.acquire`/`pool.release` sites;
+> regression `tests/test_nodepool_concurrency.py::test_idle_reaper_spares_recently_used_node`);
+> **5 still true** (per-process quota reservations, documented in
+> `docs/MULTI_HARNESS.md`); **6 largely addressed** (`docs/STATUS.md` and the
+> README trust-boundary section).
+
 This note captures the main issues found in the current repository review.
 
 ## Findings
@@ -18,6 +31,7 @@ This note captures the main issues found in the current repository review.
 
 ## Verification
 
-The current test suite passes in the local sandbox with the installed dependencies:
+The test suite passed in the local sandbox with the then-installed dependencies
+(historical — see the changelog for the current gate):
 
 `89 passed, 1 warning`
