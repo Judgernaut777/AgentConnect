@@ -408,12 +408,14 @@ Beyond the backplane's own list above, the other packages read these
 operator-facing variables (each documented with its component):
 
 - core: `AGENTCONNECT_CONFIG_DIR` (master config-dir override),
-  `AGENTCONNECT_DATA_DIR`, `AGENTCONNECT_BASE_URL`, `AGENTCONNECT_LOG_LEVEL`,
   `OP_CLI` (path to the 1Password CLI for `op://` secret refs)
-- router: `AGENTCONNECT_LOCAL_TLS_MODE`, `AGENTCONNECT_LOCAL_SERVER_NAME`,
+- router: `AGENTCONNECT_DATA_DIR` (shared-memory fallback dir),
+  `AGENTCONNECT_LOCAL_TLS_MODE`, `AGENTCONNECT_LOCAL_SERVER_NAME`,
   `FASCIA_GUARD`, `FASCIA_GUARD_ENFORCE`, and — via `providers.yaml`
   expansion — `AGENTCONNECT_RENTED_CA` / `AGENTCONNECT_RENTED_CLIENT_CERT` /
   `AGENTCONNECT_RENTED_CLIENT_KEY`
+- api / cli: `AGENTCONNECT_BASE_URL` (artifact links in Linear mirrors)
+- temporal worker: `AGENTCONNECT_LOG_LEVEL`
 - model-manager: `MODEL_MANAGER_HOST`, `MODEL_MANAGER_PORT`,
   `MODEL_MANAGER_TLS_MODE`, `MODEL_BACKEND_MODELS`
 - compute / toolconnect consumers: `AGENTCONNECT_COMPUTE_TIMEOUT`,

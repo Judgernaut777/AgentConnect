@@ -75,6 +75,20 @@ def test_list_rooted_compute_document_degrades_to_off(monkeypatch, tmp_path):
     assert bootstrap.compute_worker_from_env() is None
 
 
+def test_non_mapping_memory_backend_entry_is_ignored(monkeypatch, tmp_path):
+    # One level deeper than the block guards: `wikibrain: true` is a natural
+    # operator shorthand for enabling a backend, and it must be ignored with a
+    # warning — not crash startup with AttributeError on `spec.get`.
+    bad = tmp_path / "memory.yaml"
+    bad.write_text("memory:\n  backends:\n    wikibrain: true\n", encoding="utf-8")
+    monkeypatch.setenv(bootstrap.MEMORY_CONFIG_PATH, str(bad))
+    for var in ("WIKIBRAIN_URL", "BRAINCONNECT_URL", "COGNEE_URL", "GRAPHITI_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+    adapters, _config = bootstrap.memory_from_env()
+    assert adapters == {}
+
+
 def test_yaml_base_url_and_knobs_honored(monkeypatch, tmp_path):
     cfg = tmp_path / "compute.yaml"
     cfg.write_text(
