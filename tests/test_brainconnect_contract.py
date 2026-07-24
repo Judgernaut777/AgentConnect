@@ -13,6 +13,7 @@ between the two repositories fails a gate here rather than in production.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -80,8 +81,8 @@ RECALL_PACK_WITHHELD = {
     ],
 }
 
-# The refusal envelope a future `brainconnect serve` will return (HTTP 409). BrainConnect
-# has expressed it two ways — a flat `error` string (its server intent, matching this
+# The refusal envelope `brainconnect serve` returns (HTTP 409). BrainConnect has
+# expressed it two ways — a flat `error` string (its original server intent, matching this
 # adapter's original reader) and a nested `error.code` object (its CONTRACT.md draft). The
 # adapter tolerates both so neither repo can break the other by changing the nesting.
 _SAFETY_SUMMARY = {"surface": "memory_promotion", "decision": "block",
@@ -200,7 +201,23 @@ def test_a_forbidden_envelope_is_an_authorization_error():
 
 # ---- cross-check the embedded shapes against the real repo, when present -----
 
-_BRAINCONNECT_FIXTURES = Path("/home/mini/WikiBrain/tests/contract")
+
+def _brainconnect_repo() -> Path:
+    """WIKIBRAIN_REPO env override (the same variable test_wikibrain_integration.py
+    honors), else the first repo-parent sibling under the published name
+    BrainConnect then the pre-rename WikiBrain, else the original development
+    checkout as a last resort."""
+    override = os.environ.get("WIKIBRAIN_REPO")
+    if override:
+        return Path(override)
+    siblings = Path(__file__).resolve().parents[2]
+    for name in ("BrainConnect", "WikiBrain"):
+        if (siblings / name).is_dir():
+            return siblings / name
+    return Path("/home/mini/WikiBrain")
+
+
+_BRAINCONNECT_FIXTURES = _brainconnect_repo() / "tests" / "contract"
 
 
 def _real(name: str) -> dict:

@@ -1,0 +1,27 @@
+# Pull-worker identity -> attested tier map (federated work queue).
+#
+#   Identity IS authorization on the queue_* MCP tools: this map is the ONLY
+#   source of truth for a caller's tier — the tools never accept a tier in the
+#   request body.
+#
+# Read by load_workers() from `config/workers.yaml` (key `workers`): each entry
+# maps a worker/reviewer identity to its attested ProviderPrivacyTier
+# (local_only | private_rented | external | external_paid).
+#
+# This file is OPTIONAL and fail-closed: with no file (or no entries), no pull
+# worker has an attested tier, the admissible-class set is empty, and every
+# claim is denied. Mapping an identity here can only ever GRANT a tier — which
+# privacy classes that tier may claim is still gated live by routing.yaml's
+# `privacy.classes`, never widened by this file.
+#
+# For quick local wiring/tests, the AGENTCONNECT_WORKER_TIERS env var (a JSON
+# object, e.g. '{"trusted-worker": "local_only"}') wins over this file when set.
+
+workers: {}
+
+# Example (uncomment and adapt):
+#
+# workers:
+#   my-local-box: local_only        # your own hardware; results auto-accept
+#   friend-compute: private_rented  # semi-trusted; results land in_review
+#   cloud-worker: external          # untrusted; public/redacted work only

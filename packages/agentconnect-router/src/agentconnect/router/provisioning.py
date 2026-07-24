@@ -212,7 +212,7 @@ class NodePool:
     ``acquire`` reuses a ready node for the provider if one is up, else provisions
     a fresh one (returning ``reused=False`` so the caller bills the rental window
     once). ``reap_idle`` terminates nodes idle past their configured window. Thread
-    -safe; ``clock`` is injectable for deterministic tests.
+    -safe; callers supply ``now`` so tests stay deterministic.
     """
 
     def __init__(self):

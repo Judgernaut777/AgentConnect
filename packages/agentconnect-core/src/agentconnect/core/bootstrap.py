@@ -25,20 +25,26 @@ checked-in file: env selection (e.g. `export BRAINCONNECT_URL=...`) is honored.
 Memory backend env (each optional; a backend with no URL set stays off):
   WIKIBRAIN_URL / BRAINCONNECT_URL   the trusted-authority base URL
   WIKIBRAIN_TOKEN / BRAINCONNECT_TOKEN  bearer token for a token-protected server
-                                     (`brainconnect serve --token`); sent as the
-                                     Authorization header, never logged
+                                     (`brainconnect serve --token`); sent VERBATIM as
+                                     the Authorization header, so the value must
+                                     include the scheme (`Bearer <token>`); never logged
   COGNEE_URL / COGNEE_TOKEN, GRAPHITI_URL / GRAPHITI_TOKEN   likewise
 
 Compute plane env (optional; unset => the local_model_manager worker stays off):
   AGENTCONNECT_COMPUTE_URL     base URL of a ComputeConnect deployment (env wins over
                                `config/compute.yaml` -> compute.base_url)
   AGENTCONNECT_COMPUTE_TIMEOUT request timeout seconds (default 30)
-  AGENTCONNECT_COMPUTE_TOKEN   optional bearer token, Authorization header, never logged
+  AGENTCONNECT_COMPUTE_TOKEN   optional bearer token, sent VERBATIM as the
+                               Authorization header — include the scheme prefix
+                               (`Bearer <token>`), or the server 401s; never logged
 
 Tool governance env (optional; unset => no ToolGovernor, standalone unchanged):
   AGENTCONNECT_TOOLCONNECT_URL   base URL of a `toolconnect serve` decision point
                                  (env wins over `config/toolconnect.yaml`)
-  AGENTCONNECT_TOOLCONNECT_TOKEN optional bearer token, Authorization header, never logged
+  AGENTCONNECT_TOOLCONNECT_TOKEN optional bearer token, sent VERBATIM as the
+                                 Authorization header — include the scheme prefix
+                                 (`Bearer <token>`), or every governed subtask fails
+                                 as a fail-closed 401 outage-deny; never logged
   AGENTCONNECT_TOOLCONNECT_MODE  `required` (default) or `advisory`
 """
 
@@ -144,6 +150,22 @@ def _load_yaml_config(env_var: str, default_path: str, subsystem: str) -> dict[s
         return {}
 
 
+def _config_block(raw: Any, key: str, subsystem: str) -> dict[str, Any]:
+    """The `key:` mapping out of a loaded config document, degrading to `{}` with a
+    warning when the document root or the block is well-formed YAML of the wrong
+    shape (`compute: notamapping`, a list-rooted file) — the same degrade-to-off
+    discipline `_load_yaml_config` applies to an unreadable file."""
+    if not isinstance(raw, dict):
+        _log.warning("config document for %s is not a mapping; %s stays disabled",
+                     subsystem, subsystem)
+        return {}
+    block = raw.get(key) or {}
+    if not isinstance(block, dict):
+        _log.warning("`%s:` is not a mapping; %s stays disabled", key, subsystem)
+        return {}
+    return block
+
+
 def _compute_timeout(block: dict[str, Any]) -> float:
     raw = os.environ.get("AGENTCONNECT_COMPUTE_TIMEOUT")
     if raw is None:
@@ -160,17 +182,20 @@ def _compute_timeout(block: dict[str, Any]) -> float:
 def compute_worker_from_env() -> Optional[WorkerAdapter]:
     """Build the external local-compute worker from config, or `None` (subsystem off).
 
-    Mirrors `memory_from_env` byte-for-byte on precedence and failure: env
+    Follows `memory_from_env`'s precedence and failure posture: env
     `AGENTCONNECT_COMPUTE_URL` wins over `config/compute.yaml`'s `compute.base_url`,
     file wins over nothing, and absence leaves the `local_model_manager` worker
-    unregistered — exactly today's "optional subsystem" standalone behaviour. A
+    unregistered — exactly today's "optional subsystem" standalone behaviour. One
+    difference from memory backends: a bare env URL activates the subsystem even
+    when the file says `enabled: false`. A
     malformed `compute:` block degrades to off with a warning. The result, when not
     `None`, is a `LocalModelManagerWorkerAdapter(HttpLocalComputeProvider(url))` —
     both already exist; only the wiring from config was missing (ComputeConnect
     docs/AGENTCONNECT_INTEGRATION.md). No engine choice is made here.
     """
-    block = (_load_yaml_config(COMPUTE_CONFIG_PATH, "config/compute.yaml", "compute").get("compute")
-             or {})
+    block = _config_block(
+        _load_yaml_config(COMPUTE_CONFIG_PATH, "config/compute.yaml", "compute"),
+        "compute", "compute")
     env_url = os.environ.get("AGENTCONNECT_COMPUTE_URL")
     if env_url:
         url = env_url
@@ -210,8 +235,10 @@ def toolconnect_governor_from_env() -> Optional[Any]:
     """
     from .toolconnect_client import ToolConnectGovernor
 
-    block = (_load_yaml_config(TOOLCONNECT_CONFIG_PATH, "config/toolconnect.yaml",
-                               "toolconnect governor").get("toolconnect") or {})
+    block = _config_block(
+        _load_yaml_config(TOOLCONNECT_CONFIG_PATH, "config/toolconnect.yaml",
+                          "toolconnect governor"),
+        "toolconnect", "toolconnect governor")
     env_url = os.environ.get("AGENTCONNECT_TOOLCONNECT_URL")
     if env_url:
         url = env_url
@@ -270,11 +297,21 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
     simply off — the backplane is a task ledger first (§17 acceptance 1-2).
     """
     raw = _load_memory_yaml()
+    # Same wrong-shape discipline as the other config surfaces: a list-rooted
+    # document or a scalar `memory:` value degrades to off with a warning instead
+    # of crashing startup (MemoryConfig.from_dict assumes mappings).
+    block = raw.get("memory") if isinstance(raw, dict) else raw
+    if not (block is None or isinstance(block, dict)):
+        _log.warning("`memory:` config is not a mapping; memory stays disabled")
+        raw = {}
     config = MemoryConfig.from_dict(raw)
     if not config.enabled:
         return {}, config
 
     declared = (raw.get("memory") or {}).get("backends") or {}
+    if not isinstance(declared, dict):
+        _log.warning("`memory.backends:` is not a mapping; declared backends ignored")
+        declared = {}
     adapters: dict[str, MemoryAdapter] = {}
     for name, (cls, env_var, default_url, token_env) in _MEMORY_BACKENDS.items():
         spec = declared.get(name) or {}
