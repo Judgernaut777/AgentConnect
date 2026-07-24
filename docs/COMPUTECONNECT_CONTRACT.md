@@ -140,7 +140,7 @@ a real ComputeConnect is integration-tested against the same shapes separately).
   `/generate` remains a thin streaming proxy per ComputeConnect invariant 3.
 
 The provider does not participate in routing directly. It is wrapped by
-`LocalModelManagerWorkerAdapter` (`local_compute.py:222`) and registered as one worker in
+`LocalModelManagerWorkerAdapter` (`local_compute.py:223`) and registered as one worker in
 the router's `WorkerRegistry`. **AgentConnect defines the contract and does not own the
 engine** — that boundary is deliberate and predates this note.
 

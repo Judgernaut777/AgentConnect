@@ -223,7 +223,7 @@ class NodePool:
         self._last_used: dict[str, float] = {}
 
     def acquire(
-        self, cfg: ProviderConfig, provisioner: NodeProvisioner, spec: NodeSpec, now: float = 0.0
+        self, cfg: ProviderConfig, provisioner: NodeProvisioner, spec: NodeSpec, *, now: float
     ) -> tuple[NodeHandle, bool]:
         with self._lock:
             existing = self._live.get(cfg.provider_id)
@@ -236,7 +236,7 @@ class NodePool:
             self._last_used[cfg.provider_id] = now
         return handle, False
 
-    def release(self, cfg: ProviderConfig, now: float = 0.0) -> None:
+    def release(self, cfg: ProviderConfig, *, now: float) -> None:
         with self._lock:
             if cfg.provider_id in self._live:
                 self._last_used[cfg.provider_id] = now

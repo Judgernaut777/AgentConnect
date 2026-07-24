@@ -156,12 +156,13 @@ def _config_block(raw: Any, key: str, subsystem: str) -> dict[str, Any]:
     shape (`compute: notamapping`, a list-rooted file) — the same degrade-to-off
     discipline `_load_yaml_config` applies to an unreadable file."""
     if not isinstance(raw, dict):
-        _log.warning("config document for %s is not a mapping; %s stays disabled",
-                     subsystem, subsystem)
+        _log.warning("config document for %s is not a mapping; file ignored "
+                     "(env configuration, if any, still applies)", subsystem)
         return {}
     block = raw.get(key) or {}
     if not isinstance(block, dict):
-        _log.warning("`%s:` is not a mapping; %s stays disabled", key, subsystem)
+        _log.warning("`%s:` is not a mapping; file ignored (env configuration, "
+                     "if any, still applies)", key)
         return {}
     return block
 
@@ -302,7 +303,8 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
     # of crashing startup (MemoryConfig.from_dict assumes mappings).
     block = raw.get("memory") if isinstance(raw, dict) else raw
     if not (block is None or isinstance(block, dict)):
-        _log.warning("`memory:` config is not a mapping; memory stays disabled")
+        _log.warning("`memory:` config is not a mapping; file ignored "
+                     "(env-configured backends still apply)")
         raw = {}
     config = MemoryConfig.from_dict(raw)
     if not config.enabled:
@@ -315,6 +317,9 @@ def memory_from_env() -> tuple[dict[str, MemoryAdapter], MemoryConfig]:
     adapters: dict[str, MemoryAdapter] = {}
     for name, (cls, env_var, default_url, token_env) in _MEMORY_BACKENDS.items():
         spec = declared.get(name) or {}
+        if not isinstance(spec, dict):
+            _log.warning("`memory.backends.%s:` is not a mapping; backend ignored", name)
+            continue
         if declared and not spec.get("enabled", False):
             continue
         if not declared and not os.environ.get(env_var):

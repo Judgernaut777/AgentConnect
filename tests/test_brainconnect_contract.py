@@ -205,14 +205,15 @@ def test_a_forbidden_envelope_is_an_authorization_error():
 def _brainconnect_repo() -> Path:
     """WIKIBRAIN_REPO env override (the same variable test_wikibrain_integration.py
     honors), else the first repo-parent sibling under the published name
-    BrainConnect then the pre-rename WikiBrain, else the original development
-    checkout as a last resort."""
+    BrainConnect then the pre-rename WikiBrain that actually carries the contract
+    fixtures — a same-named directory without them is not a checkout and must not
+    shadow one that qualifies — else the original development checkout."""
     override = os.environ.get("WIKIBRAIN_REPO")
     if override:
         return Path(override)
     siblings = Path(__file__).resolve().parents[2]
     for name in ("BrainConnect", "WikiBrain"):
-        if (siblings / name).is_dir():
+        if (siblings / name / "tests" / "contract").is_dir():
             return siblings / name
     return Path("/home/mini/WikiBrain")
 

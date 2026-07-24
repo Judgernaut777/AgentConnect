@@ -30,11 +30,13 @@ import pytest
 # --- locate the sibling WikiBrain / BrainConnect checkout --------------------
 def _default_repo() -> Path:
     """First repo-parent sibling under the published name BrainConnect, then the
-    pre-rename WikiBrain; keep WikiBrain as the final fallback so the skip
-    message still names a concrete path."""
+    pre-rename WikiBrain, that actually carries the in-process API (`cli/`) —
+    a same-named directory without it must not shadow one that qualifies; keep
+    WikiBrain as the final fallback so the skip message still names a concrete
+    path."""
     siblings = Path(__file__).resolve().parents[2]
     for name in ("BrainConnect", "WikiBrain"):
-        if (siblings / name).is_dir():
+        if (siblings / name / "cli").is_dir():
             return siblings / name
     return siblings / "WikiBrain"
 

@@ -499,9 +499,24 @@ def test_run_tests_leaves_no_report_in_workspace(tmp_path, monkeypatch):
     private_tmp.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(private_tmp))
 
+    # Spy on mkstemp so the test cannot pass vacuously: the report must have
+    # been created under the private tempdir before we assert it was deleted.
+    created = []
+    real_mkstemp = tempfile.mkstemp
+
+    def _recording_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", _recording_mkstemp)
+
     (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
     rt, _ = _runtime([_RUN_TESTS, _finish("clean")], tmp_path, test_command=PYTEST_CMD)
     rt.run(TaskSubmission(task="run the tests"), task_id="rt8")
+    junit_reports = [p for p in created if "agentconnect-junit-" in p]
+    assert junit_reports, "run_tests never created a junit report in tempdir"
+    assert all(p.startswith(str(private_tmp)) for p in junit_reports)
     assert list(tmp_path.rglob("*.xml")) == []
     leftovers = [
         p for p in private_tmp.iterdir()
