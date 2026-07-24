@@ -34,7 +34,7 @@ jobs:
                       -e packages/agentconnect-cli \
                       -e packages/agentconnect-linear \
                       -e packages/agentconnect-mcp \
-                      -e packages/agentconnect-runtime \
+                      -e packages/agentconnect-runtime[resumable] \
                       -e packages/agentconnect-temporal
           pip install pytest
 
