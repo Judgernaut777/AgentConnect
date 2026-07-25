@@ -30,6 +30,7 @@ from agentconnect.core import (
     WorkerResult,
     route,
 )
+from agentconnect.core.errors import PolicyViolation
 from agentconnect.core.routing import WorkerRegistry
 
 
@@ -436,6 +437,134 @@ def test_depends_on_omitted_is_unchanged_from_before(task_svc):
     assert subtask.status is SubtaskStatus.succeeded
     assert subtask.depends_on == []
     assert "blocked_on" not in subtask.metadata
+
+
+def _exploding_cloud_worker():
+    """A cloud worker (so it parks for approval, letting a dependent be
+    submitted `blocked` against it) that crashes when finally run."""
+    def boom(prompt):
+        raise RuntimeError("harness segfaulted")
+
+    return RawModelWorker(
+        "cloud_boom", boom, model="deepseek-v3", location=WorkerLocation.cloud,
+        privacy_tiers=[PrivacyTier.public, PrivacyTier.public_redacted],
+        capability_tags=["generate"], cost_per_1k_tokens_usd=1.0,
+    )
+
+
+def test_terminal_dependency_failure_cascades_blocked_dependent_to_failed(tmp_path):
+    """A dependency that terminally fails can never be `succeeded`, so a
+    dependent still `blocked` on it must be failed — not stranded forever."""
+    svc = make_service(
+        tmp_path, [_exploding_cloud_worker(), EchoWorker()],
+        policy=RoutePolicy(max_cost_usd=10.0))
+    task = svc.create_task(CreateTaskRequest(title="t"))
+    a = svc.submit_subtask(task.id, SubtaskRequest(
+        title="A", instructions="i", privacy_tier=PrivacyTier.public,
+        required_capabilities=["generate"]))
+    assert a.status is SubtaskStatus.needs_approval  # cloud worker parks
+
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.blocked
+
+    # Approving A lets it run — and its worker crashes, so A terminally fails
+    # via `_record_result`. B must be cascaded, not left `blocked`.
+    failed_a = svc.approve_subtask(a.id, "matthew", max_cost_usd=3.0)
+    assert failed_a.status is SubtaskStatus.failed
+
+    b_after = svc.get_subtask(b.id).subtask
+    assert b_after.status is SubtaskStatus.failed
+    assert b_after.metadata.get("dependency_failed") == a.id
+    assert "blocked_on" not in b_after.metadata
+    assert svc.storage.list_runs(b.id) == []  # never ran — no work was done
+
+
+class _DenyingGovernor:
+    """In-process governor that denies one tool, driving the denied subtask
+    through `_block_subtask_on_governor` (queued -> failed)."""
+
+    def __init__(self, deny):
+        self.mode = "required"
+        self._deny = deny
+
+    def authorize(self, principal, source_id, name, context=None):
+        from agentconnect.core.toolconnect_client import ToolDecision
+        allowed = name not in self._deny
+        return ToolDecision(
+            allowed=allowed,
+            reason="allowed" if allowed else f"policy forbids {name}",
+            decision_id=f"dec-{name}", default_deny=False,
+            determining_policies=(f"p-{name}",), contract_version="1.0",
+        )
+
+    def record(self, decision_id, outcome, detail=None):
+        return {"recorded": True}
+
+    def health(self):
+        return {"status": "ok"}
+
+
+def test_governor_denied_dependency_cascades_blocked_dependent_to_failed(tmp_path):
+    """The other terminal-failure sink: a dependency refused at the governor
+    chokepoint (`_block_subtask_on_governor`) must cascade to a dependent that
+    is already `blocked` on it, not strand it."""
+    svc = make_service(
+        tmp_path, [cloud_worker(tags=["generate"])],
+        policy=RoutePolicy(max_cost_usd=10.0))
+    svc.bind_tool_governor(_DenyingGovernor(deny={"generate"}))
+    task = svc.create_task(CreateTaskRequest(title="t"))
+
+    # A is a cloud subtask, so it parks for approval before the governor is
+    # consulted — long enough to submit B `blocked` against it.
+    a = svc.submit_subtask(task.id, SubtaskRequest(
+        title="A", instructions="i", privacy_tier=PrivacyTier.public,
+        required_capabilities=["generate"]))
+    assert a.status is SubtaskStatus.needs_approval
+
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.blocked
+
+    # Approval releases A to run; the governor denies its tool, failing A via
+    # the chokepoint path. B must be cascaded, never left `blocked`.
+    denied_a = svc.approve_subtask(a.id, "matthew", max_cost_usd=3.0)
+    assert denied_a.status is SubtaskStatus.failed
+
+    b_after = svc.get_subtask(b.id).subtask
+    assert b_after.status is SubtaskStatus.failed
+    assert b_after.metadata.get("dependency_failed") == a.id
+    assert svc.storage.list_runs(b.id) == []  # never ran
+
+
+def test_blocked_subtask_blocks_completion_as_succeeded(tmp_path):
+    """A stranded `blocked` subtask is unresolved work: the parent task must
+    not audit-clean and complete as `succeeded` over the top of it."""
+    svc = make_service(tmp_path, [ExplodingWorker()])
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g"))
+    svc.launch_session("claude", task_id=task.id, claim=True)
+
+    a = svc.submit_subtask(task.id, SubtaskRequest(title="A", instructions="i"))
+    assert a.status is SubtaskStatus.failed  # exploding worker
+
+    # B is submitted *after* A already failed, so the failure cascade never saw
+    # it (it did not exist yet) and it is left stranded in `blocked`.
+    b = svc.submit_subtask(task.id, SubtaskRequest(
+        title="B", instructions="j", depends_on=[a.id]))
+    assert b.status is SubtaskStatus.blocked
+
+    report = svc.audit_task(task.id)
+    resolved = next(c for c in report.checks if c.name == "subtasks_resolved")
+    assert resolved.passed is False
+    assert b.id in resolved.detail
+
+    with pytest.raises(PolicyViolation):
+        svc.complete_task(task.id, "matthew")
+    assert svc.get_task(task.id).task.status is not TaskStatus.succeeded
+
+    # An operator with a reason can still force past it.
+    forced = svc.complete_task(task.id, "matthew", force=True)
+    assert forced["status"] == "succeeded"
 
 
 # ------------------------------------------------------------------ subtask ops

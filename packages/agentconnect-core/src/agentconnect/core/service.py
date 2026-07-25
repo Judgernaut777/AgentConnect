@@ -960,6 +960,62 @@ class AgentConnectService:
             released.append(self._require_subtask(current.id))
         return released
 
+    def _cascade_dependency_failure(
+        self, task_id: str, failed_subtask_id: str,
+    ) -> list[Subtask]:
+        """Fail every `blocked` dependent of a terminally-failed subtask.
+
+        A subtask that reaches a terminal `failed`/`cancelled` state can never
+        satisfy the `depends_on -> succeeded` gate (`_unmet_dependencies`), so a
+        sibling still `blocked` on it would otherwise wait forever — never
+        released (release only runs on success), never failed, and silently
+        dropped when the parent task completes. Drive each such dependent from
+        `blocked -> failed` with a `dependency_failed` reason, recursively over
+        its own dependents, so a dead dependency propagates an honest terminal
+        status instead of stranding the strand (mirrors
+        `WorkQueue._cascade_failure`). Idempotent: a dependent that is no longer
+        `blocked` is left untouched.
+        """
+        cascaded: list[Subtask] = []
+        seen: set[str] = set()
+        stack = [failed_subtask_id]
+        while stack:
+            parent_id = stack.pop()
+            for dependent in self.storage.list_subtasks(task_id):
+                if parent_id not in dependent.depends_on or dependent.id in seen:
+                    continue
+                seen.add(dependent.id)
+                current = self._require_subtask(dependent.id)
+                if current.status is not SubtaskStatus.blocked:
+                    continue  # already dispatched/terminal — nothing to strand
+                now = self._now()
+                subtasks_policy.check_transition(current, SubtaskStatus.failed)
+                metadata = dict(current.metadata)
+                metadata.pop("blocked_on", None)
+                metadata["dependency_failed"] = parent_id
+                self.storage.update_subtask(
+                    current.id, status=SubtaskStatus.failed.value, metadata=metadata,
+                    updated_at=now,
+                )
+                reason = f"dependency {parent_id} failed; cannot run"
+                # Record a durable attempt + ledger event so the cascade failure
+                # is auditable (the governor-deny path records an attempt too);
+                # otherwise the strand would fail with no error surfaced.
+                self.record_attempt(
+                    task_id,
+                    RecordAttemptRequest(
+                        actor_id="system", actor_type=ActorType.system,
+                        summary=reason, outcome="failed",
+                    ),
+                )
+                self.record_event(
+                    task_id, "subtask_dependency_failed", "system",
+                    {"subtask_id": current.id, "dependency_failed": parent_id},
+                )
+                cascaded.append(self._require_subtask(current.id))
+                stack.append(current.id)
+        return cascaded
+
     def grant_approval(
         self, subtask_id: str, approved_by: str, max_cost_usd: Optional[float] = None
     ) -> ApprovalRecord:
@@ -1376,6 +1432,11 @@ class AgentConnectService:
             # This is the one place a subtask ever reaches `succeeded`, so it is
             # the correct — and only needed — hook for the completion path.
             self.release_ready_subtasks(subtask.parent_task_id)
+        else:
+            # Terminal failure: a sibling still `blocked` on this subtask can
+            # never be released (a failed dependency is never `succeeded`), so
+            # fail the strand instead of stranding it in `blocked` forever.
+            self._cascade_dependency_failure(subtask.parent_task_id, subtask.id)
         return self._require_subtask(subtask.id)
 
     def _block_subtask_on_governor(
@@ -1415,6 +1476,9 @@ class AgentConnectService:
             metadata={"reason": reason, **authz.as_metadata()},
         )
         self._settle_parent_after_subtask(subtask.parent_task_id)
+        # This subtask moved queued -> failed and will never succeed, so any
+        # sibling `blocked` on it is unreleasable: fail that strand too.
+        self._cascade_dependency_failure(subtask.parent_task_id, subtask.id)
         return self._require_subtask(subtask.id)
 
     def _settle_parent_after_subtask(self, task_id: str) -> None:
@@ -2653,9 +2717,11 @@ class AgentConnectService:
         """Sweep sessions/runs whose process died without a terminal event.
 
         A record is an *orphan* when it is still in a live status but either (a) a
-        live-surface provider proves its process/pane is dead, or (b) an age gate
-        (``older_than_seconds``, a heartbeat timeout) has elapsed with no evidence
-        it is alive. Orphans are swept to a terminal, reconcilable state — sessions
+        live-surface provider proves its process/pane is dead, or (b) no such
+        provider can prove it is alive and its ``started_at`` is older than
+        ``older_than_seconds`` — a maximum-lifetime bound measured from start, not
+        a heartbeat/idle timeout (there is no last-activity timestamp to time out
+        against). Orphans are swept to a terminal, reconcilable state — sessions
         to ``abandoned``, runs to ``failed`` — tagged ``reconciled`` in metadata so
         an operator can tell a crash-swept record from a clean finish, and their
         live panes/tokens are reaped. A crash therefore leaves the ledger

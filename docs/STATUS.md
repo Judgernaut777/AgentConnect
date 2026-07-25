@@ -9,7 +9,7 @@ read before proposing work.
 | | |
 |---|---|
 | Stabilization checkpoint | **`28048ed`**, tagged `v0.1.0-mvp-control-loop` at `12f2186` |
-| Gate | `pytest -q` — **1035 passing, 11 skipped** (as of this commit, with the optional extras installed; skip counts are environment-dependent — the remaining skips need `fascia-guard`, the `trufflehog`/`gitleaks` binaries, and a BrainConnect sibling checkout, which lifts the gate to 1070 passing, 7 skipped) |
+| Gate | `pytest -q` — **1041 passing, 11 skipped** (as of this commit, with the optional extras installed; skip counts are environment-dependent — the remaining skips need `fascia-guard`, the `trufflehog`/`gitleaks` binaries, and a BrainConnect sibling checkout, which lifts the gate to 1075 passing, 7 skipped) |
 | Safety | modular engines; baseline on by default, third-party engines opt-in ([SAFETY.md](SAFETY.md)) |
 | Execution backend | `DirectExecutionBackend` (in-process, shipped default) |
 | Memory backends | none wired by default; adapters exist for BrainConnect, Cognee, Graphiti |
