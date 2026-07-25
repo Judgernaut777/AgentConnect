@@ -243,6 +243,50 @@ def test_the_body_cannot_name_a_different_actor_than_the_token(anon, svc, task):
     assert "cannot act as" in str(response.json())
 
 
+def test_request_review_requested_by_is_bound_to_the_token(anon, svc, task):
+    """The review coordination surface must not let a managed manager token
+    forge `requested_by` (ledger attribution + inbox spoofing)."""
+    token = manager_token(svc, task.id)
+    artifact = svc.create_artifact(task.id, CreateArtifactRequest(
+        type=ArtifactType.report, content="x", summary="s", created_by="claude"))
+
+    spoof = anon.post(f"/tasks/{task.id}/reviews", json={
+        "requested_by": "agent-b", "assigned_to": "codex",
+        "artifact_refs": [artifact.id]}, headers=bearer(token))
+    assert spoof.status_code == 403
+    assert "cannot act as" in str(spoof.json())
+
+    ok = anon.post(f"/tasks/{task.id}/reviews", json={
+        "requested_by": "claude", "assigned_to": "codex",
+        "artifact_refs": [artifact.id]}, headers=bearer(token))
+    assert ok.status_code == 201
+    assert ok.json()["requested_by"] == "claude"
+
+
+def test_create_task_created_by_is_bound_to_the_token(anon, svc, task):
+    """A managed token cannot attribute a freshly-created task to another name;
+    an omitted `created_by` defaults to the principal, not the schema `unknown`."""
+    token = manager_token(svc, task.id)
+
+    spoof = anon.post("/tasks", json={
+        "title": "forged", "created_by": "operator"}, headers=bearer(token))
+    assert spoof.status_code == 403
+    assert "cannot act as" in str(spoof.json())
+
+    created = anon.post("/tasks", json={"title": "mine"}, headers=bearer(token))
+    assert created.status_code == 201
+    assert created.json()["created_by"] == "claude"
+
+
+def test_an_operator_may_name_another_creator_on_create_task(anon, svc):
+    """The control plane may still create tasks on another actor's behalf."""
+    token = svc.mint_operator_token("matthew").plaintext
+    created = anon.post("/tasks", json={"title": "t", "created_by": "claude"},
+                        headers=bearer(token))
+    assert created.status_code == 201
+    assert created.json()["created_by"] == "claude"
+
+
 def test_completion_is_attributed_to_the_token_not_the_body(anon, svc, task):
     """`completed_by` is gone from the schema; the principal is the record."""
     token = svc.mint_operator_token("matthew").plaintext

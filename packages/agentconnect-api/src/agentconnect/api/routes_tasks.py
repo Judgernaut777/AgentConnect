@@ -50,7 +50,8 @@ class ConstraintBody(BaseModel):
 
 @router.post("/tasks", response_model=Task, status_code=201)
 def create_task(body: CreateTaskRequest, request: Request) -> Task:
-    return service(request).create_task(body)
+    who = assert_actor(request, body.created_by if body.created_by != "unknown" else None)
+    return service(request).create_task(body.model_copy(update={"created_by": who}))
 
 
 @router.get("/tasks", response_model=list[TaskSummary])

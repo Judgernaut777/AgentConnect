@@ -42,7 +42,12 @@ _OPEN_REVIEW_STATUSES = frozenset(
     {ReviewStatus.open, ReviewStatus.claimed, ReviewStatus.in_progress}
 )
 _OPEN_SUBTASK_STATUSES = frozenset(
-    {SubtaskStatus.queued, SubtaskStatus.running, SubtaskStatus.needs_approval}
+    {SubtaskStatus.queued, SubtaskStatus.running, SubtaskStatus.needs_approval,
+     # `blocked` is unresolved work too: a subtask waiting on a dependency has
+     # neither run nor reached a terminal status. If it is ever left stranded
+     # (e.g. a dependency failed before the cascade drained it), the parent
+     # must not be allowed to complete as `succeeded` over the top of it.
+     SubtaskStatus.blocked}
 )
 
 
