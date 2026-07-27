@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -238,6 +238,15 @@ class SharedMemory:
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:
             return
+        # Enforcement (goal item 2/8), mirroring SqliteStorage._reject_state_write:
+        # the `state` column has exactly ONE writer — `transition_task` (the
+        # authority's LockedWriter). A bare `update_task(state=...)` would skip
+        # the fresh-read CAS, the FSM edge check, AND the same-commit audit row.
+        if "state" in fields:
+            raise ValueError(
+                "tasks.state must go through TransitionAuthority "
+                "(SharedMemory.transition_task), not update_task()"
+            )
         if "risks" in fields and not isinstance(fields["risks"], str):
             fields["risks"] = json.dumps(fields["risks"])
         fields["updated_at"] = _now()
@@ -248,36 +257,67 @@ class SharedMemory:
         self._conn.commit()
 
     @_synchronized
-    def update_task_guarded(
-        self, task_id: str, *, exclude_states: Iterable[str], **fields: Any
-    ) -> tuple[bool, Optional[str]]:
-        """Compare-and-set task update: apply ``fields`` only when the stored
-        ``state`` is NOT in ``exclude_states`` — a single guarded ``UPDATE``, so
-        the check and the write are one atomic statement (mirrors the work
-        queue's guarded claim). Returns ``(updated, stored_state)`` where
-        ``stored_state`` is the row's state after the call (the pre-existing
-        state on refusal, the new one on success, ``None`` if the task does not
-        exist). This is how writers honor terminal-state finality: a concurrent
-        ``cancel_task`` (terminal CANCELLED) can never be silently overwritten
-        by a slower pipeline's completion write.
+    def transition_task(self, task_id: str, decide, conn: Any = None) -> tuple:
+        """The :class:`~agentconnect.common.transitions.LockedWriter` for
+        Engine B's ``tasks.state`` column — the ONE writer both
+        ``RouterService._transition`` (the pipeline) and ``WorkQueue``'s
+        ticket-status mirror drive their writes through, sharing one
+        :class:`~agentconnect.common.transitions.TransitionAuthority`
+        instance built over this method.
+
+        Reads ``state`` fresh (inside this call's hold of ``self._lock``, so
+        race-free against every other in-process writer — the same guarantee
+        ``_synchronized`` already documents), calls ``decide`` with it, and —
+        if it returns fields — applies one exact-match CAS
+        (``WHERE task_id=? AND state=<the value just read>``) plus, when a
+        record is returned, a raw ``logs`` INSERT on this same connection
+        before the ONE commit that covers both. A CAS miss (rowcount 0) can
+        only happen against a cross-process writer (every in-process caller
+        already serializes on ``self._lock``); retried up to 3 times with a
+        fresh read before giving up and reporting the latest observed value.
         """
-        if not fields:
-            return False, None
-        if "risks" in fields and not isinstance(fields["risks"], str):
-            fields["risks"] = json.dumps(fields["risks"])
-        fields["updated_at"] = _now()
-        excluded = [str(s) for s in exclude_states]
-        cols = ", ".join(f"{k}=?" for k in fields)
-        ph = ",".join("?" for _ in excluded) or "''"
-        cur = self._conn.execute(
-            f"UPDATE tasks SET {cols} WHERE task_id=? AND state NOT IN ({ph})",
-            (*fields.values(), task_id, *excluded),
-        )
-        self._conn.commit()
+        for _attempt in range(3):
+            row = self._conn.execute(
+                "SELECT state FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            current_raw = row["state"] if row is not None else None
+            fields, record = decide(current_raw)
+            if fields is None:
+                if record is not None:
+                    self._insert_transition_log(task_id, record)
+                    self._conn.commit()
+                return False, current_raw
+            write_fields = dict(fields)
+            write_fields["updated_at"] = _now()
+            cols = ", ".join(f"{k}=?" for k in write_fields)
+            cur = self._conn.execute(
+                f"UPDATE tasks SET {cols} WHERE task_id=? AND state=?",
+                (*write_fields.values(), task_id, current_raw),
+            )
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                continue  # cross-process CAS miss: retry with a fresh read
+            if record is not None:
+                self._insert_transition_log(task_id, record)
+            self._conn.commit()
+            return True, fields.get("state", current_raw)
         row = self._conn.execute(
             "SELECT state FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
-        return cur.rowcount == 1, (row["state"] if row is not None else None)
+        return False, (row["state"] if row is not None else None)
+
+    def _insert_transition_log(self, task_id: str, record: Any) -> None:
+        """Raw INSERT on the live connection — never ``append_log`` (which
+        self-commits) — so the audit line always rides the SAME commit as the
+        state write it describes."""
+        from .transitions import _default_message
+
+        level = "warn" if record.outcome == "refused" else "info"
+        message = record.message if record.message is not None else _default_message(record)
+        self._conn.execute(
+            "INSERT INTO logs(task_id, level, message, created_at) VALUES(?,?,?,?)",
+            (task_id, level, message, _now()),
+        )
 
     @_synchronized
     def delete_task_cascade(self, task_id: str) -> None:

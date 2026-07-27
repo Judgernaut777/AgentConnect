@@ -62,6 +62,8 @@ class EventType(str, Enum):
     #: Every `depends_on` entry reached `succeeded`; the subtask just moved
     #: `blocked -> queued` and was handed to the execution backend.
     subtask_released = "subtask.released"
+    #: A subtask was driven to terminal `cancelled` (`cancel_subtask`).
+    subtask_cancelled = "subtask.cancelled"
 
     # Worker run
     worker_spawned = "worker.spawned"
@@ -106,6 +108,14 @@ class EventType(str, Enum):
     # terminal event, swept to a terminal state by the reconcile pass).
     session_reconciled = "session.reconciled"
     run_reconciled = "run.reconciled"
+    #: A session swept by `abandon_stale_sessions` (distinct from
+    #: `session_reconciled`, which is `reconcile_orphans`'s liveness-checked
+    #: sweep — both drive the same `session_status` authority, so a race
+    #: between the two sweeps is now audited rather than silently double-run).
+    session_abandoned = "session.abandoned"
+    #: A pending approval expired without a human decision
+    #: (`AgentConnectService.expire_approval`).
+    approval_expired = "approval.expired"
 
 
 class ObservationState(str, Enum):

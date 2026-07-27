@@ -60,6 +60,10 @@ def test_get_router_and_provider_status():
 def test_cancel_task():
     svc = _service()
     tid = svc.memory.create_task({"task": "x"})
-    svc.memory.update_task(tid, state=TaskState.QUEUED.value)
+    # Seed via the authority's LockedWriter — a bare update_task(state=...)
+    # is rejected at runtime (one transition authority enforcement).
+    svc.memory.transition_task(
+        tid, lambda _cur: ({"state": TaskState.QUEUED.value}, None)
+    )
     out = svc.cancel_task(tid)
     assert out["state"] == TaskState.CANCELLED.value

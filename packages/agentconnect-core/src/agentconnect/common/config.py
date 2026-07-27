@@ -17,7 +17,15 @@ import yaml
 #: Config files shipped inside the wheel: empty provider/profile registries plus the
 #: fail-closed routing policy. They exist so an installed `agentconnect-router` can
 #: START without a source checkout; they register no providers, so they grant nothing.
-PACKAGED_CONFIG_DIR = Path(__file__).resolve().parent / "default_config"
+#: Deliberately `Path(__file__).parent`, NOT `.resolve()`: `__file__` is already
+#: absolute for a normal module import, and `.resolve()` (a real filesystem
+#: syscall — symlink resolution) is on Temporal's workflow-sandbox restricted
+#: list. `agentconnect.core.service` gained its first-ever import of
+#: `agentconnect.common` (the shared transition authority) in the one-
+#: transition-authority consolidation, which now pulls this module into the
+#: import graph the sandbox validates for every workflow — an eager `.resolve()`
+#: at module scope broke `Worker.__init__`'s `prepare_workflow` validation.
+PACKAGED_CONFIG_DIR = Path(__file__).parent / "default_config"
 
 
 def _discover_config_dir() -> Path:

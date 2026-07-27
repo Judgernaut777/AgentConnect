@@ -3,11 +3,22 @@
 Models produce artifacts *inside* states but must not freely mutate the state
 machine — all transitions go through :func:`assert_transition` / :class:`TaskFSM`,
 which reject illegal moves. This keeps the control plane deterministic (§10).
+
+`TASK_STATE_VOCAB` registers this same edge table with the shared transition
+authority (:mod:`agentconnect.common.transitions`) — `RouterService._transition`
+and `WorkQueue`'s task-state mirror both drive their writes through one
+:class:`~agentconnect.common.transitions.TransitionAuthority` built from this
+vocabulary, so this module and the authority can never drift onto two
+different edge tables. `IllegalTransition` here is the same exception class
+the authority raises (re-exported, not merely a lookalike), so existing
+``except IllegalTransition`` call sites keep working unchanged.
 """
 
 from __future__ import annotations
 
 from .schemas import TaskState
+from .transitions import IllegalTransition as IllegalTransition
+from .transitions import Vocabulary
 
 # The linear happy path (§19):
 #   CREATED -> CLASSIFIED -> PRIVACY_CHECKED -> ELIGIBLE_PROVIDERS_COMPUTED
@@ -38,9 +49,19 @@ _ALLOWED: dict[TaskState, set[TaskState]] = {
 
 TERMINAL_STATES = {TaskState.COMPLETE, TaskState.CANCELLED, TaskState.FAILED}
 
-
-class IllegalTransition(ValueError):
-    pass
+#: The registered vocabulary: the SAME edge table `allowed_transitions` below
+#: reads, wrapped for `TransitionAuthority`. `RouterService.__init__` builds
+#: its `_task_state_authority` from this constant; `WorkQueue`'s ticket-status
+#: mirror shares that one authority instance rather than owning a second edge
+#: table (goal: "one transition authority").
+TASK_STATE_VOCAB: Vocabulary[TaskState] = Vocabulary(
+    name="task_state",
+    enum_type=TaskState,
+    column="state",
+    edges={k: frozenset(v) for k, v in _ALLOWED.items()},
+    terminal=frozenset(TERMINAL_STATES),
+    universal=frozenset({TaskState.CANCELLED}),
+)
 
 
 def allowed_transitions(state: TaskState) -> set[TaskState]:
@@ -57,7 +78,7 @@ def can_transition(src: TaskState, dst: TaskState) -> bool:
 
 def assert_transition(src: TaskState, dst: TaskState) -> None:
     if not can_transition(src, dst):
-        raise IllegalTransition(f"Illegal task transition: {src.value} -> {dst.value}")
+        raise IllegalTransition("task_state", "<unbound>", src.value, dst.value)
 
 
 class TaskFSM:

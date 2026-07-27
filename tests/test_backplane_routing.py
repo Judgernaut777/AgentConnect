@@ -568,15 +568,30 @@ def test_blocked_subtask_blocks_completion_as_succeeded(tmp_path):
 
 
 # ------------------------------------------------------------------ subtask ops
-def test_cancel_subtask_then_cancel_again_conflicts(tmp_path):
+def test_cancel_subtask_then_cancel_again_is_idempotent_noop(tmp_path):
+    """Converged semantic (docs/CONSISTENCY_REVIEW.md adjudication): a second
+    `cancel_subtask` on an already-cancelled subtask is an idempotent no-op,
+    not a `Conflict` — double-cancel is an expected retry outcome (Temporal
+    retries, `cancel_agent` already had to swallow this exact `Conflict`), and
+    the state is reported either way, so nothing is lost by not raising. This
+    test used to pin the raise; the goal's cancel-semantics directive
+    supersedes it. Exactly one `subtask.cancelled` transition-audit row must
+    still exist — the second call must not silently re-run the cascade.
+    """
     svc = make_service(tmp_path, [cloud_worker()], policy=RoutePolicy(max_cost_usd=10.0))
     task = svc.create_task(CreateTaskRequest(title="t"))
     subtask = svc.submit_subtask(task.id, SubtaskRequest(
         title="t", instructions="i", privacy_tier=PrivacyTier.public))
     svc.cancel_subtask(subtask.id)
     assert svc.get_subtask(subtask.id).subtask.status is SubtaskStatus.cancelled
-    with pytest.raises(Conflict):
-        svc.cancel_subtask(subtask.id)
+    svc.cancel_subtask(subtask.id)  # no raise
+    assert svc.get_subtask(subtask.id).subtask.status is SubtaskStatus.cancelled
+    applied_audits = [
+        e for e in svc.list_events(task.id)
+        if e.kind == "transition" and e.payload.get("entity_id") == subtask.id
+        and e.payload.get("dst") == "cancelled" and e.payload.get("outcome") == "applied"
+    ]
+    assert len(applied_audits) == 1
 
 
 def test_registry_route_is_pure_and_does_not_touch_the_ledger():
