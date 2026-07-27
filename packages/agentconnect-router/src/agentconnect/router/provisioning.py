@@ -213,6 +213,13 @@ class NodePool:
     a fresh one (returning ``reused=False`` so the caller bills the rental window
     once). ``reap_idle`` terminates nodes idle past their configured window. Thread
     -safe; callers supply ``now`` so tests stay deterministic.
+
+    The check-then-provision span is held under a PER-PROVIDER lock (a
+    reservation): two concurrent ``acquire`` calls for the same provider must
+    never both provision — the loser's handle would be silently clobbered by
+    the last ``_live`` write, leaving a real rented (billed) box tracked by
+    nothing, unreachable by ``release``/``reap_idle`` forever. The loser now
+    blocks until the winner's node is up, then reuses it (``reused=True``).
     """
 
     def __init__(self):
@@ -221,31 +228,82 @@ class NodePool:
         self._lock = threading.Lock()
         self._live: dict[str, NodeHandle] = {}  # provider_id -> handle
         self._last_used: dict[str, float] = {}
+        #: provider_id -> wall-clock at provision; drives the teardown cost
+        #: true-up (vendor bills wall-clock, the ledger billed min_rental only).
+        self._provisioned_at: dict[str, float] = {}
+        #: provider_id -> lock serializing check+provision+store (reservation).
+        self._provider_locks: dict[str, threading.Lock] = {}
+        self._threading = threading
+
+    def _provider_lock(self, provider_id: str):
+        with self._lock:
+            lock = self._provider_locks.get(provider_id)
+            if lock is None:
+                lock = self._threading.Lock()
+                self._provider_locks[provider_id] = lock
+            return lock
 
     def acquire(
         self, cfg: ProviderConfig, provisioner: NodeProvisioner, spec: NodeSpec, *, now: float
     ) -> tuple[NodeHandle, bool]:
-        with self._lock:
-            existing = self._live.get(cfg.provider_id)
-            if existing is not None and existing.state == NodeState.ready:
+        with self._provider_lock(cfg.provider_id):
+            with self._lock:
+                existing = self._live.get(cfg.provider_id)
+                if existing is not None and existing.state == NodeState.ready:
+                    self._last_used[cfg.provider_id] = now
+                    return existing, True
+            handle = provisioner.wait_ready(provisioner.provision(spec))
+            with self._lock:
+                self._live[cfg.provider_id] = handle
                 self._last_used[cfg.provider_id] = now
-                return existing, True
-        handle = provisioner.wait_ready(provisioner.provision(spec))
-        with self._lock:
-            self._live[cfg.provider_id] = handle
-            self._last_used[cfg.provider_id] = now
-        return handle, False
+                self._provisioned_at[cfg.provider_id] = now
+            return handle, False
 
     def release(self, cfg: ProviderConfig, *, now: float) -> None:
         with self._lock:
             if cfg.provider_id in self._live:
                 self._last_used[cfg.provider_id] = now
 
+    def evict(
+        self,
+        provider_id: str,
+        provisioner: Optional[NodeProvisioner] = None,
+        *,
+        now: Optional[float] = None,
+        on_terminate=None,
+    ) -> Optional[NodeHandle]:
+        """Drop a provider's cached node (e.g. after its backend crashed
+        mid-dispatch) so the next ``acquire`` provisions fresh instead of
+        reusing a dead box forever. Best-effort terminates via ``provisioner``
+        and invokes ``on_terminate(provider_id, handle, provisioned_at, now)``
+        for cost true-up. Returns the evicted handle, or None if none was
+        cached."""
+        with self._lock:
+            handle = self._live.pop(provider_id, None)
+            self._last_used.pop(provider_id, None)
+            provisioned_at = self._provisioned_at.pop(provider_id, None)
+        if handle is None:
+            return None
+        if provisioner is not None:
+            try:
+                provisioner.terminate(handle)
+            except Exception:  # noqa: BLE001 — eviction is fail-safe cleanup
+                pass
+        if on_terminate is not None:
+            on_terminate(provider_id, handle, provisioned_at, now if now is not None else 0.0)
+        return handle
+
     def reap_idle(
-        self, provisioner: NodeProvisioner, cfgs: dict[str, ProviderConfig], now: float
+        self,
+        provisioner: NodeProvisioner,
+        cfgs: dict[str, ProviderConfig],
+        now: float,
+        on_terminate=None,
     ) -> list[str]:
         """Terminate nodes idle beyond terminate_when_idle_seconds. Returns the
-        provider ids reaped."""
+        provider ids reaped. ``on_terminate(provider_id, handle, provisioned_at,
+        now)`` — when given — lets the caller true up the rental cost accrued
+        beyond the window billed at spin-up."""
         reaped: list[str] = []
         with self._lock:
             items = list(self._live.items())
@@ -257,6 +315,9 @@ class NodePool:
                 with self._lock:
                     self._live.pop(pid, None)
                     self._last_used.pop(pid, None)
+                    provisioned_at = self._provisioned_at.pop(pid, None)
+                if on_terminate is not None:
+                    on_terminate(pid, handle, provisioned_at, now)
                 reaped.append(pid)
         return reaped
 

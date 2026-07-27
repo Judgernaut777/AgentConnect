@@ -1202,7 +1202,15 @@ class AgentConnectService:
             raise Conflict(
                 f"subtask {subtask_id} is {subtask.status.value}; cannot be routed"
             )
-        explanation = route(subtask, self.registry, self.policy)
+        # Cumulative-spend input to the budget gate: real recorded run spend, so
+        # a paid worker cannot accrue unbounded cost one individually-approved,
+        # individually-under-ceiling call at a time (only computed when the cap
+        # is configured — the sum is a table scan).
+        spent = (
+            self.storage.total_run_cost_usd()
+            if self.policy.max_total_cost_usd is not None else 0.0
+        )
+        explanation = route(subtask, self.registry, self.policy, spent_usd=spent)
         now = self._now()
 
         # The explanation is durable twice over: inline for programmatic reads,
@@ -1285,6 +1293,26 @@ class AgentConnectService:
         caps = worker.capabilities()
         now = self._now()
 
+        # Atomic claim (queued -> running) BEFORE any slow work: a single
+        # guarded UPDATE (the WorkQueue's claim pattern) so two concurrent
+        # run_subtask calls — a Temporal activity retry racing the original, two
+        # transports driving the same subtask — can never both pass a plain
+        # read-check during the governor round-trip and double-execute the
+        # worker's side effects. The loser gets a typed Conflict, mirroring
+        # WorkQueue's fenced lease_lost.
+        claimed = self.storage.update_subtask_if_status(
+            subtask.id, (SubtaskStatus.queued.value,),
+            status=SubtaskStatus.running.value,
+            assigned_worker=caps.worker_id, updated_at=now,
+        )
+        if not claimed:
+            live = self._require_subtask(subtask.id)
+            raise Conflict(
+                f"subtask {subtask.id} is {live.status.value}; "
+                "a concurrent runner already claimed it"
+            )
+        subtask = self._require_subtask(subtask.id)
+
         # Tool-use authorization chokepoint (ToolConnect governor). This is the real
         # path on which the governor is consulted: before a worker is ever spawned,
         # its *declared* tool set is authorized. Fail-closed — a policy deny or an
@@ -1310,10 +1338,9 @@ class AgentConnectService:
             route_reason=explanation.model_dump(mode="json"), started_at=now,
         )
         self.storage.insert_run(run)
-        self.storage.update_subtask(
-            subtask.id, status=SubtaskStatus.running.value,
-            assigned_worker=caps.worker_id, updated_at=now,
-        )
+        # status=running + assigned_worker were already written by the atomic
+        # claim above; re-writing them here unguarded would resurrect a subtask
+        # a concurrent cancel_subtask drove terminal in the interim.
         self._advance_task(subtask.parent_task_id, TaskStatus.in_progress, _TO_IN_PROGRESS)
 
         # Begin observing this worker as a live process (a real tmux pane under the
@@ -1377,19 +1404,40 @@ class AgentConnectService:
         now = self._now()
         artifact_ids = [a.artifact_id for a in result.artifacts]
         succeeded = result.status == "succeeded"
-        self.storage.update_run(
-            run.id,
+        # Zombie-write guard: the subtask transition is a guarded compare-and-set
+        # from `running` only. If a concurrent cancel_subtask drove the subtask
+        # terminal while worker.run() was still executing (WorkerAdapter.cancel
+        # is advisory — it cannot unwind in-flight Python), the stale result
+        # must NOT resurrect it to succeeded/failed or attach a result artifact.
+        # cancelled is terminal and final; the late result is recorded as an
+        # attempt (audit) and otherwise discarded.
+        landed = self.storage.update_subtask_if_status(
+            subtask.id, (SubtaskStatus.running.value,),
+            status=(SubtaskStatus.succeeded if succeeded else SubtaskStatus.failed).value,
+            result_artifact_id=artifact_ids[0] if artifact_ids else None,
+            updated_at=now,
+        )
+        if not landed:
+            live = self._require_subtask(subtask.id)
+            self.record_attempt(
+                subtask.parent_task_id,
+                RecordAttemptRequest(
+                    actor_id=worker_id, actor_type=ActorType.worker,
+                    summary=(
+                        f"stale worker result ({result.status}) discarded: subtask "
+                        f"already {live.status.value} (e.g. cancelled mid-run)"
+                    ),
+                    outcome="discarded", artifact_refs=artifact_ids,
+                ),
+            )
+            return live
+        self.storage.update_run_if_status(
+            run.id, (RunStatus.running.value,),
             status=(RunStatus.succeeded if succeeded else RunStatus.failed).value,
             finished_at=now,
             output_artifact_id=artifact_ids[0] if artifact_ids else None,
             metrics=result.metrics,
             error=result.error,
-        )
-        self.storage.update_subtask(
-            subtask.id,
-            status=(SubtaskStatus.succeeded if succeeded else SubtaskStatus.failed).value,
-            result_artifact_id=artifact_ids[0] if artifact_ids else None,
-            updated_at=now,
         )
         summary = result.summary or ("Worker succeeded" if succeeded else "Worker failed")
         if result.warnings:
@@ -2814,9 +2862,20 @@ class AgentConnectService:
                 error=f"reconciled: {reason}", metrics=metrics,
             )
             if subtask is not None and subtask.status is SubtaskStatus.running:
-                self.storage.update_subtask(
-                    run.subtask_id, status=SubtaskStatus.failed.value, updated_at=now,
+                flipped = self.storage.update_subtask_if_status(
+                    run.subtask_id, (SubtaskStatus.running.value,),
+                    status=SubtaskStatus.failed.value, updated_at=now,
                 )
+                if flipped:
+                    # Crash-reconcile must not diverge from the normal terminal-
+                    # failure path (_record_result): settle the parent and
+                    # cascade-fail any sibling still `blocked` on this subtask —
+                    # a failed dependency is never `succeeded`, so without the
+                    # cascade that sibling waits in `blocked` forever.
+                    self._settle_parent_after_subtask(subtask.parent_task_id)
+                    self._cascade_dependency_failure(
+                        subtask.parent_task_id, run.subtask_id
+                    )
             self._close_observation_handles("subtask", run.subtask_id,
                                              ObservationOutcome.failed)
             parent = subtask.parent_task_id if subtask else None

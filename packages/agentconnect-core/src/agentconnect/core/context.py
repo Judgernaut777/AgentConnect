@@ -30,6 +30,7 @@ from typing import Any, Optional
 from pydantic import BaseModel
 
 from .. import safety
+from .models import PrivacyTier
 from .memory import (
     BROAD_RETRIEVAL,
     DEFAULT_MAX_ITEMS,
@@ -529,6 +530,22 @@ class ContextBuilder:
         )
         query = query or f"{detail.task.title}\n{detail.task.goal}".strip()
 
+        # Privacy gate (the same withhold rule agentconnect-linear applies before
+        # task content reaches Linear): a secret_sensitive task's title/goal must
+        # never leave for a memory backend — Cognee/Graphiti recall is a real
+        # HTTP POST of the query to an operator-configurable endpoint, the one
+        # external-facing path that previously skipped the privacy check
+        # entirely. Fail closed: no backend is queried at all; ledger truth
+        # (AgentConnect's own records) still flows.
+        recall_withheld = (
+            getattr(detail, "effective_privacy", None) is PrivacyTier.secret_sensitive
+        )
+        if recall_withheld:
+            warnings.append(
+                "memory recall withheld: task is secret_sensitive and its content "
+                "must not be sent to any memory backend"
+            )
+
         resolution = resolve_scopes(
             profile_cfg, detail, self.config,
             manager_id=manager_id, worker_id=worker_id, model_id=model_id,
@@ -543,8 +560,10 @@ class ContextBuilder:
                     profile=profile, query=query, items=ledger_items, backend="agentconnect",
                 ))
 
-        backends = self.router.select_backends(profile, task_id, query) if self.config.enabled \
-            else []
+        backends = (
+            self.router.select_backends(profile, task_id, query)
+            if self.config.enabled and not recall_withheld else []
+        )
         if not self.config.enabled:
             warnings.append("memory is disabled; context is task state only")
 

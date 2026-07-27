@@ -56,6 +56,21 @@ if TYPE_CHECKING:
     from .provisioning import NodePool, NodeProvisioner
 
 
+class TaskSuperseded(RuntimeError):
+    """A pipeline state write was refused because a concurrent actor already
+    drove the task to a terminal state (e.g. ``cancel_task`` -> CANCELLED while
+    a dispatch was in flight). Terminal is final (common/state.py): the pipeline
+    must stop and surface the stored terminal state, never clobber it."""
+
+    def __init__(self, task_id: str, stored_state: Optional[str]):
+        super().__init__(
+            f"task {task_id} was driven to terminal state {stored_state} by a "
+            "concurrent actor; pipeline write refused"
+        )
+        self.task_id = task_id
+        self.stored_state = stored_state
+
+
 @dataclass
 class RouterService:
     memory: SharedMemory
@@ -233,17 +248,33 @@ class RouterService:
         from .provisioning import NodePool, spec_from_provider
 
         pool = self.node_pool or NodePool()
+        # Opportunistic reap: terminate (and cost-true-up) any node idle past its
+        # window before acquiring, so a warm pool self-heals on the request path
+        # even in a deployment with no external reap loop.
+        self.reap_idle_nodes(time.time())
         spec = spec_from_provider(cfg, model_id=gen_req.model_id)
         handle, reused = pool.acquire(cfg, self.provisioner, spec, now=time.time())
-        factory = self.rented_client_factory or self._default_rented_client
-        client = factory(cfg, handle)
-        resp = client.generate(gen_req)
-        # Bill the rental window only on first spin-up; reuse within the warm
-        # window is free (amortization). A production reaper trues up on teardown.
+        # Bill the rental window at spin-up (vendor billing starts at provision,
+        # whether or not the first generate succeeds — matches the agentic rented
+        # path); reuse within the warm window is free (amortization). reap_idle
+        # trues up any overrun past the billed window on teardown.
         if not reused:
             window = cfg.rental.min_rental_seconds if cfg.rental else 0
             self.quota.record_rental_window(cfg, gen_req.task_id, seconds=window)
-        pool.release(cfg, now=time.time())
+        factory = self.rented_client_factory or self._default_rented_client
+        try:
+            client = factory(cfg, handle)
+            resp = client.generate(gen_req)
+        except Exception:
+            # A node whose backend just failed must not stay cached `ready` and
+            # be silently reused (and re-crash) forever: evict it (best-effort
+            # terminate + cost true-up) so the next task re-provisions fresh.
+            self._evict_rented_node(cfg, pool, time.time(), task_id=gen_req.task_id)
+            raise
+        finally:
+            # Mirrors _run_agentic_rented: the node is always released for the
+            # idle reaper, even when generation raised.
+            pool.release(cfg, now=time.time())
         self.memory.append_log(
             gen_req.task_id,
             f"rented_node={handle.node_id} endpoint={handle.manager_endpoint} reused={reused}",
@@ -257,11 +288,55 @@ class RouterService:
         )
 
     def reap_idle_nodes(self, now: float) -> list[str]:
-        """Terminate rented nodes idle past their window. Call periodically."""
+        """Terminate rented nodes idle past their window, truing up cost for any
+        lifetime beyond the min rental window billed at spin-up. Called
+        opportunistically from the rented dispatch paths (so a live deployment
+        self-heals without an external loop) and callable periodically."""
         if self.node_pool is None:
             return []
         cfgs = {p.provider_id: p for p in self.registry.all()}
-        return self.node_pool.reap_idle(self.provisioner, cfgs, now)
+        return self.node_pool.reap_idle(
+            self.provisioner, cfgs, now, on_terminate=self._true_up_rental_cost
+        )
+
+    def _true_up_rental_cost(
+        self, provider_id: str, handle, provisioned_at: Optional[float], now: float
+    ) -> None:
+        """Record the rental cost accrued BEYOND the min window billed at
+        spin-up. The vendor bills wall-clock for as long as the node is up, so
+        the internal ledger (which gates future routing via BudgetManager) must
+        not under-report a long-lived warm node."""
+        cfg = self.registry.get(provider_id)
+        if cfg is None or provisioned_at is None:
+            return
+        billed = cfg.rental.min_rental_seconds if cfg.rental else 0
+        extra = max(0.0, (now - provisioned_at) - billed)
+        if extra > 0:
+            self.quota.record_rental_window(
+                cfg, f"reap:{provider_id}", seconds=extra, status="rental_true_up"
+            )
+
+    def _evict_rented_node(
+        self, cfg, pool, now: float, task_id: Optional[str] = None
+    ) -> None:
+        """Drop a rented node from the warm pool after a dispatch failure —
+        best-effort terminate + cost true-up — so a crashed backend is never
+        silently reused forever. Fail-safe: eviction errors are logged, never
+        raised over the original dispatch failure."""
+        try:
+            evicted = pool.evict(
+                cfg.provider_id, self.provisioner, now=now,
+                on_terminate=self._true_up_rental_cost,
+            )
+            if evicted is not None and task_id:
+                self.memory.append_log(
+                    task_id,
+                    f"rented_node_evicted={evicted.node_id} provider={cfg.provider_id} "
+                    "reason=dispatch_failure",
+                    level="warn",
+                )
+        except Exception:  # noqa: BLE001 — never mask the dispatch failure
+            pass
 
     def reap_work_queue(self, now: float) -> dict[str, list[str]]:
         """Requeue expired leases / park exhausted ones. Mirrors
@@ -293,6 +368,15 @@ class RouterService:
         """
         if self.workqueue is None:
             raise RuntimeError("RouterService has no workqueue configured")
+
+        # Idempotency FIRST: a retry with the same dedup_key must return the
+        # existing ticket without minting a fresh task row / sanitized-payload
+        # artifact / routing decision — those rows would reference a task no
+        # ticket ever points at (permanently orphaned; no GC sweep exists).
+        if dedup_key is not None:
+            existing = self.workqueue.find_by_dedup(dedup_key)
+            if existing is not None:
+                return existing
 
         sub_dict = submission.model_dump(mode="json")
         task_id = self.memory.create_task(sub_dict, agent_type=submission.agent_type)
@@ -345,7 +429,7 @@ class RouterService:
             else list(self._capabilities_for(submission.agent_type))
         )
 
-        return self.workqueue.add(
+        ticket = self.workqueue.add(
             task=submission.task,
             origin=f"router:{submission.agent_type or 'unknown'}",
             privacy_class=privacy_class,
@@ -358,6 +442,16 @@ class RouterService:
             assignee=assignee,
             cloud_safe=redaction.cloud_safe,
         )
+        # Idempotency-race cleanup: a concurrent enqueue with the same dedup_key
+        # may have won between the pre-check above and add() (which dedups the
+        # ticket only). If the returned ticket points at a different task, the
+        # rows THIS call minted are orphans — unwind them (mirrors add()'s own
+        # orphan-artifact cleanup on the same race).
+        if dedup_key is not None and "ticket_id" in ticket:
+            winner_task = self.workqueue.task_id_for_ticket(ticket["ticket_id"])
+            if winner_task is not None and winner_task != task_id:
+                self.memory.delete_task_cascade(task_id)
+        return ticket
 
     # ------------------------------------------------- decision-only routing
     def decide_route(self, ctx: RoutingContext) -> RoutingDecision:
@@ -401,12 +495,49 @@ class RouterService:
             return None
 
     def _transition(self, task_id: str, current: TaskState, dst: TaskState) -> TaskState:
+        """FSM-checked, terminal-safe state write.
+
+        ``assert_transition`` validates against the caller's in-memory view; the
+        store write is additionally GUARDED against the live row (one atomic
+        ``UPDATE ... WHERE state NOT IN <terminal>``), because the in-memory
+        view can be stale: a concurrent ``cancel_task`` may have driven the task
+        to terminal CANCELLED mid-pipeline. In that case the write is refused
+        and :class:`TaskSuperseded` is raised — the pipeline stops, the
+        cancellation stands, and the caller returns the stored terminal summary.
+        """
         assert_transition(current, dst)
-        self.memory.update_task(task_id, state=dst.value)
+        exclude = {s.value for s in TERMINAL_STATES if s is not dst}
+        updated, stored = self.memory.update_task_guarded(
+            task_id, exclude_states=exclude, state=dst.value
+        )
+        if not updated:
+            raise TaskSuperseded(task_id, stored)
         return dst
 
     # --------------------------------------------------------- MCP: submit_task
     def submit_task(self, submission: TaskSubmission) -> TaskSummary:
+        """Submit + synchronously drive a task through the pipeline.
+
+        If a concurrent ``cancel_task`` wins mid-flight (terminal CANCELLED),
+        every later pipeline write is refused by the guarded ``_transition`` and
+        the caller receives the stored terminal summary — cancellation is never
+        silently overwritten by a slower completion, on any dispatch path
+        (local, rented, or cloud all flow through this one pipeline). Actual
+        spend incurred before the cancellation was observed is still reconciled
+        (the tokens/rental really happened); only the state/summary stand down.
+        """
+        try:
+            return self._submit_task_pipeline(submission)
+        except TaskSuperseded as exc:
+            self.memory.append_log(
+                exc.task_id,
+                f"pipeline result discarded: task reached terminal state "
+                f"{exc.stored_state} (e.g. cancelled) while work was in flight",
+                level="warn",
+            )
+            return self._summary(exc.task_id)
+
+    def _submit_task_pipeline(self, submission: TaskSubmission) -> TaskSummary:
         # 1-2. Receive + assign id.
         sub_dict = submission.model_dump(mode="json")
         task_id = self.memory.create_task(sub_dict, agent_type=submission.agent_type)
@@ -441,7 +572,6 @@ class RouterService:
             self._transition(task_id, state, TaskState.REJECTED)
             self.memory.update_task(
                 task_id,
-                state=TaskState.REJECTED.value,
                 summary="Blocked: task contains secret-sensitive content and may not be sent to any model.",
                 recommended_next_action="Remove/redact secrets or handle out-of-band; do not route to an LLM.",
             )
@@ -457,7 +587,6 @@ class RouterService:
                 self._transition(task_id, state, TaskState.REJECTED)
                 self.memory.update_task(
                     task_id,
-                    state=TaskState.REJECTED.value,
                     summary="Blocked by fascia-guard: task contains secret/credential material.",
                     recommended_next_action="Remove/redact the flagged content; do not route to an LLM.",
                 )
@@ -528,7 +657,7 @@ class RouterService:
                 summary = f"No eligible provider ({decision.decision})."
                 next_action = "Relax constraints, sanitize the payload, or wait for quota/capacity."
             self.memory.update_task(
-                task_id, state=TaskState.REJECTED.value, summary=summary,
+                task_id, summary=summary,
                 recommended_next_action=next_action,
             )
             return self._summary(task_id)
@@ -576,8 +705,7 @@ class RouterService:
                         "rented) model is eligible."
                     )
                 self.memory.update_task(
-                    task_id, state=TaskState.REJECTED.value,
-                    summary=summary, recommended_next_action=next_action,
+                    task_id, summary=summary, recommended_next_action=next_action,
                 )
                 return self._summary(task_id)
 
@@ -587,8 +715,7 @@ class RouterService:
             if not self._confirm_charge(cfg, ctx, submission.task, task_id):
                 self._transition(task_id, state, TaskState.REJECTED)
                 self.memory.update_task(
-                    task_id, state=TaskState.REJECTED.value,
-                    summary="Spend not confirmed by the user.",
+                    task_id, summary="Spend not confirmed by the user.",
                     recommended_next_action="Approve the charge when prompted, adjust the budget, "
                     "or resubmit constrained to free/local providers.",
                 )
@@ -601,8 +728,7 @@ class RouterService:
             if not reservation.granted:
                 self._transition(task_id, state, TaskState.REJECTED)
                 self.memory.update_task(
-                    task_id, state=TaskState.REJECTED.value,
-                    summary=f"Quota reservation denied for {cfg.provider_id}: {reservation.reason}.",
+                    task_id, summary=f"Quota reservation denied for {cfg.provider_id}: {reservation.reason}.",
                     recommended_next_action="Wait for quota reset or route to a local model.",
                 )
                 return self._summary(task_id)
@@ -638,8 +764,7 @@ class RouterService:
             self.memory.append_log(task_id, f"dispatch_failed: {exc}", level="error")
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=f"Dispatch to {cfg.provider_id} failed.",
+                task_id, summary=f"Dispatch to {cfg.provider_id} failed.",
                 recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
             )
             return self._summary(task_id)
@@ -673,7 +798,7 @@ class RouterService:
 
         summary = self._first_line(stored_output)
         self.memory.update_task(
-            task_id, state=TaskState.COMPLETE.value, summary=summary,
+            task_id, summary=summary,
             recommended_next_action="Read the output artifact chunk if details are needed.",
         )
         self.memory.append_log(
@@ -749,8 +874,7 @@ class RouterService:
             )
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=f"Remote agentic dispatch to {worker_cfg.worker_id} failed.",
+                task_id, summary=f"Remote agentic dispatch to {worker_cfg.worker_id} failed.",
                 recommended_next_action="Inspect logs via get_log_slice; retry or run in-process.",
             )
             return self._summary(task_id)
@@ -788,8 +912,7 @@ class RouterService:
             state = self._transition(task_id, state, TaskState.APPROVED)
             self._transition(task_id, state, TaskState.COMPLETE)
             self.memory.update_task(
-                task_id, state=TaskState.COMPLETE.value,
-                summary=self._first_line(worker.summary) or "Remote agentic task completed.",
+                task_id, summary=self._first_line(worker.summary) or "Remote agentic task completed.",
                 recommended_next_action=worker.recommended_next_action
                 or "Read the output artifact chunk if details are needed.",
             )
@@ -798,8 +921,7 @@ class RouterService:
             # not a success — surface as FAILED with the worker's own next-action.
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=self._first_line(worker.summary) or "Remote agentic task did not complete.",
+                task_id, summary=self._first_line(worker.summary) or "Remote agentic task did not complete.",
                 recommended_next_action=worker.recommended_next_action
                 or "Raise the step limit or narrow the task, then retry.",
             )
@@ -842,8 +964,7 @@ class RouterService:
             self.memory.append_log(task_id, f"agentic_run_failed: {exc}", level="error")
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=f"Agentic run on {cfg.provider_id} failed.",
+                task_id, summary=f"Agentic run on {cfg.provider_id} failed.",
                 recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
             )
             return self._summary(task_id)
@@ -877,8 +998,7 @@ class RouterService:
             state = self._transition(task_id, state, TaskState.APPROVED)
             self._transition(task_id, state, TaskState.COMPLETE)
             self.memory.update_task(
-                task_id, state=TaskState.COMPLETE.value,
-                summary=self._first_line(worker.summary) or "Agentic task completed.",
+                task_id, summary=self._first_line(worker.summary) or "Agentic task completed.",
                 recommended_next_action=worker.recommended_next_action
                 or "Read the output artifact chunk if details are needed.",
             )
@@ -888,8 +1008,7 @@ class RouterService:
             # own risks/next-action so the manager can decide.
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=self._first_line(worker.summary) or "Agentic task did not complete.",
+                task_id, summary=self._first_line(worker.summary) or "Agentic task did not complete.",
                 recommended_next_action=worker.recommended_next_action
                 or "Raise the step limit or narrow the task, then retry.",
             )
@@ -1099,7 +1218,11 @@ class RouterService:
         # we failed before constructing it, so the except guards token totals.
         source = None
         handle = None
+        node_engaged = False  # True once the node itself is exercised (the loop)
         started = time.perf_counter()
+        # Opportunistic reap (mirrors _dispatch): true up + terminate idle nodes
+        # on the request path so no external loop is required.
+        self.reap_idle_nodes(time.time())
         try:
             handle, reused = pool.acquire(cfg, self.provisioner, spec, now=time.time())
             client = factory(cfg, handle)
@@ -1111,8 +1234,15 @@ class RouterService:
             runtime = self._make_local_runtime(
                 source, RuntimeConfig(model_id=model_id, max_output_tokens=max_out)
             )
+            node_engaged = True
             worker = runtime.run(submission, task_id=task_id)
         except Exception as exc:  # setup/runtime failure -> FAILED (no cloud quota to reconcile).
+            if handle is not None and node_engaged:
+                # Mirrors _dispatch: a node whose LOOP just failed must not stay
+                # cached `ready` and be reused (and re-fail) forever. A router-
+                # side setup/billing failure before the node was engaged is not
+                # the node's fault — it stays pooled for the idle reaper.
+                self._evict_rented_node(cfg, pool, time.time(), task_id=task_id)
             latency_ms = (time.perf_counter() - started) * 1000.0
             in_tok = source.total_input_tokens if source is not None else 0
             out_tok = source.total_output_tokens if source is not None else 0
@@ -1123,8 +1253,7 @@ class RouterService:
             self.memory.append_log(task_id, f"agentic_run_failed: {exc}", level="error")
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=f"Agentic run on rented node {cfg.provider_id} failed.",
+                task_id, summary=f"Agentic run on rented node {cfg.provider_id} failed.",
                 recommended_next_action="Inspect logs via get_log_slice; retry or reroute.",
             )
             return self._summary(task_id)
@@ -1158,16 +1287,14 @@ class RouterService:
             state = self._transition(task_id, state, TaskState.APPROVED)
             self._transition(task_id, state, TaskState.COMPLETE)
             self.memory.update_task(
-                task_id, state=TaskState.COMPLETE.value,
-                summary=self._first_line(worker.summary) or "Agentic task completed.",
+                task_id, summary=self._first_line(worker.summary) or "Agentic task completed.",
                 recommended_next_action=worker.recommended_next_action
                 or "Read the output artifact chunk if details are needed.",
             )
         else:
             self._transition(task_id, state, TaskState.FAILED)
             self.memory.update_task(
-                task_id, state=TaskState.FAILED.value,
-                summary=self._first_line(worker.summary) or "Agentic task did not complete.",
+                task_id, summary=self._first_line(worker.summary) or "Agentic task did not complete.",
                 recommended_next_action=worker.recommended_next_action
                 or "Raise the step limit or narrow the task, then retry.",
             )
@@ -1321,15 +1448,52 @@ class RouterService:
         return {"task_id": task_id, "priority": "urgent", "note": "Priority raised; requeue on next dispatch."}
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
+        """Cancel a non-terminal task. CANCELLED is terminal and FINAL: the
+        guarded pipeline writes (``_transition``) can never overwrite it, and
+        any work-queue tickets linked to this task are cancelled too so a pull
+        worker cannot claim (or successfully report) work for it afterwards.
+
+        Cancelling an already-terminal task is an ERROR-shaped result
+        (``{"error": "already_terminal", ...}``) — the same "cancel-after-
+        terminal is a conflict" semantic AgentConnectService.cancel_subtask
+        raises as ``Conflict``, expressed in this surface's typed-dict error
+        idiom — so callers of either engine can share one idempotency check.
+        """
         task = self.memory.get_task(task_id)
         if task is None:
             return {"error": "task_not_found"}
         current = TaskState(task["state"])
         if current in TERMINAL_STATES:
-            return {"task_id": task_id, "state": current.value, "note": "already terminal"}
-        self._transition(task_id, current, TaskState.CANCELLED)
+            return {
+                "error": "already_terminal", "task_id": task_id, "state": current.value,
+                "note": "already terminal",
+            }
+        try:
+            self._transition(task_id, current, TaskState.CANCELLED)
+        except TaskSuperseded as exc:
+            # Lost the race to another terminal writer between the read above
+            # and the guarded write.
+            return {
+                "error": "already_terminal", "task_id": task_id,
+                "state": exc.stored_state, "note": "already terminal",
+            }
         self.memory.update_task(task_id, summary="Cancelled by manager.")
-        return {"task_id": task_id, "state": TaskState.CANCELLED.value}
+        # Audit: cancellation is a state mutation like any other and must be
+        # reconstructable from the task's log (previously the one unlogged
+        # terminal transition in this file).
+        self.memory.append_log(task_id, f"cancelled by manager (was {current.value})")
+        cancelled_tickets: list[str] = []
+        if self.workqueue is not None:
+            cancelled_tickets = self.workqueue.cancel_for_task(task_id)
+            if cancelled_tickets:
+                self.memory.append_log(
+                    task_id,
+                    "cancelled linked work-queue tickets: " + ", ".join(cancelled_tickets),
+                )
+        return {
+            "task_id": task_id, "state": TaskState.CANCELLED.value,
+            "cancelled_tickets": cancelled_tickets,
+        }
 
     # ----------------------------------------------------------- internals
     def _capabilities_for(self, agent_type: Optional[str]) -> tuple[str, ...]:
