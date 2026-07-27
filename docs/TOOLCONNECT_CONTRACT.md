@@ -5,6 +5,15 @@
 > text below documents the contract and rationale; current reality: the sibling repos ship
 > working implementations that AgentConnect now integrates with.
 
+> **toolconnect_governor contract bumped 1.0 → 1.1 (2026-07-27, ADR 0009).** Additive:
+> `authorize` accepts optional keyword-only `args`/`ttl_seconds` and, on allow, may
+> return a one-use `grant` (`grant_id`, `args_hash`, `expires_at`, `ttl_seconds`); a new
+> `redeem(grant_id, principal, args)` atomically consumes it immediately before
+> execution. `authorize` without `args` is byte-identical to 1.0 — no `grant` key, same
+> decision shape — which is what makes the bump backward compatible;
+> `EXPECTED_CONTRACT_MAJOR` in `toolconnect_client.py` stays `"1"`, unchanged. See §7
+> below and [ADR 0009](adr/0009-final-invocation-boundary.md).
+
 **Original status (historical, pre-2026-07-17): design note; ToolConnect did not yet
 exist.** When first written, no code moved as a result of this document, and
 AgentConnect exposed a fixed MCP tool set and ran standalone.
@@ -220,6 +229,47 @@ All three are now met, which is why this contract is worth writing against:
 
 What remains before ToolConnect could take over the gate: the CLI is unauthenticated, and
 tool inputs are still unscanned (below).
+
+## 7. Argument-bound grants (contract 1.1) — the final invocation boundary
+
+Sections 1–6 above describe the **declared-set** gate (`_consult_tool_governor` /
+`authorize_tool`): a worker's tool *names* are authorized before it spawns. That
+remains true and unchanged. Contract 1.1 adds a second, narrower gate for
+AgentConnect's own in-process runtime loop (`agentconnect-runtime`), which — unlike an
+opaque third-party harness — genuinely has the model's final tool arguments in hand
+before each call executes:
+
+1. `authorize(principal, source_id, name, context, args=final_args)` — the exact
+   mapping about to be passed to the tool, not a declared capability name.
+2. On allow, ToolConnect issues a one-use `grant` bound to a canonical-JSON hash of
+   those args (ToolConnect computes the hash; neither AgentConnect client ever does).
+3. `redeem(grant_id, principal, final_args)` — called immediately before execution,
+   re-submitting the SAME args. Atomically consumes the grant; a second redeem, a
+   changed argument, an expired/closed grant, or a principal mismatch all deny.
+4. Only on a successful redemption — and only when the redeem response's echoed
+   `source_id`/`name` match the tool actually about to run (identity-echo check,
+   defense-in-depth against a wrong-grant redemption) — does AgentConnect execute
+   the tool, passing the SAME frozen mapping that was hashed and redeemed (never
+   re-reading the model's mutable action dict). `record(decision_id, outcome,
+   detail, grant_id=...)` closes the loop best-effort, as before; `grant_id` is
+   sent as a TOP-LEVEL body field on `POST /decisions/{id}/outcome`, which is what
+   makes ToolConnect close the grant in the same call (close-via-outcome).
+
+**Mixed-fleet rule:** if `args` was sent but the response carries no `grant` despite
+allowing, AgentConnect treats that as an outage-shaped deny (`unavailable=True`),
+never as a real allow — a pre-1.1 server silently dropping the field must not degrade
+into ungoverned execution.
+
+This gate wraps every side-effecting action in `runtime/graph.py::run_tool` —
+`read_file`, `write_file`, `list_dir`, `shell`, `run_tests` (bound to the operator's
+`test_command`, never the model's ignored args), `fetch_url`, `remember` — and is
+threaded optionally through `LangGraphAgentRuntime`, `RouterService`, and
+`agentconnect-worker`. `delegate` is exempt: it executes nothing external itself: its
+child subtask hits the ordinary declared-set gate through the router.
+
+See [ADR 0009](adr/0009-final-invocation-boundary.md) for the full rationale,
+including why `redeem` is a required Protocol method rather than an optional
+subprotocol with a silent decision-only fallback.
 
 ## Related
 

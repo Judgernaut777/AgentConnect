@@ -135,6 +135,44 @@ class _CountingGateway:
         )
 
 
+def test_make_local_runtime_wires_the_bound_tool_governor():
+    # RouterService._make_local_runtime threads tool_governor/governed_principal into
+    # the built-in LangGraphAgentRuntime (ADR 0009) — this pins the wiring itself,
+    # the enforcement semantics are covered end-to-end in test_runtime_governor.py.
+    governor = object()
+    principal = {"id": "router-test", "kind": "agent", "privacy_tier": "local"}
+    svc = RouterService.create(
+        memory=SharedMemory(), local_client=InProcessLocalClient(ResidencyManager()),
+        tool_governor=governor, governed_principal=principal,
+    )
+    from agentconnect.runtime import RuntimeConfig
+
+    runtime = svc._make_local_runtime(object(), RuntimeConfig())
+    assert runtime._tool_governor is governor
+    assert runtime._governed_principal == principal
+    assert runtime._governed_source_id == "agentconnect-router"
+
+
+def test_local_runtime_factory_bypasses_router_tool_governor_wiring():
+    # An injected local_runtime_factory wires its OWN governance; the router must not
+    # silently inject its tool_governor into a bring-your-own runtime.
+    governor = object()
+    calls = []
+
+    def factory(source, config):
+        calls.append((source, config))
+        return object()
+
+    svc = RouterService.create(
+        memory=SharedMemory(), local_client=InProcessLocalClient(ResidencyManager()),
+        tool_governor=governor, local_runtime_factory=factory,
+    )
+    from agentconnect.runtime import RuntimeConfig
+
+    svc._make_local_runtime(object(), RuntimeConfig())
+    assert len(calls) == 1  # factory received exactly (source, config), no governor
+
+
 def test_gateway_model_source_pins_model_and_sums_usage():
     gw = _CountingGateway()
     src = GatewayModelSource(gw, cfg=object(), model_id="pinned-model")

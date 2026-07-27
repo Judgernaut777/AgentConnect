@@ -78,13 +78,35 @@ def _model_source(args: argparse.Namespace) -> Any:
     return backend_from_env()
 
 
+def _tool_governor_from_env(identity: Optional[str]):
+    """Build the optional final-invocation-boundary tool governor from env, mirroring
+    ``agentconnect.core.bootstrap.toolconnect_governor_from_env`` (same env vars:
+    ``AGENTCONNECT_TOOLCONNECT_URL``/``_TOKEN``/``_MODE``/``_TIMEOUT``). Absence of the
+    URL env var means no governor — this worker runs exactly as before. Lazily imports
+    ``agentconnect-core`` so a governance-less deployment need not have it configured."""
+    from agentconnect.core.bootstrap import toolconnect_governor_from_env
+
+    governor = toolconnect_governor_from_env()
+    if governor is None:
+        return None, None
+    principal = {
+        "id": f"worker:{identity or 'agentconnect-worker'}",
+        "kind": "agent", "privacy_tier": "local",
+    }
+    return governor, principal
+
+
 def build_worker(args: argparse.Namespace) -> PullWorker:
     """Construct a configured PullWorker from parsed args, without connecting."""
+    tool_governor, governed_principal = _tool_governor_from_env(args.identity)
     runtime = LangGraphAgentRuntime(
         _model_source(args),
         RuntimeConfig(
             model_id=args.model_id, allow_shell=args.shell, allow_browser=args.browser
         ),
+        tool_governor=tool_governor,
+        governed_principal=governed_principal,
+        governed_source_id="agentconnect-worker",
     )
     caps = [c.strip() for c in (args.capabilities or "").split(",") if c.strip()]
     # In real deployment identity is the mTLS client cert and no header is sent.

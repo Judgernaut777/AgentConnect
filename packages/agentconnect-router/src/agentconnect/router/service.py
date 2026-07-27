@@ -105,6 +105,15 @@ class RouterService:
     enable_delegation: bool = False
     max_delegation_depth: int = 2
     max_subtasks: int = 8
+    # Final-invocation-boundary tool governance (ADR 0009), threaded into the
+    # built-in in-process runtime's act/tool loop. None (default) => no governor,
+    # the in-process runtime runs exactly as before. A bound governor authorizes
+    # AND redeems the FINAL arguments of every side-effecting tool call the loop
+    # makes, immediately before it executes. Only wired for the built-in runtime
+    # branch of `_make_local_runtime` — an injected `local_runtime_factory`
+    # (bring-your-own AgentRuntime) wires its own governance.
+    tool_governor: Optional[Any] = None
+    governed_principal: Optional[dict] = None
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -117,6 +126,8 @@ class RouterService:
         rented_client_factory: Optional[Callable[[Any, Any], LocalClient]] = None,
         authorizer: Optional[SpendAuthorizer] = None,
         local_runtime_factory: Optional[Callable[[Any, Any], Any]] = None,
+        tool_governor: Optional[Any] = None,
+        governed_principal: Optional[dict] = None,
     ) -> "RouterService":
         providers_cfg, profiles, routing_cfg = load_all()
         mem = memory or SharedMemory()
@@ -152,18 +163,28 @@ class RouterService:
             # None stays None here on purpose: _make_local_runtime lazily builds the
             # built-in runtime so a one-shot-only deployment need not install it.
             local_runtime_factory=local_runtime_factory,
+            tool_governor=tool_governor,
+            governed_principal=governed_principal,
         )
 
     def _make_local_runtime(self, source, config):
         """Build the in-process agentic runtime. Uses an injected
-        ``local_runtime_factory`` when set (bring-your-own AgentRuntime), else lazily
-        constructs the built-in ``LangGraphAgentRuntime`` — the lazy import keeps
-        one-shot-only deployments free of the runtime/langgraph dependency."""
+        ``local_runtime_factory`` when set (bring-your-own AgentRuntime — it wires
+        its own tool governance, not this seam), else lazily constructs the built-in
+        ``LangGraphAgentRuntime`` — the lazy import keeps one-shot-only deployments
+        free of the runtime/langgraph dependency — bound to ``self.tool_governor``
+        (final-invocation-boundary enforcement, ADR 0009; ``None`` => ungoverned,
+        unchanged from before this seam existed)."""
         if self.local_runtime_factory is not None:
             return self.local_runtime_factory(source, config)
         from agentconnect.runtime import LangGraphAgentRuntime
 
-        return LangGraphAgentRuntime(source, config)
+        return LangGraphAgentRuntime(
+            source, config,
+            tool_governor=self.tool_governor,
+            governed_principal=self.governed_principal,
+            governed_source_id="agentconnect-router",
+        )
 
     # ----------------------------------------------------------- evaluation
     def _record_eval(self, cfg, model, task_id, agent_type, status, latency_ms,

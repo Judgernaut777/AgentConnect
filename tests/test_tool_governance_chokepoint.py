@@ -40,38 +40,94 @@ from agentconnect.core.observability import (
     ObservabilityEmitter,
     StructuredLogObservabilityProvider,
 )
-from agentconnect.core.toolconnect_client import ToolDecision, ToolUseAuthorization
+from agentconnect.core.toolconnect_client import (
+    RedeemResult,
+    ToolDecision,
+    ToolGrant,
+    ToolUseAuthorization,
+)
 from agentconnect.core.workers import WorkerArtifactRef
 
 
 # ------------------------------------------------------------------- test doubles
 class FakeGovernor:
     """An in-process `ToolGovernor`. Deterministic, no HTTP — the network path is
-    already covered by `test_toolconnect_client`; here we pin the *consultation*."""
+    already covered by `test_toolconnect_client`; here we pin the *consultation*.
 
-    def __init__(self, *, deny=(), raise_on=(), mode="required"):
+    Also implements the contract-1.1 grant/redeem surface (a deterministic
+    ``grant_id=f"g-{name}"``): when ``authorize`` is called with ``args`` and the
+    decision allows, a one-use grant is issued and remembered (bound principal +
+    exact args); ``redeem`` enforces one-use, exact-args-equality, and principal
+    match, mirroring ToolConnect's own server-side semantics closely enough for
+    runtime-loop tests without needing a live server."""
+
+    def __init__(self, *, deny=(), raise_on=(), mode="required", redeem_deny=()):
         self.mode = mode
         self.deny = set(deny)
         self.raise_on = set(raise_on)
+        # Tool names for which redeem should deny even though authorize allowed —
+        # simulates a grant that gets rejected at the final boundary.
+        self.redeem_deny = set(redeem_deny)
         self.calls: list[tuple] = []
+        self.authorize_args_calls: list[tuple] = []
         self.records: list[tuple] = []
+        self.redeems: list[tuple] = []
+        self._grants: dict[str, dict] = {}  # grant_id -> {principal, args, name, redeemed}
 
-    def authorize(self, principal, source_id, name, context=None):
+    def authorize(self, principal, source_id, name, context=None, *,
+                  args=None, ttl_seconds=None):
+        # Kept as a 4-tuple for the existing consultation-pinning tests
+        # (`for _, _, p, _ in gov.calls`); `args` is tracked separately below so
+        # this addition doesn't shift their unpacking arity.
         self.calls.append((source_id, name, dict(principal), dict(context or {})))
+        self.authorize_args_calls.append((source_id, name, args))
         if name in self.raise_on:
             raise RuntimeError("engine exploded")
         if name in self.deny:
             return ToolDecision(
                 allowed=False, reason=f"policy forbids {name}",
                 decision_id=f"dec-{name}", default_deny=False,
-                determining_policies=(f"no-{name}",), contract_version="1.0",
+                determining_policies=(f"no-{name}",), contract_version="1.1",
             )
+        grant = None
+        if args is not None:
+            grant_id = f"g-{name}"
+            self._grants[grant_id] = {
+                "principal_id": principal.get("id"), "args": dict(args),
+                "name": name, "source_id": source_id, "redeemed": False,
+            }
+            grant = ToolGrant(grant_id=grant_id, args_hash=f"hash-{name}",
+                              expires_at="9999-01-01T00:00:00+00:00", ttl_seconds=60)
         return ToolDecision(
             allowed=True, reason="allowed", decision_id=f"dec-{name}",
-            determining_policies=(f"allow-{name}",), contract_version="1.0",
+            determining_policies=(f"allow-{name}",), contract_version="1.1",
+            grant=grant,
         )
 
-    def record(self, decision_id, outcome, detail=None):
+    def redeem(self, grant_id, principal, args):
+        record = self._grants.get(grant_id)
+        self.redeems.append((grant_id, dict(principal), dict(args)))
+        if record is None:
+            return RedeemResult(False, reason="not_found", grant_id=grant_id)
+        if record["name"] in self.redeem_deny:
+            return RedeemResult(False, reason="not_invocable", grant_id=grant_id,
+                                decision_id=f"dec-{record['name']}")
+        if record["redeemed"]:
+            return RedeemResult(False, reason="already_redeemed", grant_id=grant_id,
+                                decision_id=f"dec-{record['name']}")
+        if principal.get("id") != record["principal_id"]:
+            return RedeemResult(False, reason="principal_mismatch", grant_id=grant_id,
+                                decision_id=f"dec-{record['name']}")
+        if dict(args) != record["args"]:
+            return RedeemResult(False, reason="args_mismatch", grant_id=grant_id,
+                                decision_id=f"dec-{record['name']}")
+        record["redeemed"] = True
+        return RedeemResult(
+            True, reason="ok", grant_id=grant_id, decision_id=f"dec-{record['name']}",
+            source_id=record["source_id"], name=record["name"],
+        )
+
+    def record(self, decision_id, outcome, detail=None, *, grant_id=None):
         self.records.append((decision_id, outcome, dict(detail or {})))
         return {"recorded": True}
 

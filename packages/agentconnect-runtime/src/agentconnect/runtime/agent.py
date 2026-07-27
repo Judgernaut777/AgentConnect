@@ -13,7 +13,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol
 
 from agentconnect.common.schemas import GenerateRequest, GenerateResponse, TaskSubmission, WorkerResult
 
@@ -24,6 +24,7 @@ from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .memory import MemorySink
+    from agentconnect.core.toolconnect_client import ToolGovernor
 
 
 def _safe_dirname(task_id: str) -> str:
@@ -106,6 +107,9 @@ class LangGraphAgentRuntime:
         fetcher: Fetcher | None = None,
         url_resolver: Resolver | None = None,
         memory_sink: "MemorySink | None" = None,
+        tool_governor: "ToolGovernor | None" = None,
+        governed_principal: Optional[Mapping[str, Any]] = None,
+        governed_source_id: str = "agentconnect-runtime",
     ):
         self.model_source = model_source
         self.config = config or RuntimeConfig()
@@ -117,6 +121,12 @@ class LangGraphAgentRuntime:
         # Outbound memory seam (write-only). None + allow_memory disables the
         # remember action; a sink is what makes it live.
         self._memory_sink = memory_sink
+        # Final-invocation-boundary tool governance (ADR 0009). None (the default)
+        # preserves today's ungoverned behavior byte-for-byte. Seam, not config
+        # data, for the same reason as fetcher/memory_sink above.
+        self._tool_governor = tool_governor
+        self._governed_principal = governed_principal
+        self._governed_source_id = governed_source_id
 
     def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult:
         from .graph import build_execution_graph
@@ -156,6 +166,9 @@ class LangGraphAgentRuntime:
                 memory_sink=self._memory_sink,
                 provenance=provenance,
                 checkpointer=checkpointer,
+                tool_governor=self._tool_governor,
+                governed_principal=self._governed_principal,
+                governed_source_id=self._governed_source_id,
             )
             initial: RuntimeState = {
                 "task_id": task_id,

@@ -2407,11 +2407,17 @@ class AgentConnectService:
         ``action.authorized`` signal. Outcomes are recorded best-effort via
         ``governor.record()``; recording never gates a decision.
 
-        Boundary (see ADR 0008): this authorizes the *declared* tool set at prepare
-        time. It is deliberately NOT per-tool-call interception — the worker harness
-        runs its own internal tool loop and AgentConnect is never on that data path
-        (``workers.py``). Declared-set authorization + the explicit ``authorize_tool``
-        surface is the honest scope of enforcement this architecture supports.
+        Boundary (see ADR 0008 as narrowed by ADR 0009): this authorizes the
+        *declared* tool set at prepare time, before a worker is even spawned — a
+        cheap early filter, not the enforcement point. For an opaque third-party
+        worker harness (Claude Code, Codex, ...) running its own internal tool loop,
+        it remains the only honest enforcement available: AgentConnect is never on
+        that data path (``workers.py``). But for AgentConnect's OWN in-process
+        LangGraph act/tool loop (``agentconnect-runtime``), the real final-invocation
+        boundary is the per-call authorize+redeem the runtime performs immediately
+        before executing each tool's FINAL arguments (ADR 0009) — this declared-set
+        check stays in place ahead of it as a cheap pre-spawn filter, it is simply no
+        longer where the enforcement decision is made for that worker class.
         """
         governor = self.tool_governor
         if governor is None:
