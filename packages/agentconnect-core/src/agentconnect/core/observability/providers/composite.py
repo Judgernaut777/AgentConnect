@@ -96,6 +96,11 @@ class CompositeObservabilityProvider(AgentObservabilityProvider):
     def create_session(self, request: SessionObservationRequest) -> list[ObservationHandle]:
         handles: list[ObservationHandle] = []
         for p in self.providers:
+            if p.passive:
+                # A passive provider (event-log recorder, noop) offers no live
+                # surface; calling it would only persist the base class's inert
+                # placeholder handle as if it were a real attachable pane.
+                continue
             captured: dict = {}
 
             def _do(p=p, captured=captured) -> None:
@@ -109,6 +114,8 @@ class CompositeObservabilityProvider(AgentObservabilityProvider):
     def spawn_process(self, request: SpawnObservationRequest) -> list[ObservationHandle]:
         handles: list[ObservationHandle] = []
         for p in self.providers:
+            if p.passive:
+                continue
             captured: dict = {}
 
             def _do(p=p, captured=captured) -> None:

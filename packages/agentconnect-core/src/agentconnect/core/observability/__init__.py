@@ -27,6 +27,7 @@ from .model import (
 )
 from .provider import AgentObservabilityProvider
 from .providers.composite import CompositeObservabilityProvider, FailurePolicy
+from .providers.event_log import SqliteEventLogProvider
 from .providers.herdr import HerdrObservabilityProvider
 from .providers.noop import NoopObservabilityProvider
 from .providers.otlp import (
@@ -57,6 +58,7 @@ __all__ = [
     "ProviderHealth",
     "SessionObservationRequest",
     "SpawnObservationRequest",
+    "SqliteEventLogProvider",
     "StateObservationRequest",
     "StructuredLogObservabilityProvider",
     "TmuxObservabilityProvider",

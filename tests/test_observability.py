@@ -426,13 +426,26 @@ def test_provider_failure_never_corrupts_the_ledger(tmp_path):
     assert svc.observation_events(task_id=task.id)  # the good provider still logged
 
 
-def test_noop_service_emits_nothing_and_needs_no_provider(tmp_path):
+def test_default_service_needs_no_configured_provider_but_is_durably_observed(tmp_path):
+    """A standalone deployment with no provider configured still requires zero
+    extra infrastructure — but it is no longer "no observability at all"
+    (docs/EVENT_BUS.md): the always-on `SqliteEventLogProvider` makes
+    `observability.enabled` True everywhere, and every rich `_observe(...)`
+    call becomes a durable row in the ledger's own `event_log`, with no JSONL
+    file, no tmux, nothing configured. `observation_events` (the JSONL reader)
+    stays empty absent a `StructuredLogObservabilityProvider` — that surface
+    is unrelated to the always-on ledger sink."""
     svc = AgentConnectService.create(
         db_path=":memory:", artifact_dir=str(tmp_path / "a"), workers=[EchoWorker()])
-    assert svc.observability.enabled is False
+    assert svc.observability.enabled is True
+    assert [p.name for p in svc.observability.provider.providers] == ["event_log"]
     task = svc.create_task(CreateTaskRequest(title="T", created_by="human"))
     svc.submit_subtask(task.id, SubtaskRequest(title="d", instructions="x"))
-    assert svc.observation_events(task_id=task.id) == []
+    assert svc.observation_events(task_id=task.id) == []  # no JSONL reader configured
+    kinds = {e["type"] for e in svc.list_bus_events(limit=500)}
+    assert "task.created" in kinds
+    assert "subtask.created" in kinds
+    assert "state.changed" in kinds  # Path 1, independent of any provider
 
 
 @requires_tmux

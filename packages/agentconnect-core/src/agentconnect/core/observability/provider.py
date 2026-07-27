@@ -43,6 +43,13 @@ class AgentObservabilityProvider:
     """
 
     name: str = "abstract"
+    #: A passive provider offers no live surface at all (it never yields a
+    #: session/process handle worth persisting) — the composite skips it in
+    #: `create_session`/`spawn_process` so the base class's generic inert-handle
+    #: default does not get written into `observation_handles` as if it were a
+    #: real live pane. Set by a provider that exists purely to record events
+    #: (`SqliteEventLogProvider`, `NoopObservabilityProvider`).
+    passive: bool = False
 
     # ---------------------------------------------------------------- health
     def health(self) -> ProviderHealth:
