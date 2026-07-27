@@ -84,3 +84,26 @@ def test_identity_flag_sets_the_dev_proxy_header():
 def test_broker_is_required():
     with pytest.raises(SystemExit):
         _parse_args(["--dry-run"])
+
+
+def test_no_toolconnect_env_means_no_governor(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTCONNECT_TOOLCONNECT_URL", raising=False)
+    from agentconnect.core import bootstrap
+
+    monkeypatch.setenv(bootstrap.TOOLCONNECT_CONFIG_PATH, str(tmp_path / "absent.yaml"))
+    worker = build_worker(_parse_args(["--broker", "http://b", "--dry-run"]))
+    assert worker.runtime._tool_governor is None
+
+
+def test_toolconnect_env_wires_a_governor_and_worker_principal(monkeypatch, tmp_path):
+    from agentconnect.core import bootstrap
+    from agentconnect.core.toolconnect_client import ToolConnectGovernor
+
+    monkeypatch.setenv(bootstrap.TOOLCONNECT_CONFIG_PATH, str(tmp_path / "absent.yaml"))
+    monkeypatch.setenv("AGENTCONNECT_TOOLCONNECT_URL", "http://127.0.0.1:8095")
+    worker = build_worker(
+        _parse_args(["--broker", "http://b", "--dry-run", "--identity", "worker-1"])
+    )
+    assert isinstance(worker.runtime._tool_governor, ToolConnectGovernor)
+    assert worker.runtime._governed_principal["id"] == "worker:worker-1"
+    assert worker.runtime._governed_source_id == "agentconnect-worker"

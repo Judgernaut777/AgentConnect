@@ -76,6 +76,26 @@ def _try_embedded_manager():
     return InProcessLocalClient(ResidencyManager(backend=backend_from_env()))
 
 
+def _tool_governor_from_env() -> tuple[Optional[Any], Optional[dict]]:
+    """Build the optional final-invocation-boundary tool governor from env/config,
+    mirroring ``agentconnect.runtime.worker_cli._tool_governor_from_env`` (same
+    source of truth: ``agentconnect.core.bootstrap.toolconnect_governor_from_env``,
+    env vars ``AGENTCONNECT_TOOLCONNECT_URL``/``_TOKEN``/``_MODE``/``_TIMEOUT`` or
+    ``config/toolconnect.yaml``). Absence means no governor — the router's built-in
+    in-process agentic runtime runs exactly as before. Without this wiring the
+    ADR-0009 per-call authorize+redeem gate would be unreachable dead capability on
+    the ``agentconnect-router`` production entrypoint: RouterService.tool_governor
+    would stay None and every side-effecting tool call in the in-process act/tool
+    loop would execute ungoverned."""
+    from agentconnect.core.bootstrap import toolconnect_governor_from_env
+
+    governor = toolconnect_governor_from_env()
+    if governor is None:
+        return None, None
+    principal = {"id": "router:agentconnect-router", "kind": "agent", "privacy_tier": "local"}
+    return governor, principal
+
+
 def _build_service() -> RouterService:
     """Wire the router.
 
@@ -91,8 +111,13 @@ def _build_service() -> RouterService:
         local_client = HttpLocalClient(manager_url, tls=_local_tls_from_env())
     else:
         local_client = _try_embedded_manager()
+    tool_governor, governed_principal = _tool_governor_from_env()
     return RouterService.create(
-        memory=_default_memory(), local_client=local_client, authorizer=_spend_authorizer_from_env()
+        memory=_default_memory(),
+        local_client=local_client,
+        authorizer=_spend_authorizer_from_env(),
+        tool_governor=tool_governor,
+        governed_principal=governed_principal,
     )
 
 

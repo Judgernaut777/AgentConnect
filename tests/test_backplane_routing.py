@@ -498,7 +498,7 @@ class _DenyingGovernor:
             determining_policies=(f"p-{name}",), contract_version="1.0",
         )
 
-    def record(self, decision_id, outcome, detail=None):
+    def record(self, decision_id, outcome, detail=None, *, grant_id=None):
         return {"recorded": True}
 
     def health(self):

@@ -11,7 +11,8 @@ selection — stays in the router.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 from agentconnect.common.schemas import GenerateRequest
 
@@ -26,6 +27,9 @@ from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .memory import MemorySink
+    from agentconnect.core.toolconnect_client import ToolGovernor
+
+_log = logging.getLogger(__name__)
 
 
 def build_execution_graph(
@@ -38,11 +42,22 @@ def build_execution_graph(
     memory_sink: "MemorySink | None" = None,
     provenance: dict | None = None,
     checkpointer: Any = None,
+    tool_governor: "ToolGovernor | None" = None,
+    governed_principal: Optional[Mapping[str, Any]] = None,
+    governed_source_id: str = "agentconnect-runtime",
 ) -> Any:
     """Build and compile the worker graph bound to one workspace. When a
     ``checkpointer`` is supplied (a LangGraph ``BaseCheckpointSaver``), the graph
     persists state after each super-step so a crashed run can resume from the pending
-    node; without one it runs in-memory (the default ephemeral behavior)."""
+    node; without one it runs in-memory (the default ephemeral behavior).
+
+    ``tool_governor`` is the final-invocation-boundary enforcement seam (ADR 0009):
+    when bound, every side-effecting tool call in ``run_tool`` below is authorized
+    AND redeemed against its exact final arguments immediately before it executes —
+    not the model's *declared* tool set (that's the cheap early gate the router/core
+    layer already does before a worker even spawns), but the literal args about to
+    run. ``None`` (the default) preserves today's ungoverned behavior byte-for-byte;
+    every existing runtime test passes with no fixture changes required."""
 
     def act(state: RuntimeState) -> dict[str, Any]:
         req = GenerateRequest(
@@ -65,22 +80,102 @@ def build_execution_graph(
             "model_id": resp.model_id or config.model_id,
         }
 
+    def governed(state: RuntimeState, tool_name: str, final_args: Mapping[str, Any],
+                 execute: Callable[[Mapping[str, Any]], str]) -> str:
+        """Final-invocation-boundary gate (ADR 0009): authorize the EXACT final
+        args, redeem the one-use grant, THEN execute — immediately before, for
+        every side-effecting tool call.
+
+        No governor bound => today's ungoverned behavior, unchanged (the common
+        case; the pre-spawn declared-tool-set check at dispatch time remains the
+        only gate). A bound governor is all-or-nothing: any missing grant/redeem
+        capability, any deny, any redemption failure, or any raised exception
+        refuses — there is deliberately no decision-only downgrade, since that
+        would recreate the exact enforcement gap this exists to close. A refusal
+        is a soft in-loop stop: an ERROR observation fed back to the model, the
+        same idiom the static allow_* gates already use.
+        """
+        if tool_governor is None:
+            return execute(dict(final_args))
+        principal = dict(governed_principal or {
+            "id": "agentconnect-runtime", "kind": "agent", "privacy_tier": "local",
+        })
+        context = {"task_id": state["task_id"], "iteration": state["iteration"]}
+        # The ONE mapping that is hashed, redeemed, AND executed: `execute` receives
+        # this frozen copy rather than re-reading the model's mutable action dict, so
+        # nothing that mutates the original between the two blocking governor
+        # round-trips and the actual call can desynchronize what was authorized from
+        # what runs (TOCTOU mitigation M5, mirroring ToolConnect's governed_invoke).
+        frozen_args = dict(final_args)
+        try:
+            decision = tool_governor.authorize(
+                principal, governed_source_id, tool_name, context, args=frozen_args)
+        except Exception as exc:  # noqa: BLE001 — a raising governor is an outage, not an allow
+            _log.warning("tool governor raised authorizing %s: %s", tool_name, exc)
+            return f"ERROR: tool governor unavailable for {tool_name}; action refused ({exc})."
+        if not decision.allowed:
+            return f"ERROR: {tool_name} denied by policy: {decision.reason}"
+        grant = getattr(decision, "grant", None)
+        redeem = getattr(tool_governor, "redeem", None)
+        if grant is None or not callable(redeem):
+            return (f"ERROR: {tool_name} allowed but no argument-bound grant available; "
+                    "refusing ungoverned execution.")
+        try:
+            redemption = redeem(grant.grant_id, principal, frozen_args)
+        except Exception as exc:  # noqa: BLE001 — same outage posture as authorize
+            _log.warning("tool governor raised redeeming %s: %s", tool_name, exc)
+            return f"ERROR: {tool_name} grant redemption failed; action refused ({exc})."
+        if not getattr(redemption, "redeemed", False):
+            return (f"ERROR: {tool_name} grant not redeemed "
+                    f"({getattr(redemption, 'reason', 'unknown')}); action refused.")
+        # Identity-echo check (defense-in-depth, mirroring ToolConnect's
+        # governed_invoke): the redeem response echoes the STORED grant identity —
+        # if it names a different tool/source than the one about to execute, some
+        # layer redeemed the wrong grant (collision, tracking bug, compromised
+        # server). Refuse rather than execute on a mismatched redemption.
+        echoed_sid = str(getattr(redemption, "source_id", "") or "")
+        echoed_name = str(getattr(redemption, "name", "") or "")
+        if (echoed_sid and echoed_sid != governed_source_id) or (
+                echoed_name and echoed_name != tool_name):
+            return (f"ERROR: {tool_name} redeemed grant is for "
+                    f"{echoed_sid}:{echoed_name}, expected "
+                    f"{governed_source_id}:{tool_name}; action refused.")
+        obs = execute(frozen_args)
+        if getattr(decision, "decision_id", ""):
+            try:  # best-effort loop closure; the audit trail never gates execution
+                tool_governor.record(
+                    decision.decision_id,
+                    "error" if obs.startswith("ERROR:") else "executed",
+                    {"grant_id": grant.grant_id, "tool": tool_name},
+                    grant_id=grant.grant_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return obs
+
     def run_tool(state: RuntimeState) -> dict[str, Any]:
         action = state["last_action"] or {}
         kind, args = action.get("kind"), action.get("args", {})
         evidence = state["evidence_refs"]
         subtasks = state.get("subtasks", [])
+        # Every execute closure below takes the frozen mapping `governed()` hashed and
+        # redeemed and reads its values from THAT — never re-indexing the model's
+        # mutable `args` dict after the governor round-trips (TOCTOU mitigation M5).
         if kind == "read_file":
-            obs = read_file(workspace, args["path"], max_chars=config.observation_max_chars)
+            obs = governed(state, "read_file", {"path": args["path"]}, lambda a: read_file(
+                workspace, a["path"], max_chars=config.observation_max_chars))
             if not obs.startswith("ERROR:"):
                 evidence = evidence + [f"read_file:{args['path']}"]
         elif kind == "write_file":
-            obs = write_file(workspace, args["path"], args["content"])
+            obs = governed(state, "write_file", {"path": args["path"], "content": args["content"]},
+                           lambda a: write_file(workspace, a["path"], a["content"]))
         elif kind == "list_dir":
-            obs = list_dir(workspace, args.get("path", "."))
+            obs = governed(state, "list_dir", {"path": args.get("path", ".")},
+                           lambda a: list_dir(workspace, a["path"]))
         elif kind == "shell":
             if config.allow_shell:
-                obs = run_shell(workspace, args["command"], timeout=config.shell_timeout_seconds)
+                obs = governed(state, "shell", {"command": args["command"]}, lambda a: run_shell(
+                    workspace, a["command"], timeout=config.shell_timeout_seconds))
                 if not obs.startswith("ERROR:"):
                     evidence = evidence + [f"shell:{args['command'][:120]}"]
             else:
@@ -93,23 +188,27 @@ def build_execution_graph(
             # runs on import. With no OS sandbox on this worker, allow_shell is
             # the only isolation boundary; run_tests is an equivalent
             # code-execution primitive and must honour it, or allow_shell=False
-            # is silently defeated.
+            # is silently defeated. The governed final_args bind the OPERATOR's
+            # command (never the model's ignored args) — that's the value about
+            # to actually execute.
             if config.allow_tests and config.allow_shell:
-                obs = run_tests(workspace, config.test_command, timeout=config.test_timeout_seconds)
+                obs = governed(state, "run_tests", {"command": config.test_command},
+                               lambda a: run_tests(workspace, a["command"],
+                                                   timeout=config.test_timeout_seconds))
                 if not obs.startswith("ERROR:"):
                     evidence = evidence + [f"run_tests:{config.test_command[:120]}"]
             else:
                 obs = "ERROR: the run_tests action is disabled for this task."
         elif kind == "fetch_url":
             if config.allow_browser:
-                obs = fetch_url(
-                    args["url"],
+                obs = governed(state, "fetch_url", {"url": args["url"]}, lambda a: fetch_url(
+                    a["url"],
                     timeout=config.browser_timeout_seconds,
                     max_bytes=config.browser_max_response_bytes,
                     max_redirects=config.browser_max_redirects,
                     fetcher=fetcher,
                     resolver=url_resolver,
-                )
+                ))
                 if not obs.startswith("ERROR:"):
                     evidence = evidence + [f"fetch_url:{args['url'][:120]}"]
             else:
@@ -119,12 +218,18 @@ def build_execution_graph(
             # the worker can never read memory back (there is no recall action).
             if config.allow_memory and memory_sink is not None:
                 prov = {**(provenance or {}), "task_id": state["task_id"]}
-                obs = memory_sink.capture(args["text"], provenance=prov)
+                obs = governed(state, "remember", {"text": args["text"]}, lambda a: memory_sink.capture(
+                    a["text"], provenance=prov))
                 if not obs.startswith("ERROR:"):
                     evidence = evidence + [f"remember:{args['text'][:120]}"]
             else:
                 obs = "ERROR: the remember action is disabled for this task."
         elif kind == "delegate":
+            # Not gated through the tool governor here: delegate executes nothing
+            # external itself, it only records a sub-task for the router to run as
+            # a child — that child subtask hits the pre-spawn declared-set gate
+            # (site #2) through the router like any other dispatch. Omitted by
+            # deliberate decision, not oversight.
             # Hierarchical decomposition (Track 4): record a sub-task for the router
             # to run as a child. Bounded — disabled past the depth limit and capped
             # per run — so recursion cannot run away. The worker never waits here; it

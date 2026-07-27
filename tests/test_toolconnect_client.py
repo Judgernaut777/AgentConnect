@@ -15,9 +15,11 @@ import pytest
 
 from agentconnect.core import bootstrap
 from agentconnect.core.toolconnect_client import (
+    RedeemResult,
     ToolConnectGovernor,
     ToolDecision,
     ToolGovernor,
+    ToolGrant,
 )
 
 
@@ -51,6 +53,7 @@ class _StubHandler(BaseHTTPRequestHandler):
         if self.path == "/authorize":
             body = self._read_json()
             name = body.get("name")
+            args = body.get("args")
             # A server that requires a token: 401 unless the header is present.
             if name == "needs_auth" and not self.headers.get("Authorization"):
                 self._send(401, {"error": "unauthorized"})
@@ -60,6 +63,22 @@ class _StubHandler(BaseHTTPRequestHandler):
                     "allowed": False, "reason": "policy forbids danger",
                     "decision_id": "dec-deny", "default_deny": False,
                     "determining_policies": ["no-danger"], "contract_version": "1.2",
+                })
+                return
+            if name == "grantable" and args is not None:
+                self._send(200, {
+                    "allowed": True, "reason": "policy allows", "decision_id": "dec-grant",
+                    "determining_policies": ["allow-grantable"], "contract_version": "1.1",
+                    "grant": {"grant_id": "gr-1", "args_hash": "h", "ttl_seconds": 60,
+                             "expires_at": "9999-01-01T00:00:00+00:00"},
+                })
+                return
+            if name == "grantable_no_grant" and args is not None:
+                # Simulates a pre-1.1 server that silently drops "args" and returns a
+                # bare allow with no grant — the mixed-fleet case.
+                self._send(200, {
+                    "allowed": True, "reason": "policy allows", "decision_id": "dec-nogrant",
+                    "contract_version": "1.0",
                 })
                 return
             self._send(200, {
@@ -73,6 +92,35 @@ class _StubHandler(BaseHTTPRequestHandler):
             # The real server's wire shape: {"decision_id", "audit_seq"} — no
             # "recorded" key; that one is adapter-synthesized on outages only.
             self._send(200, {"decision_id": decision_id, "audit_seq": 1})
+        elif self.path.startswith("/grants/") and self.path.endswith("/redeem"):
+            grant_id = self.path.split("/")[2]
+            body = self._read_json()
+            args = body.get("args") or {}
+            if grant_id == "gr-1":
+                if args == {"path": "x"}:
+                    self._send(200, {
+                        "grant_id": grant_id, "decision_id": "dec-grant", "redeemed": True,
+                        "reason": "ok", "source_id": "src", "name": "grantable",
+                        "contract_version": "1.1",
+                    })
+                else:
+                    self._send(200, {
+                        "grant_id": grant_id, "decision_id": "dec-grant", "redeemed": False,
+                        "reason": "args_mismatch", "source_id": "src", "name": "grantable",
+                        "contract_version": "1.1",
+                    })
+                return
+            if grant_id == "gr-broken-major":
+                self._send(200, {
+                    "grant_id": grant_id, "decision_id": "d", "redeemed": True,
+                    "reason": "ok", "contract_version": "9.0",
+                })
+                return
+            self._send(200, {
+                "grant_id": grant_id, "decision_id": None, "redeemed": False,
+                "reason": "not_found", "source_id": None, "name": None,
+                "contract_version": "1.1",
+            })
         else:
             self._send(404, {"error": "not found"})
 
@@ -130,6 +178,28 @@ def test_record_outcome_over_stub(stub_server):
                                                  "detail": {"artifact": "a-1"}})]
 
 
+def test_record_with_grant_id_sends_top_level_body_field(stub_server):
+    # Close-via-outcome (contract 1.1): ToolConnect's POST /decisions/{id}/outcome
+    # reads `grant_id` ONLY at the top level of the body — a grant_id tucked inside
+    # `detail` is opaque payload and closes nothing. This is the wire-level
+    # regression for the runtime's grant-closing outcome report.
+    gov = ToolConnectGovernor(stub_server)
+    result = gov.record("dec-g", "executed",
+                        detail={"grant_id": "g-1", "tool": "write_file"}, grant_id="g-1")
+    assert result["decision_id"] == "dec-g"
+    ((decision_id, body),) = _StubHandler.recorded
+    assert decision_id == "dec-g"
+    assert body["grant_id"] == "g-1"  # top-level: the field the server acts on
+    assert body["detail"] == {"grant_id": "g-1", "tool": "write_file"}
+
+
+def test_record_without_grant_id_omits_the_field(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    gov.record("dec-plain", "succeeded", detail={"artifact": "a-1"})
+    ((_, body),) = _StubHandler.recorded
+    assert "grant_id" not in body  # byte-identical legacy body when not closing a grant
+
+
 def test_token_sent_as_authorization_header(stub_server):
     # Server 401s the `needs_auth` tool unless Authorization is present; with a token
     # the adapter must supply it (and the 401 path must itself fail closed).
@@ -159,6 +229,101 @@ def test_record_unreachable_is_best_effort():
     gov = ToolConnectGovernor("http://127.0.0.1:9", timeout=0.5)
     result = gov.record("dec-x", "succeeded")
     assert result["recorded"] is False  # never a crash on the audit path
+
+
+# -- contract 1.1: argument-bound grants ------------------------------------
+
+
+def test_authorize_with_args_puts_args_and_ttl_in_body_and_parses_grant(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    decision = gov.authorize(
+        {"id": "a"}, "src", "grantable", args={"path": "x"}, ttl_seconds=30)
+    assert decision.allowed is True
+    assert isinstance(decision.grant, ToolGrant)
+    assert decision.grant.grant_id == "gr-1"
+    assert decision.grant.ttl_seconds == 60
+
+
+def test_authorize_without_args_parses_no_grant(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    decision = gov.authorize({"id": "a"}, "src", "read_file")
+    assert decision.allowed is True
+    assert decision.grant is None
+
+
+def test_authorize_allow_with_args_but_no_grant_is_mixed_fleet_fail_closed(stub_server):
+    # A pre-1.1 server silently drops "args" and returns a bare allow: that must
+    # NOT be treated as a real allow when args were sent — refuse fail-closed.
+    gov = ToolConnectGovernor(stub_server)
+    decision = gov.authorize(
+        {"id": "a"}, "src", "grantable_no_grant", args={"path": "x"})
+    assert decision.allowed is False
+    assert decision.unavailable is True
+
+
+def test_redeem_success_maps_all_fields(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    result = gov.redeem("gr-1", {"id": "a"}, {"path": "x"})
+    assert isinstance(result, RedeemResult)
+    assert result.redeemed is True
+    assert result.reason == "ok"
+    assert result.decision_id == "dec-grant"
+    assert result.source_id == "src"
+    assert result.name == "grantable"
+
+
+def test_redeem_args_mismatch_is_a_normal_deny_not_an_exception(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    result = gov.redeem("gr-1", {"id": "a"}, {"path": "WRONG"})
+    assert result.redeemed is False
+    assert result.reason == "args_mismatch"
+    assert result.unavailable is False
+
+
+def test_redeem_not_found_is_a_normal_deny(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    result = gov.redeem("gr-does-not-exist", {"id": "a"}, {})
+    assert result.redeemed is False
+    assert result.reason == "not_found"
+
+
+def test_redeem_incompatible_contract_major_fails_closed(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    result = gov.redeem("gr-broken-major", {"id": "a"}, {})
+    assert result.redeemed is False
+    assert result.unavailable is True
+
+
+def test_redeem_fail_closed_when_unreachable():
+    gov = ToolConnectGovernor("http://127.0.0.1:9", timeout=0.5)
+    result = gov.redeem("gr-1", {"id": "a"}, {})
+    assert result.redeemed is False
+    assert result.unavailable is True
+
+
+def test_redeem_missing_redeemed_key_is_unavailable_never_inferred_true():
+    def transport(method, url, payload):
+        return 200, {"grant_id": "gr-1", "decision_id": "d"}  # no "redeemed" key
+
+    gov = ToolConnectGovernor("http://stub", transport=transport)
+    result = gov.redeem("gr-1", {"id": "a"}, {})
+    assert result.redeemed is False
+    assert result.unavailable is True
+
+
+def test_redeem_truthy_non_bool_redeemed_is_not_treated_as_true():
+    def transport(method, url, payload):
+        return 200, {"grant_id": "gr-1", "decision_id": "d", "redeemed": "true"}
+
+    gov = ToolConnectGovernor("http://stub", transport=transport)
+    result = gov.redeem("gr-1", {"id": "a"}, {})
+    assert result.redeemed is False  # only a literal JSON `true` counts
+
+
+def test_governor_satisfies_protocol_including_redeem(stub_server):
+    gov = ToolConnectGovernor(stub_server)
+    assert isinstance(gov, ToolGovernor)
+    assert callable(gov.redeem)
 
 
 def test_incompatible_contract_major_fails_closed():
