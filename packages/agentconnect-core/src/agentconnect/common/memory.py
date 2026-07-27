@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -217,6 +217,39 @@ class SharedMemory:
             self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Optional ecosystem event-bus bridge (docs/EVENT_BUS.md, Engine B):
+        # a sink with `SqliteStorage.append_bus_event`'s keyword signature.
+        # None (the default) = unbridged, exactly the old behaviour.
+        self._event_bus: Optional[Callable[..., Any]] = None
+
+    def bind_event_bus(self, sink: Optional[Callable[..., Any]]) -> None:
+        """Bridge Engine B's state changes onto the ecosystem event bus.
+
+        `sink` is called with `SqliteStorage.append_bus_event`'s keyword
+        signature (the core ledger's `event_log` writer is the intended
+        target). The bridge is ADVISORY by construction: Engine B lives on its
+        own SQLite connection, so same-commit emission into the core ledger is
+        architecturally impossible — a sink failure is swallowed (logged via
+        the store's `logs` table is NOT attempted; nothing may break a queue
+        write), and a bridge event describes a write that was about to commit
+        under the store lock, so a subsequent commit failure can leave one
+        stray advisory event (docs/EVENT_BUS.md §3, Engine B bridge)."""
+        self._event_bus = sink
+
+    def _emit_bus_event(
+        self, *, type: str, outcome: Optional[str], actor: str,  # noqa: A002
+        task_id: Optional[str], entity_id: Optional[str], payload: dict[str, Any],
+    ) -> None:
+        sink = self._event_bus
+        if sink is None:
+            return
+        try:
+            sink(
+                event_id=f"event_{uuid.uuid4().hex[:12]}", type=type, outcome=outcome,
+                actor=actor, task_id=task_id, entity_id=entity_id, payload=payload,
+            )
+        except Exception:  # noqa: BLE001 — advisory: the bridge never breaks Engine B
+            pass
 
     def close(self) -> None:
         self._conn.close()
@@ -300,6 +333,21 @@ class SharedMemory:
             if record is not None:
                 self._insert_transition_log(task_id, record)
             self._conn.commit()
+            # Engine B bridge (docs/EVENT_BUS.md): AFTER the commit landed —
+            # an applied transition mirrors one advisory `state.changed` onto
+            # the ecosystem bus, marked `engine: "b"` so consumers can tell it
+            # from Engine A's same-commit skeleton rows.
+            # `reason` stays OFF the bridge payload: an Engine-B cancel reason
+            # is caller free text and no privacy tier is in scope here to gate
+            # it — the same-commit `logs` row keeps the full detail locally
+            # (fail-closed, docs/EVENT_BUS.md §6).
+            if record is not None and record.outcome == "applied":
+                self._emit_bus_event(
+                    type="state.changed", outcome=record.outcome, actor=record.actor,
+                    task_id=task_id, entity_id=task_id,
+                    payload={"vocabulary": record.vocabulary, "src": record.src,
+                             "dst": record.dst, "engine": "b"},
+                )
             return True, fields.get("state", current_raw)
         row = self._conn.execute(
             "SELECT state FROM tasks WHERE task_id=?", (task_id,)

@@ -50,6 +50,7 @@ from .execution import DirectExecutionBackend, ExecutionBackend, ExecutionHandle
 from .observability import (
     AttachInformation,
     CapturedOutput,
+    CompositeObservabilityProvider,
     EventType,
     ObservabilityEmitter,
     ObservationHandle,
@@ -57,7 +58,9 @@ from .observability import (
     ObservationState,
     SessionObservationRequest,
     SpawnObservationRequest,
+    SqliteEventLogProvider,
 )
+from .observability.tree import build_observe_tree
 from .workspace import WorkspaceBuilder, mode_for
 from .models import (
     ApprovalRecord,
@@ -80,6 +83,7 @@ from .models import (
     InboxItem,
     InboxKind,
     ManagerSession,
+    PRIVACY_STRICTNESS,
     PrivacyTier,
     RecordAttemptRequest,
     RecordDecisionRequest,
@@ -229,11 +233,25 @@ class AgentConnectService:
         # durability call `bind_execution(TemporalExecutionBackend(...))`.
         self.execution: ExecutionBackend = execution or DirectExecutionBackend(self)
         #: Provider-neutral observability (production handoff Parts II–V). Default is
-        #: an effectively-noop emitter: standalone AgentConnect requires no provider,
-        #: and emission is always safe to call. `bind_observability` swaps in a
-        #: configured emitter (structured-log, tmux, …). Emission NEVER corrupts the
+        #: NOT a bare noop emitter (docs/EVENT_BUS.md): every deployment — even one
+        #: with no provider configured — always carries the always-on, passive
+        #: `SqliteEventLogProvider`, so `observability.enabled` is True everywhere
+        #: and the rich `_observe(...)` sites become durable, persisted into the
+        #: ledger's own `event_log` table, with zero extra infrastructure. This is
+        #: independent of the structural `state.changed` skeleton Path 1 writes
+        #: same-commit from `TransitionAuthority`'s audit hook regardless of any
+        #: provider at all. `bind_observability` swaps in a richer emitter
+        #: (structured-log, tmux, …) and re-adds this provider if the caller's own
+        #: composite does not already carry one. Emission NEVER corrupts the
         #: ledger — under the advisory policy it cannot even raise.
-        self.observability: ObservabilityEmitter = observability or ObservabilityEmitter()
+        self.observability: ObservabilityEmitter = observability or ObservabilityEmitter(
+            CompositeObservabilityProvider([SqliteEventLogProvider(self.storage)]),
+            redactor=self.observation_redactor(),
+        )
+        #: Edge-triggered health classification per component (memory backends
+        #: today), for `_note_component_health`'s provider.offline/degraded/recovered
+        #: emission. `None`/absent means "never checked yet".
+        self._component_health: dict[str, str] = {}
         #: Optional tool-governance seam (ToolConnect contract §3). ``None`` means no
         #: governor is configured — standalone AgentConnect runs unchanged. Unlike every
         #: other adapter it fails *closed*: a bound governor whose engine is unreachable
@@ -277,6 +295,15 @@ class AgentConnectService:
         )
 
     def bind_observability(self, emitter: ObservabilityEmitter) -> None:
+        """Swap in a configured emitter. Always re-adds the always-on,
+        passive event-log provider if the caller's composite does not already
+        carry one by name — a `bind_observability` caller configuring tmux/otlp
+        should not have to remember to also wire the durable ledger sink, and
+        the whole `event_log` guarantee (docs/EVENT_BUS.md) would silently stop
+        holding for any deployment that bound its own emitter."""
+        providers = getattr(emitter.provider, "providers", None)
+        if providers is not None and not any(p.name == "event_log" for p in providers):
+            providers.append(SqliteEventLogProvider(self.storage))
         self.observability = emitter
 
     def bind_tool_governor(self, governor: Any) -> None:
@@ -427,8 +454,14 @@ class AgentConnectService:
         self.storage.insert_task(task)
         for text in request.constraints:
             self.add_constraint(task.id, text, request.created_by)
+        # A task carries no privacy tier of its own (tiers live on subtasks,
+        # which do not exist yet at creation time), so `title` rides the bus
+        # bounded + secret-scanned but NOT tier-gated — the append-only log
+        # cannot be retro-redacted when a strict-tier subtask arrives later.
+        # Sensitive content belongs in subtask title/instructions (tier-gated
+        # at write time), never in a task title (docs/EVENT_BUS.md §6).
         self._observe(EventType.task_created, task_id=task.id, agent_id=request.created_by,
-                      agent_role="human", metadata={"title": task.title})
+                      agent_role="human", metadata={"title": task.title[:120]})
         return task
 
     def add_constraint(self, task_id: str, text: str, created_by: str = "unknown") -> Constraint:
@@ -941,9 +974,9 @@ class AgentConnectService:
                       delegation_id=subtask.delegation_id,
                       parent_delegation_id=subtask.parent_delegation_id,
                       agent_role="worker", agent_id=request.preferred_worker or "unrouted",
-                      metadata={"title": subtask.title,
-                                "privacy_tier": subtask.privacy_tier.value,
-                                "depends_on": subtask.depends_on})
+                      metadata=self._subtask_event_meta(
+                          subtask, privacy_tier=subtask.privacy_tier.value,
+                          depends_on=subtask.depends_on))
         if subtask.status is SubtaskStatus.blocked:
             self.record_event(
                 task_id, "subtask_blocked", "system",
@@ -1090,10 +1123,21 @@ class AgentConnectService:
                 metadata = dict(current.metadata)
                 metadata.pop("blocked_on", None)
                 metadata["dependency_failed"] = parent_id
-                self._subtask_status_authority.transition(
-                    current.id, SubtaskStatus.failed, actor="system", task_id=task_id,
+                # `advance()`, not `transition()`: two callers can race for the
+                # same blocked dependent (worker-failure + governor-deny + reap
+                # paths all cascade), and only the caller whose CAS actually
+                # LANDED may emit the rich `subtask.failed` bus event — a loser
+                # emitting too would put a rich event on the bus with no
+                # same-commit `state.changed` sibling (an "extra" the
+                # reconstruction contract never allows, docs/EVENT_BUS.md §3).
+                applied = self._subtask_status_authority.advance(
+                    current.id, SubtaskStatus.failed,
+                    only_from=frozenset({SubtaskStatus.blocked}),
+                    actor="system", task_id=task_id,
                     extra_fields={"metadata": metadata, "updated_at": now},
                 )
+                if applied is None:
+                    continue  # lost the race: someone else already settled it
                 reason = f"dependency {parent_id} failed; cannot run"
                 # Record a durable attempt + ledger event so the cascade failure
                 # is auditable (the governor-deny path records an attempt too);
@@ -1108,6 +1152,14 @@ class AgentConnectService:
                 self.record_event(
                     task_id, "subtask_dependency_failed", "system",
                     {"subtask_id": current.id, "dependency_failed": parent_id},
+                )
+                self._observe(
+                    EventType.subtask_failed, task_id=task_id, subtask_id=current.id,
+                    delegation_id=current.delegation_id,
+                    parent_delegation_id=current.parent_delegation_id,
+                    agent_id="system", agent_role="system",
+                    outcome=ObservationOutcome.failed,
+                    metadata={"reason": reason, "dependency_failed": parent_id},
                 )
                 cascaded.append(self._require_subtask(current.id))
                 stack.append(current.id)
@@ -1188,10 +1240,15 @@ class AgentConnectService:
             {"subtask_id": subtask_id, "reason": reason},
         )
         self._signal_entity("subtask", subtask_id, "approval_denied", {"reason": reason})
+        # The operator's free-text denial reason often restates WHY the work is
+        # sensitive — tier-gated at write time before it reaches the durable
+        # event bus, same cutoff as `_subtask_event_meta`'s title rule
+        # (docs/EVENT_BUS.md §6).
         self._observe(EventType.subtask_denied, task_id=subtask.parent_task_id,
                       subtask_id=subtask_id, delegation_id=subtask.delegation_id,
                       agent_id=denied_by, agent_role="operator",
-                      outcome=ObservationOutcome.denied, metadata={"reason": reason})
+                      outcome=ObservationOutcome.denied,
+                      metadata={"reason": self._tier_gated_free_text(subtask, reason, 160)})
         self._close_observation_handles("subtask", subtask_id, ObservationOutcome.denied)
         self._settle_parent_after_subtask(subtask.parent_task_id)
         return self._require_subtask(subtask_id)
@@ -1669,19 +1726,35 @@ class AgentConnectService:
                 handle = ObservationHandle(**row["handle"])
                 self.observability.update_state(
                     handle, ObservationState.done if succeeded else ObservationState.failed,
-                    outcome=outcome, detail=summary[:40],
+                    outcome=outcome, detail=self._tier_gated_free_text(subtask, summary, 40),
                 )
                 self.storage.update_observation_handle_state(
                     "subtask", subtask.id, handle.provider,
                     "done" if succeeded else "failed", outcome.value, now,
                 )
+            # `summary` is worker-supplied free text (a worker may echo its
+            # input back into it), so it is tier-gated at write time exactly
+            # like `subtask.created`'s title — never persisted for
+            # `local_only`/`secret_sensitive` subtasks (docs/EVENT_BUS.md §6).
             self._observe(
                 EventType.worker_completed if succeeded else EventType.worker_failed,
                 task_id=subtask.parent_task_id, subtask_id=subtask.id, run_id=run.id,
                 delegation_id=subtask.delegation_id,
                 parent_delegation_id=subtask.parent_delegation_id,
                 agent_id=worker_id, agent_role="worker", outcome=outcome,
-                metadata={"summary": summary[:120]},
+                metadata={"summary": self._tier_gated_free_text(subtask, summary)},
+            )
+            # Distinct from worker.completed/failed (which describe the *run*):
+            # this is the subtask's own terminal outcome, the GOAL vocabulary's
+            # SubtaskCompleted/SubtaskFailed, so a consumer filtering on subtask
+            # lifecycle does not have to know a worker run exists underneath.
+            self._observe(
+                EventType.subtask_completed if succeeded else EventType.subtask_failed,
+                task_id=subtask.parent_task_id, subtask_id=subtask.id,
+                delegation_id=subtask.delegation_id,
+                parent_delegation_id=subtask.parent_delegation_id,
+                agent_id=worker_id, agent_role="worker", outcome=outcome,
+                metadata={"summary": self._tier_gated_free_text(subtask, summary)},
             )
         self._settle_parent_after_subtask(subtask.parent_task_id)
         if succeeded:
@@ -1738,7 +1811,14 @@ class AgentConnectService:
             parent_delegation_id=subtask.parent_delegation_id,
             agent_id=worker_id, agent_role="worker",
             outcome=ObservationOutcome.denied,
-            metadata={"reason": reason, **authz.as_metadata()},
+            # The governor's policy reason is free text that may reference the
+            # subtask's content — tier-gated like every other free-text field
+            # on the bus. `as_metadata()`'s ids/flags ride ungated (a consumer
+            # still learns WHICH tool was denied), but its own `reason` key is
+            # ALSO free text, so the gated value must be applied LAST — never
+            # let the raw governor prose override it.
+            metadata={**authz.as_metadata(),
+                      "reason": self._tier_gated_free_text(subtask, reason, 300)},
         )
         self._settle_parent_after_subtask(subtask.parent_task_id)
         # This subtask moved queued -> failed and will never succeed, so any
@@ -1888,6 +1968,56 @@ class AgentConnectService:
         except Exception as exc:  # noqa: BLE001 — never let observability break a flow
             _log.warning("observe(%s) failed: %s", event_type, exc)
 
+    @staticmethod
+    def _subtask_event_meta(subtask: Subtask, **extra: Any) -> dict[str, Any]:
+        """Metadata for a subtask-lifecycle observation event. `title` is a
+        free-text, operator-chosen field that can carry content, unlike the
+        ids/enums the rest of an event's metadata holds — so once a subtask's
+        privacy strictness reaches the `local_only`/`secret_sensitive` band
+        (docs/EVENT_BUS.md §6 — the same fail-closed threshold `/observe/tree`
+        applies at read time) it is withheld here at write time instead,
+        rather than persisted into the durable event bus and redacted only
+        when read back."""
+        meta = dict(extra)
+        meta["title"] = (
+            "[redacted]" if PRIVACY_STRICTNESS[subtask.privacy_tier] >= 3
+            else subtask.title
+        )
+        return meta
+
+    @staticmethod
+    def _tier_gated_free_text(subtask: Subtask, text: str, limit: int = 120) -> str:
+        """Free text that flowed through a worker or operator (a result
+        `summary`, a denial `reason`) is withheld at WRITE time once the
+        subtask's privacy strictness reaches the `local_only`/`secret_sensitive`
+        band — the same cutoff `_subtask_event_meta` applies to `title`, for the
+        same reason: a worker that echoes its input (the bundled `EchoWorker`
+        does exactly this) or an operator restating why they denied something
+        would otherwise carry tier-protected content into the durable
+        `event_log` (docs/EVENT_BUS.md §6). An unknown/corrupted tier fails
+        CLOSED to withheld, never through."""
+        if PRIVACY_STRICTNESS.get(subtask.privacy_tier, 4) >= 3:
+            return "[redacted]"
+        return (text or "")[:limit]
+
+    def _tier_gated_reason_for_subtask_id(
+        self, subtask_id: Optional[str], text: str, limit: int = 200,
+    ) -> str:
+        """`_tier_gated_free_text` for sites that hold only a subtask ID.
+        A named-but-unresolvable subtask fails CLOSED to withheld; no subtask
+        in scope at all (e.g. a generic `authorize_tool_use` probe) has no
+        tier to gate against, so the text rides bounded — the same posture as
+        `task.created`'s title (docs/EVENT_BUS.md §6)."""
+        if not subtask_id:
+            return (text or "")[:limit]
+        try:
+            subtask = self.storage.get_subtask(subtask_id)
+        except Exception:  # noqa: BLE001 — a lookup failure must not leak
+            subtask = None
+        if subtask is None:
+            return "[redacted]"
+        return self._tier_gated_free_text(subtask, text, limit)
+
     def _record_observation_handles(
         self, entity_type: str, entity_id: str, task_id: Optional[str],
         handles: list["ObservationHandle"], state: str = "starting",
@@ -1947,6 +2077,40 @@ class AgentConnectService:
         health = self.observability.provider.health()
         return health.model_dump(mode="json")
 
+    def _note_component_health(self, component: str, status: str, detail: str = "") -> None:
+        """Edge-triggered `provider.offline`/`provider.degraded`/`provider.recovered`
+        emission (docs/EVENT_BUS.md §4): a repeated check with an UNCHANGED
+        classification emits nothing, so a periodic poller (readiness probes,
+        the opt-in reaper thread) does not spam the bus. `status` is one of
+        `"ok" | "degraded" | "unreachable"`; anything else (`"disabled"`,
+        `"unknown"`) is not a meaningful health signal and is ignored outright
+        — a backend that was never configured should never look "offline".
+
+        The very first observation of a component establishes a silent
+        baseline when it is already healthy (nothing to announce recovering
+        FROM), but still fires immediately when the first-ever check finds it
+        down — an outage present since before this process started is real
+        news, not noise.
+        """
+        if status not in ("ok", "degraded", "unreachable"):
+            return
+        previous = self._component_health.get(component)
+        self._component_health[component] = status
+        if previous is None:
+            if status == "ok":
+                return
+        elif previous == status:
+            return
+        event_type = {
+            "unreachable": EventType.provider_offline,
+            "degraded": EventType.provider_degraded,
+            "ok": EventType.provider_recovered,
+        }[status]
+        self._observe(
+            event_type, agent_id="system", agent_role="system",
+            metadata={"component": component, "status": status, "detail": detail[:200]},
+        )
+
     def observation_events(
         self, task_id: Optional[str] = None, limit: int = 200
     ) -> list[dict[str, Any]]:
@@ -1957,6 +2121,37 @@ class AgentConnectService:
             if reader is not None:
                 return reader(task_id=task_id, limit=limit)
         return []
+
+    # ---------------------------------------------------------- event bus (HTTP)
+    def list_bus_events(
+        self, since: int = 0, limit: int = 100,
+        types: Optional[list[str]] = None, task_id: Optional[str] = None,
+        outcome: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """The canonical, replayable ecosystem event stream (docs/EVENT_BUS.md).
+        Thin pass-through to storage — `GET /events` and `GET /events/stream`
+        are its only callers today."""
+        return self.storage.list_bus_events(
+            since=since, limit=limit, types=types, task_id=task_id, outcome=outcome,
+        )
+
+    def latest_bus_seq(self) -> int:
+        return self.storage.latest_bus_seq()
+
+    def observe_tree(
+        self, task_id: Optional[str] = None, include_terminal: bool = False,
+    ) -> dict[str, Any]:
+        """The live manager -> worker -> subagent hierarchy (docs/EVENT_BUS.md
+        §8): `GET /observe/tree`'s only caller. A pure read-time aggregation —
+        no new tables, no mutation — with privacy redaction applied here, at
+        serialization, per the task's/subtask's own privacy tier (fail-closed:
+        an unparseable tier is treated as `secret_sensitive`)."""
+        if task_id:
+            self._require_task(task_id)  # NotFound for an unknown id, as elsewhere
+        return build_observe_tree(
+            self.storage, redact=self.observation_redactor(),
+            task_id=task_id, include_terminal=include_terminal, now=self._now(),
+        )
 
     def list_agents(self, task_id: str) -> list[dict[str, Any]]:
         """Every observed agent for a task: its delegation record, entity, state,
@@ -2339,6 +2534,14 @@ class AgentConnectService:
             claim.get("task_id"), "memory_promoted", promoted_by,
             {"claim_id": claim.get("claim_id"), "indexed_into": indexed,
              "index_failures": failed},
+        )
+        # Bus event: ids and backend names only, never claim content — a
+        # promoted claim's TEXT never travels through the observation surface.
+        self._observe(
+            EventType.memory_promoted, task_id=claim.get("task_id"),
+            agent_id=promoted_by, agent_role="operator",
+            metadata={"claim_id": claim.get("claim_id"), "indexed_into": indexed,
+                      "index_failures": failed},
         )
         return claim
 
@@ -2729,7 +2932,10 @@ class AgentConnectService:
                     "allowed": decision.allowed,
                     "unavailable": decision.unavailable,
                     "default_deny": decision.default_deny,
-                    "reason": decision.reason[:200],
+                    # Governor prose is free text — tier-gated against the
+                    # subtask when one is in scope (docs/EVENT_BUS.md §6).
+                    "reason": self._tier_gated_reason_for_subtask_id(
+                        subtask_id, decision.reason, 200),
                     "determining_policies": list(decision.determining_policies),
                     "governor_mode": getattr(governor, "mode", "required"),
                 },
@@ -3229,7 +3435,12 @@ class AgentConnectService:
     def readiness(self) -> dict[str, Any]:
         """Readiness (can this instance serve traffic?) vs liveness (is the process
         up?). Checks the one hard dependency — the ledger — with a real query, plus
-        a soft observability probe that never fails readiness on its own.
+        a soft observability probe and a per-memory-backend health probe, neither
+        of which ever fails readiness on its own — and both of which feed
+        `_note_component_health`'s edge-triggered provider.offline/degraded/
+        recovered emission, so periodic readiness polling (a load balancer, the
+        opt-in reaper thread) is what gives that emission its "periodic" coverage
+        (docs/EVENT_BUS.md §4 — no separate poller exists).
         """
         checks: dict[str, Any] = {}
         ready = True
@@ -3245,6 +3456,19 @@ class AgentConnectService:
                                        "detail": health.detail}
         except Exception as exc:  # noqa: BLE001
             checks["observability"] = {"ok": True, "available": False, "detail": str(exc)}
+        memory_checks: dict[str, Any] = {}
+        for name, adapter in self.memory_backends.items():
+            try:
+                report = adapter.health()
+                status = str(report.get("status", "unknown"))
+                detail = str(report.get("detail", ""))
+            except Exception as exc:  # noqa: BLE001 — a raising health() is an outage
+                status, detail = "unreachable", str(exc)
+                report = {"backend": name, "status": status, "detail": detail}
+            memory_checks[name] = report
+            self._note_component_health(f"memory:{name}", status, detail)
+        if memory_checks:
+            checks["memory"] = memory_checks
         return {"ready": ready, "checks": checks}
 
     # --------------------------------------------------------- backup/restore

@@ -81,13 +81,18 @@ def test_every_route_declares_an_action_and_no_declared_route_is_a_phantom(svc):
 
 
 def test_only_liveness_and_readiness_probes_serve_without_a_token(anon, svc, task):
-    # Liveness and readiness are the only unauthenticated routes: both are
-    # infrastructure probes that return no ledger contents.
+    # Liveness and readiness are infrastructure probes that return no ledger
+    # contents. `GET /observe` (docs/EVENT_BUS.md §8) joins them deliberately:
+    # it is a constant HTML string with zero ledger data baked in — every data
+    # call its inline JS makes carries the caller's own bearer token to the
+    # real, protected `/events`/`/observe/tree` routes (same precedent as the
+    # router's `queue_web` operator dashboard).
     assert anon.get("/health").status_code == 200
     assert anon.get("/ready").status_code in (200, 503)
+    assert anon.get("/observe").status_code == 200
     for method, path in declared_routes(create_app(service=svc, linear_sync=None)):
         if (method, path) in (("GET", "/health"), ("GET", "/ready"),
-                              ("POST", "/linear/webhook")):
+                              ("GET", "/observe"), ("POST", "/linear/webhook")):
             continue
         concrete = (path.replace("{task_id}", task.id)
                         .replace("{review_id}", "review_x")

@@ -75,6 +75,12 @@ OPERATOR_ACTIONS: frozenset[str] = MANAGER_ACTIONS | REVIEWER_ACTIONS | frozense
     "launch_session", "end_session", "list_sessions", "list_workspaces",
     "audit_task", "audit_review", "list_tasks", "get_inbox",
     "linear_sync", "temporal_signal", "get_execution_status",
+    # ecosystem event bus (docs/EVENT_BUS.md) — fleet-wide ledger visibility,
+    # same posture as list_sessions/audit_task.
+    "list_events",
+    # live observability tree (docs/EVENT_BUS.md §8) — same fleet-wide
+    # ledger-read posture as list_events/list_sessions/audit_task.
+    "observe_tree",
 })
 
 ACTIONS_BY_MODE: dict[SessionMode, frozenset[str]] = {

@@ -29,6 +29,13 @@ from fastapi import HTTPException, Request
 PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/health"),
     ("GET", "/ready"),
+    # The live observability HTML page (docs/EVENT_BUS.md §8) is a constant
+    # string containing ZERO ledger data — it names no task and returns no
+    # event/tree contents itself; every data call its inline JS makes carries
+    # the operator's own bearer token to the real (non-public) `/events` and
+    # `/observe/tree` routes. Same precedent as the router's `queue_web`
+    # operator dashboard.
+    ("GET", "/observe"),
 })
 
 #: (method, path template) -> the action `authorize()` is asked about.
@@ -96,6 +103,12 @@ ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/tasks/{task_id}/complete"): "complete_task",
     ("POST", "/tasks/{task_id}/complete/override"): "force_complete_task",
     ("POST", "/reviews/{review_id}/complete"): "complete_review",
+    # ecosystem event bus (docs/EVENT_BUS.md) — operator-plane, fleet-wide ledger read
+    ("GET", "/events"): "list_events",
+    ("GET", "/events/stream"): "list_events",
+    # live observability tree (docs/EVENT_BUS.md §8) — same operator-plane
+    # posture as /events (the HTML page itself is public; see PUBLIC_ROUTES).
+    ("GET", "/observe/tree"): "observe_tree",
 }
 
 #: Exempt from the *token* check performed here — not exempt from authentication.

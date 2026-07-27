@@ -12,3 +12,4 @@ from ..provider import AgentObservabilityProvider
 
 class NoopObservabilityProvider(AgentObservabilityProvider):
     name = "noop"
+    passive = True

@@ -1395,6 +1395,23 @@ class WorkQueue:
             (task_id or ticket_id, "warn" if outcome == "refused" or not sane else "info",
              detail, _now()),
         )
+        # Engine B bridge (docs/EVENT_BUS.md §3): an applied ticket-lifecycle
+        # write also mirrors one advisory `state.changed` onto the ecosystem
+        # bus. This runs before the caller's commit (the bespoke fenced UPDATEs
+        # commit at their own sites), so a subsequent rollback can leave one
+        # stray advisory event — the `logs` table stays authoritative; the
+        # bridge is advisory by construction and never raises.
+        # `reason` stays OFF the bus payload deliberately: at this layer it can
+        # carry reviewer free text and no privacy tier is in scope to gate it —
+        # the local `logs` row above keeps the full detail (fail-closed,
+        # docs/EVENT_BUS.md §6).
+        if outcome == "applied":
+            self.memory._emit_bus_event(
+                type="state.changed", outcome=outcome, actor=actor,
+                task_id=task_id, entity_id=ticket_id,
+                payload={"vocabulary": "ticket_status", "src": src, "dst": dst,
+                         "engine": "b"},
+            )
 
     @_synchronized
     def _raw(self, ticket_id: str) -> Optional[dict[str, Any]]:

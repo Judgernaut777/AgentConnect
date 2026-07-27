@@ -189,6 +189,21 @@ CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_extrefs_lookup ON external_refs(provider, external_id);
 CREATE INDEX IF NOT EXISTS idx_obs_entity ON observation_handles(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_obs_task ON observation_handles(task_id);
+CREATE TABLE IF NOT EXISTS event_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    ts REAL NOT NULL,
+    type TEXT NOT NULL,
+    outcome TEXT,
+    actor TEXT NOT NULL DEFAULT '',
+    task_id TEXT, subtask_id TEXT, run_id TEXT, review_id TEXT, session_id TEXT,
+    delegation_id TEXT, parent_delegation_id TEXT, workspace_id TEXT,
+    entity_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_eventlog_task ON event_log(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_eventlog_type ON event_log(type, seq);
+CREATE INDEX IF NOT EXISTS idx_eventlog_subtask ON event_log(subtask_id, seq);
 """
 
 #: Columns added after the initial schema shipped. Existing databases created by
@@ -312,7 +327,15 @@ class SqliteStorage:
         """Raw INSERT on the caller's connection — never a self-committing
         helper — so a transition's audit row always rides the SAME commit as
         the state write it describes (fail-closed: "no state transition
-        without a record")."""
+        without a record").
+
+        Also the Path 1 event-bus emission point (docs/EVENT_BUS.md): every
+        *applied* transition additionally gets one ``state.changed`` row in
+        ``event_log``, on the same connection, before the same commit — the
+        guaranteed skeleton of the ecosystem event stream, independent of
+        whether any observability provider is configured. Refused/noop
+        outcomes stay legacy-audit-only, same as before.
+        """
         from ..common.transitions import _default_message
 
         payload = {
@@ -326,6 +349,176 @@ class SqliteStorage:
             (ids.new_id(ids.EVENT), record.task_id, "transition", record.actor,
              _j(payload), time.time()),
         )
+        if record.outcome == "applied":
+            corr = self._event_correlation_for_transition(conn, record)
+            self._insert_event_row(
+                conn, event_id=ids.new_id(ids.EVENT), type="state.changed",
+                outcome=record.outcome, actor=record.actor,
+                task_id=corr["task_id"], subtask_id=corr["subtask_id"],
+                run_id=corr["run_id"], review_id=corr["review_id"],
+                session_id=corr["session_id"], delegation_id=corr["delegation_id"],
+                parent_delegation_id=corr["parent_delegation_id"],
+                entity_id=record.entity_id,
+                payload={"vocabulary": record.vocabulary, "src": record.src,
+                         "dst": record.dst, "reason": (record.reason or "")[:300]},
+            )
+
+    #: `vocabulary name -> (table, columns to select for correlation)`. Internal
+    #: constants, never caller input.
+    _CORRELATION_LOOKUP: dict[str, tuple[str, tuple[str, ...]]] = {
+        "subtask_status": ("subtasks", ("parent_task_id", "delegation_id",
+                                        "parent_delegation_id")),
+        "run_status": ("worker_runs", ("subtask_id",)),
+        "session_status": ("manager_sessions", ("task_id", "delegation_id",
+                                                "parent_delegation_id")),
+        "review_status": ("reviews", ("task_id",)),
+        "approval_status": ("approvals", ("task_id", "subtask_id")),
+    }
+
+    def _event_correlation_for_transition(
+        self, conn: sqlite3.Connection, record: Any,
+    ) -> dict[str, Optional[str]]:
+        """Enrich a transition's audit record with the full correlation id set
+        for `event_log`, via one same-connection SELECT keyed by
+        ``record.vocabulary``. ``record.task_id`` is the fallback when the
+        SELECT finds nothing (row already gone, or `execution_state`, whose
+        entity ref stays in the payload only — see docs/EVENT_BUS.md)."""
+        corr: dict[str, Optional[str]] = {
+            "task_id": record.task_id, "subtask_id": None, "run_id": None,
+            "review_id": None, "session_id": None, "delegation_id": None,
+            "parent_delegation_id": None,
+        }
+        if record.vocabulary == "task_status":
+            corr["task_id"] = record.entity_id
+            return corr
+        lookup = self._CORRELATION_LOOKUP.get(record.vocabulary)
+        if lookup is None:
+            return corr
+        table, columns = lookup
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(columns)} FROM {table} WHERE id=?",
+                (record.entity_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return corr
+        if row is None:
+            return corr
+        if record.vocabulary == "subtask_status":
+            corr["task_id"] = row["parent_task_id"] or corr["task_id"]
+            corr["subtask_id"] = record.entity_id
+            corr["delegation_id"] = row["delegation_id"]
+            corr["parent_delegation_id"] = row["parent_delegation_id"]
+        elif record.vocabulary == "run_status":
+            corr["run_id"] = record.entity_id
+            corr["subtask_id"] = row["subtask_id"]
+        elif record.vocabulary == "session_status":
+            corr["task_id"] = row["task_id"] or corr["task_id"]
+            corr["session_id"] = record.entity_id
+            corr["delegation_id"] = row["delegation_id"]
+            corr["parent_delegation_id"] = row["parent_delegation_id"]
+        elif record.vocabulary == "review_status":
+            corr["task_id"] = row["task_id"] or corr["task_id"]
+            corr["review_id"] = record.entity_id
+        elif record.vocabulary == "approval_status":
+            corr["task_id"] = row["task_id"] or corr["task_id"]
+            corr["subtask_id"] = row["subtask_id"]
+        return corr
+
+    def _insert_event_row(
+        self, conn: sqlite3.Connection, *, event_id: str, type: str,  # noqa: A002
+        outcome: Optional[str] = None, actor: str = "",
+        task_id: Optional[str] = None, subtask_id: Optional[str] = None,
+        run_id: Optional[str] = None, review_id: Optional[str] = None,
+        session_id: Optional[str] = None, delegation_id: Optional[str] = None,
+        parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        entity_id: Optional[str] = None, payload: Optional[dict] = None,
+    ) -> bool:
+        """Raw `INSERT OR IGNORE` on the caller's connection — the one write
+        path both event-bus producers (§0: structural + rich) share. Returns
+        whether a row was actually inserted (`False` on an `event_id`
+        duplicate — idempotency, never a second door for a replayed id)."""
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO event_log (event_id,ts,type,outcome,actor,task_id,"
+            "subtask_id,run_id,review_id,session_id,delegation_id,parent_delegation_id,"
+            "workspace_id,entity_id,payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, time.time(), type, outcome, actor, task_id, subtask_id, run_id,
+             review_id, session_id, delegation_id, parent_delegation_id, workspace_id,
+             entity_id, _j(payload or {})),
+        )
+        return cur.rowcount == 1
+
+    def append_bus_event(
+        self, *, event_id: str, type: str,  # noqa: A002
+        outcome: Optional[str] = None, actor: str = "",
+        task_id: Optional[str] = None, subtask_id: Optional[str] = None,
+        run_id: Optional[str] = None, review_id: Optional[str] = None,
+        session_id: Optional[str] = None, delegation_id: Optional[str] = None,
+        parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        entity_id: Optional[str] = None, payload: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Path 2 (rich, advisory) entry point — its own transaction, since
+        the rich providers are called well after the ledger commit that
+        triggered them. Returns the new `seq`, or `None` if `event_id` was
+        already present (idempotent replay)."""
+        with self.transaction() as c:
+            inserted = self._insert_event_row(
+                c, event_id=event_id, type=type, outcome=outcome, actor=actor,
+                task_id=task_id, subtask_id=subtask_id, run_id=run_id,
+                review_id=review_id, session_id=session_id, delegation_id=delegation_id,
+                parent_delegation_id=parent_delegation_id, workspace_id=workspace_id,
+                entity_id=entity_id, payload=payload,
+            )
+            if not inserted:
+                return None
+            row = c.execute("SELECT last_insert_rowid() AS seq").fetchone()
+            return int(row["seq"])
+
+    def list_bus_events(
+        self, since: int = 0, limit: int = 100,
+        types: Optional[list[str]] = None, task_id: Optional[str] = None,
+        outcome: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Replay/poll the canonical event stream. `since` is EXCLUSIVE (`seq
+        > since`) — a consumer resumes with the last `seq` it saw, never with
+        arithmetic on it, because `seq` is monotonic but not dense."""
+        limit = max(1, min(int(limit), 500))
+        sql = "SELECT * FROM event_log WHERE seq > ?"
+        params: list[Any] = [since]
+        if types:
+            marks = ",".join("?" * len(types))
+            sql += f" AND type IN ({marks})"
+            params.extend(types)
+        if task_id:
+            sql += " AND task_id=?"
+            params.append(task_id)
+        if outcome:
+            sql += " AND outcome=?"
+            params.append(outcome)
+        sql += " ORDER BY seq ASC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._bus_event(r) for r in rows]
+
+    def latest_bus_seq(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS n FROM event_log"
+            ).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _bus_event(r: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "seq": r["seq"], "event_id": r["event_id"], "ts": r["ts"], "type": r["type"],
+            "outcome": r["outcome"], "actor": r["actor"], "task_id": r["task_id"],
+            "subtask_id": r["subtask_id"], "run_id": r["run_id"], "review_id": r["review_id"],
+            "session_id": r["session_id"], "delegation_id": r["delegation_id"],
+            "parent_delegation_id": r["parent_delegation_id"],
+            "workspace_id": r["workspace_id"], "entity_id": r["entity_id"],
+            "payload": _u(r["payload_json"], {}),
+        }
 
     @staticmethod
     def _reject_state_write(fields: dict, key: str, table: str) -> None:
@@ -443,7 +636,7 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(f"UPDATE tasks SET {cols} WHERE id=?", (*fields.values(), task_id))
 
-    def list_tasks(self, filters: TaskFilters) -> list[TaskSummary]:
+    def _list_task_rows(self, filters: TaskFilters) -> list[sqlite3.Row]:
         sql = "SELECT * FROM tasks"
         where, params = [], []
         if filters.status:
@@ -457,15 +650,24 @@ class SqliteStorage:
         sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         params += [max(0, filters.limit), max(0, filters.offset)]
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            return self._conn.execute(sql, params).fetchall()
+
+    def list_tasks(self, filters: TaskFilters) -> list[TaskSummary]:
         return [
             TaskSummary(
                 id=r["id"], title=r["title"], status=r["status"], priority=r["priority"],
                 current_manager=r["current_manager"], updated_at=r["updated_at"],
                 linear_issue_url=r["linear_issue_url"],
             )
-            for r in rows
+            for r in self._list_task_rows(filters)
         ]
+
+    def list_tasks_full(self, filters: TaskFilters) -> list[Task]:
+        """Same query as `list_tasks`, materialized as full `Task` rows. For
+        callers (observe-tree assembly) that need every column of many tasks at
+        once — one SELECT, never a per-summary `get_task` re-read (the N+1 the
+        first tree implementation had)."""
+        return [self._task(r) for r in self._list_task_rows(filters)]
 
     @staticmethod
     def _task(r: sqlite3.Row) -> Task:
@@ -823,6 +1025,18 @@ class SqliteStorage:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM worker_runs WHERE subtask_id=? ORDER BY started_at", (subtask_id,)
+            ).fetchall()
+        return [self._run(r) for r in rows]
+
+    def list_runs_for_task(self, task_id: str) -> list[WorkerRun]:
+        """Every run under every subtask of one task, in one query (join over
+        `idx_runs_subtask`/`idx_subtasks_task`). The batched read the
+        observe-tree assembly uses instead of one `list_runs` per subtask."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT wr.* FROM worker_runs wr JOIN subtasks s ON wr.subtask_id = s.id"
+                " WHERE s.parent_task_id=? ORDER BY wr.started_at",
+                (task_id,),
             ).fetchall()
         return [self._run(r) for r in rows]
 

@@ -18,6 +18,7 @@ from agentconnect.core.service import AgentConnectService
 from . import (
     routes_artifacts,
     routes_compliance,
+    routes_events,
     routes_linear,
     routes_managers,
     routes_memory,
@@ -62,6 +63,16 @@ def create_app(
     # (BrainConnect Lane 4). Built once, guarded like linear_sync: a deployment
     # without the router package/config degrades that one route to 503.
     app.state.router = router_from_env() if router is _UNSET else router
+    # Engine B -> ecosystem event bus bridge (docs/EVENT_BUS.md §3): when this
+    # deployment holds both the core ledger and a RouterService, Engine B's
+    # applied transitions (task pipeline + work-queue tickets) mirror advisory
+    # `state.changed` events into the SAME `event_log` the /events surface
+    # serves. Advisory by construction (separate SQLite connections — a
+    # same-commit write is architecturally impossible); binding is a no-op for
+    # deployments without the router.
+    _memory = getattr(app.state.router, "memory", None)
+    if _memory is not None and hasattr(_memory, "bind_event_bus"):
+        _memory.bind_event_bus(svc.storage.append_bus_event)
     # The Linear webhook signing secret (see `routes_linear.webhook`). `_UNSET`
     # (the normal case) reads the environment; a test may pass `None` explicitly
     # to exercise the fail-closed "secret not configured" path, or a real secret to
@@ -113,7 +124,7 @@ def create_app(
     for module in (
         routes_tasks, routes_artifacts, routes_reviews, routes_managers,
         routes_subtasks, routes_linear, routes_memory, routes_temporal,
-        routes_compliance, routes_route,
+        routes_compliance, routes_route, routes_events,
     ):
         app.include_router(module.router)
     return app

@@ -117,6 +117,37 @@ class EventType(str, Enum):
     #: (`AgentConnectService.expire_approval`).
     approval_expired = "approval.expired"
 
+    # Event bus (docs/EVENT_BUS.md) — Part 1 additions.
+    #: The structural, same-commit skeleton `TransitionAuthority._insert_transition_audit`
+    #: emits for EVERY applied state/status write on any of the 7 Engine-A tables,
+    #: independent of whether a rich sibling event (below) also fires. Never
+    #: dropped, even with no observability provider configured.
+    state_changed = "state.changed"
+    #: A subtask reached a terminal outcome — the GOAL vocabulary's
+    #: `SubtaskCompleted`/part of `SubtaskFailed`, fired beside the existing
+    #: `worker.completed`/`worker.failed` (which describe the *run*, not the
+    #: subtask) so a consumer can filter on the subtask's own lifecycle.
+    subtask_completed = "subtask.completed"
+    #: A subtask reached terminal `failed`, whether from a worker's own failure
+    #: or a dependency cascade (`_cascade_dependency_failure`). `subtask.denied`
+    #: stays the richer, distinct label for a governor deny (never fires both).
+    subtask_failed = "subtask.failed"
+    #: A candidate was promoted into trusted memory (`promote_memory_candidate`).
+    #: Metadata carries only `candidate_id`/backend names — never claim content.
+    memory_promoted = "memory.promoted"
+    #: Edge-triggered health transitions for a configured dependency (a memory
+    #: backend today; any future `LocalComputeProvider`/execution backend that
+    #: grows a `health()` seam). Emitted only on a *change* of classification —
+    #: a component that stays healthy, or stays down, emits nothing on repeat
+    #: checks (`AgentConnectService._note_component_health`).
+    provider_offline = "provider.offline"
+    provider_degraded = "provider.degraded"
+    provider_recovered = "provider.recovered"
+    #: Reserved wire id for the sandbox-runtime worker-report path (GOAL's
+    #: `ToolExecuted`) — no producer exists yet in this codebase; the enum
+    #: member ships so the wire identifier is fixed ahead of that integration.
+    tool_executed = "tool.executed"
+
 
 class ObservationState(str, Enum):
     """The normalized agent state model (Part III).
@@ -192,6 +223,12 @@ DEFAULT_STATE_FOR_EVENT: dict[EventType, ObservationState] = {
     EventType.audit_failed: ObservationState.failed,
     EventType.session_reconciled: ObservationState.failed,
     EventType.run_reconciled: ObservationState.failed,
+    EventType.subtask_completed: ObservationState.done,
+    EventType.subtask_failed: ObservationState.failed,
+    EventType.memory_promoted: ObservationState.working,
+    EventType.provider_offline: ObservationState.failed,
+    EventType.provider_degraded: ObservationState.blocked,
+    EventType.provider_recovered: ObservationState.working,
 }
 
 
