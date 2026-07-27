@@ -66,6 +66,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from enum import Enum
 from typing import Any, Iterable, Optional, Union
 
 from .config import RoutingConfig
@@ -74,7 +75,9 @@ from .privacy import admissible_classes as _privacy_admissible_classes
 from .privacy import admits as _privacy_admits
 from .privacy import allowed_tiers as _privacy_allowed_tiers
 from .schemas import PrivacyClass, ProviderPrivacyTier, TaskState, WorkerResult
+from .state import TASK_STATE_VOCAB
 from .state import TERMINAL_STATES as _TASK_TERMINAL_STATES
+from .transitions import TransitionAuthority, Vocabulary
 
 _TRUSTED_TIER = ProviderPrivacyTier.local_only.value
 
@@ -86,6 +89,74 @@ _TERMINAL = {"done", "failed", "cancelled"}
 # (COMPLETE/FAILED/CANCELLED — most importantly an operator's cancel) is FINAL:
 # the mirror write is refused, never a silent resurrection.
 _TASK_TERMINAL_VALUES = {s.value for s in _TASK_TERMINAL_STATES}
+
+
+class TicketStatus(str, Enum):
+    """The `work_queue.status` column's values, formalized as data (goal item
+    3: one shared vocabulary mapping ticket state <-> task state <-> subtask
+    status, documented in code). Reconstructed from every bespoke fenced
+    UPDATE in this file — NOT itself routed through a `TransitionAuthority`
+    (the bespoke UPDATEs stay verbatim: a generic CAS cannot reproduce their
+    lease/privacy/dependency fencing); this vocabulary exists so each of those
+    UPDATEs can be sanity-checked against ONE declared edge table (logged,
+    never raised — the fencing predicate is the real authority)."""
+
+    open = "open"
+    claimed = "claimed"
+    in_review = "in_review"
+    parked = "parked"
+    done = "done"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+_TICKET_STATUS_EDGES: dict[TicketStatus, frozenset] = {
+    TicketStatus.open: frozenset({TicketStatus.claimed}),
+    TicketStatus.claimed: frozenset({
+        TicketStatus.open, TicketStatus.in_review, TicketStatus.done, TicketStatus.failed,
+    }),
+    TicketStatus.in_review: frozenset({
+        TicketStatus.open, TicketStatus.done, TicketStatus.failed,
+    }),
+    TicketStatus.parked: frozenset({TicketStatus.open, TicketStatus.failed}),
+    TicketStatus.done: frozenset(),
+    TicketStatus.failed: frozenset(),
+    TicketStatus.cancelled: frozenset(),
+}
+
+TICKET_STATUS_VOCAB: Vocabulary[TicketStatus] = Vocabulary(
+    name="ticket_status",
+    enum_type=TicketStatus,
+    column="status",
+    edges=_TICKET_STATUS_EDGES,
+    terminal=frozenset({TicketStatus.done, TicketStatus.failed, TicketStatus.cancelled}),
+    universal=frozenset({TicketStatus.cancelled}),
+)
+
+#: (a) LIVE, code-enforced cross-vocabulary mapping (goal item 3): the ONLY
+#: ticket-status -> task-state translation any code performs. `cancelled` is
+#: intentionally ABSENT — one-directional; a task's own cancel drives the
+#: ticket's cancel via `cancel_for_task`, never the reverse (by the time
+#: `cancel_for_task` runs, the task is already terminal).
+TICKET_TO_TASK_STATE: dict[TicketStatus, TaskState] = {
+    TicketStatus.failed: TaskState.FAILED,
+    TicketStatus.done: TaskState.COMPLETE,
+    TicketStatus.in_review: TaskState.REVIEW_READY,
+}
+
+#: Mirror-only overlay (never merged into `TASK_STATE_VOCAB`'s own edges): the
+#: ticket mirror may jump a task from ANY non-terminal state straight to
+#: COMPLETE/FAILED/REVIEW_READY, because `enqueue_task` leaves a task at
+#: CREATED for its entire ticket lifetime (there is no pipeline walking it
+#: through CLASSIFIED/.../QUEUED the way `submit_task` does), and
+#: `approve()`/`reject()` mirror from REVIEW_READY. Consumed ONLY by
+#: `WorkQueue`'s `converge()` calls — never by the strict `transition()` verb
+#: the pipeline uses, so this never loosens what the PIPELINE may do.
+TICKET_MIRROR_EDGES: dict[TaskState, frozenset] = {
+    s: frozenset({TaskState.COMPLETE, TaskState.FAILED, TaskState.REVIEW_READY})
+    for s in TaskState
+    if s not in (TaskState.COMPLETE, TaskState.CANCELLED, TaskState.FAILED)
+}
 
 # Ceiling on a single heartbeat/renew extension: the same anti-starvation
 # reasoning as MAX_CLAIM_BATCH (transport.py) — an authorized-but-buggy or
@@ -138,6 +209,20 @@ class WorkQueue:
         # serialize against the store's own writes (create_task, put_artifact)
         # on the shared connection, not merely against each other.
         self._lock = memory._lock
+        # The one transition authority for the task-state mirror (goal: one
+        # transition authority). A standalone `WorkQueue(memory, routing)` —
+        # the common bare-fixture pattern in tests with no `RouterService` in
+        # the loop — builds its own instance here (same vocabulary, same
+        # writer bound to this same `memory`, so behaviorally identical);
+        # `RouterService.__post_init__` overrides it via
+        # `bind_task_state_authority` so production wiring shares ONE literal
+        # instance across both engines.
+        self._task_state_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=TASK_STATE_VOCAB, writer=memory.transition_task,
+        )
+
+    def bind_task_state_authority(self, authority: TransitionAuthority) -> None:
+        self._task_state_authority = authority
 
     # ---------------------------------------------------------- authorization
     # The tier×class rule lives in common.privacy (the single source of truth shared
@@ -417,6 +502,12 @@ class WorkQueue:
         if cur.rowcount != 1:
             self._conn.rollback()
             return None
+        row = self._conn.execute(
+            "SELECT task_id FROM work_queue WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()
+        self._ticket_audit(
+            ticket_id, row["task_id"] if row else None, "open", "claimed", "applied", identity,
+        )
         self._conn.commit()
         raw = self._raw(ticket_id)
         # Worker-visible row ONLY: the internal task_id is a live handle into the
@@ -552,18 +643,18 @@ class WorkQueue:
                 # than short-circuiting on 'already_reported' and stranding them.
                 self._cascade_failure(ticket_id, now)
             # Self-heal the linked task's mirrored state the same way: the
-            # ticket-terminal commit and _set_task_state are separate
+            # ticket-terminal commit and _mirror_task_state are separate
             # transactions too, so a crash between them leaves the task stuck
             # non-terminal forever. A retried report re-drives the idempotent
-            # mirror (the terminal-state guard in _set_task_state makes this
+            # mirror (the terminal-state guard in _mirror_task_state makes this
             # safe — a CANCELLED task is never resurrected by it).
             if raw["task_id"]:
                 if raw["status"] == "failed":
-                    self._set_task_state(raw["task_id"], TaskState.FAILED)
+                    self._mirror_task_state(raw["task_id"], TaskState.FAILED)
                 elif raw["status"] == "done":
-                    self._set_task_state(raw["task_id"], TaskState.COMPLETE)
+                    self._mirror_task_state(raw["task_id"], TaskState.COMPLETE)
                 elif raw["status"] == "in_review":
-                    self._set_task_state(raw["task_id"], TaskState.REVIEW_READY)
+                    self._mirror_task_state(raw["task_id"], TaskState.REVIEW_READY)
             if raw["status"] == "cancelled":
                 # The linked task was cancelled while this worker held the
                 # lease; its (valid, un-expired) fence is void by design.
@@ -642,6 +733,10 @@ class WorkQueue:
             self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (result_ref,))
             self._conn.commit()
             return {"error": "lease_lost"}
+        self._ticket_audit(
+            ticket_id, raw["task_id"], "claimed", new_status, "applied", identity,
+            reason=f"worker_status={wr.status}",
+        )
         try:
             self._conn.commit()
         except sqlite3.Error:
@@ -683,13 +778,13 @@ class WorkQueue:
             # leaves the task state to be resolved by the next report.
             if new_status == "failed":
                 if raw["task_id"]:
-                    self._set_task_state(raw["task_id"], TaskState.FAILED)
+                    self._mirror_task_state(raw["task_id"], TaskState.FAILED)
                 # A terminally-failed parent can never become 'done', so every
                 # ticket that depends on it is permanently unclaimable — cascade
                 # the failure rather than strand the children forever.
                 self._cascade_failure(ticket_id, now)
         elif raw["task_id"]:
-            self._set_task_state(raw["task_id"],
+            self._mirror_task_state(raw["task_id"],
                                  TaskState.COMPLETE if trusted else TaskState.REVIEW_READY)
         return {"ticket_status": new_status, "result_status": result_status, "result_ref": result_ref}
 
@@ -747,13 +842,16 @@ class WorkQueue:
         if cur.rowcount != 1:
             self._conn.rollback()
             return {"error": "not_in_review"}
+        self._ticket_audit(
+            ticket_id, raw["task_id"], "in_review", "done", "applied", reviewer_id,
+        )
         self._conn.commit()
         self.memory.record_evaluation({
             "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "completed",
             **self._result_usage(raw["result_ref"]),
         })
         if raw["task_id"]:
-            self._set_task_state(raw["task_id"], TaskState.COMPLETE)
+            self._mirror_task_state(raw["task_id"], TaskState.COMPLETE)
         return {"ticket_status": "done", "result_status": "approved"}
 
     @_synchronized
@@ -782,10 +880,10 @@ class WorkQueue:
                 # 'not_in_review' and leaving them stranded.
                 self._cascade_failure(ticket_id, now)
                 # And the linked task's mirrored state (see report()): a crash
-                # between the terminal ticket commit and _set_task_state would
+                # between the terminal ticket commit and _mirror_task_state would
                 # otherwise leave it non-terminal forever.
                 if raw["task_id"]:
-                    self._set_task_state(raw["task_id"], TaskState.FAILED)
+                    self._mirror_task_state(raw["task_id"], TaskState.FAILED)
             return {"error": "not_in_review"}
         prov = json.loads(raw["provenance"] or "[]")
         prov.append({"event": "review", "reviewer": reviewer_id, "verdict": "rejected",
@@ -811,6 +909,10 @@ class WorkQueue:
         if cur.rowcount != 1:
             self._conn.rollback()
             return {"error": "not_in_review"}
+        self._ticket_audit(
+            ticket_id, raw["task_id"], "in_review", "open" if requeue else "failed",
+            "applied", reviewer_id, reason=reason,
+        )
         self._conn.commit()
         self.memory.record_evaluation({
             "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "failed",
@@ -819,7 +921,7 @@ class WorkQueue:
         if requeue:
             return {"ticket_status": "open", "result_status": "rejected"}
         if raw["task_id"]:
-            self._set_task_state(raw["task_id"], TaskState.FAILED)
+            self._mirror_task_state(raw["task_id"], TaskState.FAILED)
         # Terminal failure: cascade to every dependent so a rejected parent does
         # not leave its children blocked forever (mirrors report()).
         self._cascade_failure(ticket_id, now)
@@ -909,7 +1011,7 @@ class WorkQueue:
         cancelled by THIS call."""
         now = _now() if now is None else now
         rows = self._conn.execute(
-            "SELECT ticket_id, provenance FROM work_queue"
+            "SELECT ticket_id, provenance, status FROM work_queue"
             " WHERE task_id=? AND status NOT IN ('done','failed','cancelled')",
             (task_id,),
         ).fetchall()
@@ -925,6 +1027,10 @@ class WorkQueue:
                 " WHERE ticket_id=? AND status NOT IN ('done','failed','cancelled')",
                 (json.dumps(prov), now, now, row["ticket_id"]),
             )
+            self._ticket_audit(
+                row["ticket_id"], task_id, row["status"], "cancelled", "applied", "router",
+                reason="task_cancelled",
+            )
             cancelled.append(row["ticket_id"])
         self._conn.commit()
         for ticket_id in cancelled:
@@ -938,16 +1044,19 @@ class WorkQueue:
         Two statements, one commit. Call periodically from an explicit loop, or
         let ``start_reaper`` run it on an opt-in daemon thread."""
         now = _now() if now is None else now
-        requeued = [
-            r["ticket_id"]
-            for r in self._conn.execute(
-                "UPDATE work_queue SET status='open', lease_holder=NULL, lease_tier=NULL,"
-                " lease_token=NULL, lease_expires_at=NULL, updated_at=?"
-                " WHERE status='claimed' AND lease_expires_at<? AND attempts<max_attempts"
-                " RETURNING ticket_id",
-                (now, now),
-            ).fetchall()
-        ]
+        requeued_rows = self._conn.execute(
+            "UPDATE work_queue SET status='open', lease_holder=NULL, lease_tier=NULL,"
+            " lease_token=NULL, lease_expires_at=NULL, updated_at=?"
+            " WHERE status='claimed' AND lease_expires_at<? AND attempts<max_attempts"
+            " RETURNING ticket_id, task_id",
+            (now, now),
+        ).fetchall()
+        requeued = [r["ticket_id"] for r in requeued_rows]
+        for r in requeued_rows:
+            self._ticket_audit(
+                r["ticket_id"], r["task_id"], "claimed", "open", "applied", "reaper",
+                reason="lease_expired",
+            )
         parked_rows = self._conn.execute(
             "UPDATE work_queue SET status='parked', park_reason='max_attempts_exhausted',"
             " lease_holder=NULL, lease_tier=NULL, lease_token=NULL, lease_expires_at=NULL,"
@@ -957,6 +1066,11 @@ class WorkQueue:
             (now, now),
         ).fetchall()
         parked = [r["ticket_id"] for r in parked_rows]
+        for r in parked_rows:
+            self._ticket_audit(
+                r["ticket_id"], r["task_id"], "claimed", "parked", "applied", "reaper",
+                reason="max_attempts_exhausted",
+            )
         self._conn.commit()
         # A parked (attempts-exhausted) ticket can never reach 'done', so — exactly
         # as report()/reject() do on the identical attempts-exhausted condition —
@@ -966,7 +1080,7 @@ class WorkQueue:
         # report-driven exhaustion.
         for r in parked_rows:
             if r["task_id"]:
-                self._set_task_state(r["task_id"], TaskState.FAILED)
+                self._mirror_task_state(r["task_id"], TaskState.FAILED)
             self._cascade_failure(r["ticket_id"], now)
         # Self-heal an interrupted cascade across ticks: report()/reject() and the
         # parked loop above commit the terminal transition and _cascade_failure in
@@ -990,11 +1104,11 @@ class WorkQueue:
         for r in stranded:
             self._cascade_failure(r["pid"], now)
         # Self-heal the task-state mirror across ticks: a crash between a
-        # ticket's terminal commit and its _set_task_state leaves the linked
+        # ticket's terminal commit and its _mirror_task_state leaves the linked
         # task non-terminal forever (no retry path revisits it once the ticket
         # is terminal). Re-drive the idempotent mirror for any terminal ticket
         # whose task is still non-terminal; the terminal-state guard in
-        # _set_task_state keeps this from ever resurrecting a CANCELLED task.
+        # _mirror_task_state keeps this from ever resurrecting a CANCELLED task.
         ph = ",".join("?" for _ in _TASK_TERMINAL_VALUES)
         desynced = self._conn.execute(
             f"SELECT w.ticket_id, w.task_id, w.status FROM work_queue w"
@@ -1003,7 +1117,7 @@ class WorkQueue:
             tuple(_TASK_TERMINAL_VALUES),
         ).fetchall()
         for r in desynced:
-            self._set_task_state(
+            self._mirror_task_state(
                 r["task_id"],
                 TaskState.COMPLETE if r["status"] == "done" else TaskState.FAILED,
             )
@@ -1225,21 +1339,63 @@ class WorkQueue:
                     continue
                 prov = json.loads(child["provenance"] or "[]")
                 prov.append({"event": "cascade_fail", "cause": parent_id, "ts": now})
-                self._conn.execute(
+                cur = self._conn.execute(
                     "UPDATE work_queue SET status='failed', result_status='dependency_failed',"
                     " park_reason='dependency_failed', lease_holder=NULL, lease_tier=NULL,"
                     " lease_token=NULL, lease_expires_at=NULL, provenance=?, updated_at=?"
-                    " WHERE ticket_id=?",
+                    " WHERE ticket_id=? AND status NOT IN ('done','failed','cancelled')",
                     (json.dumps(prov), now, child_id),
                 )
+                if cur.rowcount != 1:
+                    # A concurrent writer (impossible in-process under this
+                    # method's lock, but belt-and-suspenders against a future
+                    # cross-process caller) already drove it terminal between
+                    # the Python-level check above and this UPDATE — skip, do
+                    # not double-cascade from a child that never actually
+                    # changed.
+                    continue
+                self._ticket_audit(
+                    child_id, child["task_id"], child["status"], "failed", "applied", "cascade",
+                    reason=f"dependency {parent_id} failed",
+                )
                 if child["task_id"]:
-                    self._set_task_state(child["task_id"], TaskState.FAILED)
+                    self._mirror_task_state(child["task_id"], TaskState.FAILED)
                 cascaded.append(child_id)
                 stack.append(child_id)
         self._conn.commit()
         return cascaded
 
     # ------------------------------------------------------------- internals
+    def _ticket_audit(
+        self, ticket_id: str, task_id: Optional[str], src: str, dst: str,
+        outcome: str, actor: str, reason: str = "",
+    ) -> None:
+        """Raw INSERT on the live connection — never `self.memory.append_log`
+        (self-committing) — so this ticket-status audit row always rides the
+        SAME commit as the fenced UPDATE it describes (goal item: mandatory
+        audit emission; docs/CONSISTENCY_REVIEW.md's fail-closed-audit
+        adjudication). The bespoke fenced UPDATEs stay verbatim; this is the
+        only addition each one gains. `TICKET_STATUS_VOCAB` sanity-checks the
+        edge (logged, never raised — the fencing WHERE clause is the real
+        authority, this is an observability cross-check only)."""
+        try:
+            sane = TicketStatus(dst) in TICKET_STATUS_VOCAB.allowed(TicketStatus(src))
+        except ValueError:
+            sane = True
+        detail = f"ticket_status {ticket_id}: {src} -> {dst} ({outcome})"
+        if reason:
+            detail += f": {reason}"
+        if not sane:
+            detail += " [WARNING: edge outside declared ticket_status vocabulary]"
+        # `logs.task_id` is NOT NULL; a ticket added without one (`add()` with no
+        # `task_id=`) falls back to the ticket_id itself so the row is still
+        # insertable and still findable, never a constraint violation mid-commit.
+        self._conn.execute(
+            "INSERT INTO logs(task_id, level, message, created_at) VALUES(?,?,?,?)",
+            (task_id or ticket_id, "warn" if outcome == "refused" or not sane else "info",
+             detail, _now()),
+        )
+
     @_synchronized
     def _raw(self, ticket_id: str) -> Optional[dict[str, Any]]:
         row = self._conn.execute(
@@ -1299,41 +1455,32 @@ class WorkQueue:
             "park_reason": d["park_reason"],
         }
 
-    def _set_task_state(self, task_id: str, state: TaskState) -> None:
-        """Drive a linked task's state. S1 core is framework-free, so it writes
-        the store directly (the router pipeline's strict FSM is layered in S2) —
-        but terminal-state finality still holds across engines: a task already
-        COMPLETE/FAILED/CANCELLED (e.g. cancelled by the router's manager while
-        a ticket was still leased) is never overwritten. The refused write is
-        audited to the task's log, as is every accepted transition, so a
-        ticket-driven task-state change is reconstructable from the task alone."""
-        task = self.memory.get_task(task_id)
-        if task is None:
-            return
-        current = task["state"]
-        if current in _TASK_TERMINAL_VALUES:
-            if current != state.value:
-                self.memory.append_log(
-                    task_id,
-                    f"work_queue refused task-state overwrite {current} -> {state.value}: "
-                    "terminal state is final",
-                    level="warn",
-                )
-            return
-        updated, stored = self.memory.update_task_guarded(
-            task_id, exclude_states=_TASK_TERMINAL_VALUES, state=state.value
+    def _mirror_task_state(self, task_id: str, state: TaskState) -> None:
+        """Drive a linked task's state through the shared `TransitionAuthority`
+        (goal: one transition authority) via its `converge()` mirror verb.
+
+        Renamed from its pre-consolidation name (the "set task state" helper —
+        spec checklist item 2): that symbol named the retired SECOND WRITER of
+        `tasks.state`, and the grep checklist plus the source-scan enforcement
+        test pin its absence so a genuinely separate bare-write helper cannot
+        quietly come back under the old name. This wrapper does not write the
+        column itself — it only shapes the converge call.
+
+        Terminal-state finality still holds across engines: a task already
+        COMPLETE/FAILED/CANCELLED (e.g. cancelled by the router's manager
+        while a ticket was still leased) is never overwritten — the refused
+        write is audited (both as a generic transition-audit row AND, via the
+        legacy-message formatters below, the exact log line existing
+        tests/tooling grep for). A task already at `state` is a silent
+        no-op replay (no duplicate audit row) — the self-heal re-drive every
+        caller of this method relies on after a crash between a ticket's
+        terminal commit and this mirror write.
+        """
+        self._task_state_authority.converge(
+            task_id, state, actor="work_queue", overlay=TICKET_MIRROR_EDGES,
+            on_applied_message=lambda src, dst: f"work_queue task-state {src.value} -> {dst.value}",
+            on_refused_message=lambda src, dst: (
+                f"work_queue refused task-state overwrite {src.value} -> {dst.value}: "
+                "terminal state is final"
+            ),
         )
-        if updated:
-            self.memory.append_log(
-                task_id, f"work_queue task-state {current} -> {state.value}"
-            )
-        else:
-            # Lost an atomic race to a concurrent terminal writer (cancel_task
-            # in another thread/process) between the read above and the guarded
-            # write. The guard held; record the refusal.
-            self.memory.append_log(
-                task_id,
-                f"work_queue refused task-state overwrite {stored} -> {state.value}: "
-                "terminal state is final",
-                level="warn",
-            )

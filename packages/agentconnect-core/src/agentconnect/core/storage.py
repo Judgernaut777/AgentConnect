@@ -20,10 +20,13 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterator, Optional
 
+from . import ids
+from ..common.transitions import DecideFn
 from .execution import ExecutionHandle
 from .models import (
     ApprovalRecord,
@@ -273,7 +276,17 @@ class SqliteStorage:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Serialized read-modify-write span. Reentrant: nesting is a no-op."""
+        """Serialized read-modify-write span.
+
+        Reentrant LOCK (the ``RLock`` nests fine) — but **not commit-reentrant**:
+        the body still runs ``self._conn.commit()`` at every exit, including a
+        nested one. Calling this again while already inside another
+        ``transaction()``/``transition_row()`` span therefore commits the
+        OUTER span's not-yet-finished work early. Never nest; compose a second
+        write into an already-open span by accepting and using its ``conn``
+        (see ``insert_claim(..., conn=conn)``, ``transition_row(..., conn=conn)``)
+        instead of calling this again.
+        """
         with self._lock:
             try:
                 yield self._conn
@@ -281,6 +294,125 @@ class SqliteStorage:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    #: `table -> (id_column, state_column)`. Internal constants, never caller
+    #: input — the f-string interpolation in `transition_row` carries no
+    #: injection surface (mirrors `status_counts`).
+    _TRANSITION_TABLES: dict[str, tuple[str, str]] = {
+        "tasks": ("id", "status"),
+        "subtasks": ("id", "status"),
+        "worker_runs": ("id", "status"),
+        "reviews": ("id", "status"),
+        "approvals": ("id", "status"),
+        "manager_sessions": ("id", "status"),
+        "executions": ("handle_id", "state"),
+    }
+
+    def _insert_transition_audit(self, conn: sqlite3.Connection, record: Any) -> None:
+        """Raw INSERT on the caller's connection — never a self-committing
+        helper — so a transition's audit row always rides the SAME commit as
+        the state write it describes (fail-closed: "no state transition
+        without a record")."""
+        from ..common.transitions import _default_message
+
+        payload = {
+            "vocabulary": record.vocabulary, "entity_id": record.entity_id,
+            "src": record.src, "dst": record.dst, "outcome": record.outcome,
+            "reason": record.reason, "message": _default_message(record),
+        }
+        conn.execute(
+            "INSERT INTO events (id,task_id,kind,actor,payload_json,created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (ids.new_id(ids.EVENT), record.task_id, "transition", record.actor,
+             _j(payload), time.time()),
+        )
+
+    @staticmethod
+    def _reject_state_write(fields: dict, key: str, table: str) -> None:
+        """Enforcement (goal item 2/8): a state/status key must go through
+        :meth:`transition_row` (the authority's writer), never a bare
+        ``update_*`` call. Grep-provable statically (no call site under
+        ``packages/*/src`` passes one) AND runtime-provable here."""
+        if key in fields:
+            raise ValueError(
+                f"{table}.{key} must go through TransitionAuthority "
+                "(SqliteStorage.transition_row), not update_*()"
+            )
+
+    @staticmethod
+    def _normalize_transition_fields(fields: dict) -> dict:
+        """Same friendly-key -> real-column normalization every hand-written
+        ``update_*`` method already does (``metadata`` -> ``metadata_json``,
+        etc.) — centralized here so a `decide()` closure in service.py can
+        pass the same field names it would to `update_subtask`/`update_task`
+        without knowing which underlying column is JSON-encoded."""
+        fields = dict(fields)
+        if "metadata" in fields:
+            fields["metadata_json"] = _j(fields.pop("metadata"))
+        if "route_reason" in fields:
+            fields["route_reason_json"] = _j(fields.pop("route_reason"))
+        if "depends_on" in fields:
+            fields["depends_on_json"] = _j(fields.pop("depends_on"))
+        if "criteria" in fields:
+            fields["criteria_json"] = _j(fields.pop("criteria"))
+        if "metrics" in fields:
+            fields["metrics_json"] = _j(fields.pop("metrics"))
+        return fields
+
+    def transition_row(
+        self, table: str, entity_id: str, decide: DecideFn,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """The generic :class:`~agentconnect.common.transitions.LockedWriter`
+        for every Engine-A table. Reads the row's state/status column fresh,
+        calls ``decide`` with it, and — if it returns fields to write —
+        applies one guarded ``UPDATE ... WHERE {id_col}=? AND {state_col}=?``
+        (exact-match CAS against the value just read) plus, if a record was
+        returned, an audit INSERT, all on the same connection.
+
+        When ``conn`` is given (the ``claim_task`` composition path), this
+        never commits — the caller's own :meth:`transaction` span commits
+        everything together. When ``conn`` is ``None`` it opens (and commits)
+        its own span, retrying up to 3 times on a CAS miss (a cross-process
+        writer only; every in-process writer already serializes on
+        ``self._lock``).
+        """
+        id_col, state_col = self._TRANSITION_TABLES[table]
+
+        def _attempt(c: sqlite3.Connection) -> tuple[bool, Optional[str], bool]:
+            row = c.execute(
+                f"SELECT {state_col} FROM {table} WHERE {id_col}=?", (entity_id,)
+            ).fetchone()
+            current_raw = row[state_col] if row is not None else None
+            fields, record = decide(current_raw)
+            if fields is not None:
+                fields = self._normalize_transition_fields(fields)
+            if fields is None:
+                if record is not None:
+                    self._insert_transition_audit(c, record)
+                return False, current_raw, True
+            cols = ", ".join(f"{k}=?" for k in fields)
+            cur = c.execute(
+                f"UPDATE {table} SET {cols} WHERE {id_col}=? AND {state_col}=?",
+                (*fields.values(), entity_id, current_raw),
+            )
+            if cur.rowcount != 1:
+                return False, current_raw, False
+            if record is not None:
+                self._insert_transition_audit(c, record)
+            return True, fields.get(state_col, current_raw), True
+
+        if conn is not None:
+            applied, stored, _done = _attempt(conn)
+            return applied, stored
+
+        applied, stored, done = False, None, False
+        for _attempt_no in range(3):
+            with self.transaction() as c:
+                applied, stored, done = _attempt(c)
+            if done:
+                return applied, stored
+        return applied, stored
 
     # -------------------------------------------------------------- tasks
     def insert_task(self, task: Task) -> Task:
@@ -304,6 +436,7 @@ class SqliteStorage:
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "tasks")
         if "metadata" in fields:
             fields["metadata_json"] = _j(fields.pop("metadata"))
         cols = ", ".join(f"{k}=?" for k in fields)
@@ -539,6 +672,7 @@ class SqliteStorage:
                       **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "reviews")
         cols = ", ".join(f"{k}=?" for k in fields)
         sql = f"UPDATE reviews SET {cols} WHERE id=?"
         args = (*fields.values(), review_id)
@@ -605,6 +739,7 @@ class SqliteStorage:
     def update_subtask(self, subtask_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "subtasks")
         if "route_reason" in fields:
             fields["route_reason_json"] = _j(fields.pop("route_reason"))
         if "metadata" in fields:
@@ -615,33 +750,12 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(f"UPDATE subtasks SET {cols} WHERE id=?", (*fields.values(), subtask_id))
 
-    def update_subtask_if_status(
-        self, subtask_id: str, expected_statuses: Iterable[str], **fields: Any
-    ) -> bool:
-        """Compare-and-set subtask update: one guarded ``UPDATE ... WHERE status
-        IN (...)`` so the status check and the write are atomic (the WorkQueue's
-        claim pattern). Returns True iff this call won the transition. Closes
-        the TOCTOU windows where (a) two concurrent ``run_subtask`` calls both
-        pass the plain read-check and double-execute the worker, and (b) a stale
-        in-flight ``worker.run()`` result resurrects a subtask a concurrent
-        ``cancel_subtask`` already drove terminal (zombie write)."""
-        if not fields:
-            return False
-        if "route_reason" in fields:
-            fields["route_reason_json"] = _j(fields.pop("route_reason"))
-        if "metadata" in fields:
-            fields["metadata_json"] = _j(fields.pop("metadata"))
-        if "depends_on" in fields:
-            fields["depends_on_json"] = _j(fields.pop("depends_on"))
-        expected = [str(s) for s in expected_statuses]
-        ph = ",".join("?" for _ in expected) or "''"
-        cols = ", ".join(f"{k}=?" for k in fields)
-        with self.transaction() as c:
-            cur = c.execute(
-                f"UPDATE subtasks SET {cols} WHERE id=? AND status IN ({ph})",
-                (*fields.values(), subtask_id, *expected),
-            )
-            return cur.rowcount == 1
+    # NOTE: the old boolean `update_subtask_if_status` / `update_run_if_status`
+    # CAS helpers were REMOVED (consolidation review finding): after every call
+    # site migrated onto the `subtask_status` / `run_status` authorities they
+    # were orphaned public methods that could still flip a status column with
+    # no FSM check and no audit row — a second door past the one transition
+    # authority. `transition_row` is the only status writer for these tables.
 
     def list_subtasks(self, task_id: str) -> list[Subtask]:
         with self._lock:
@@ -686,30 +800,12 @@ class SqliteStorage:
     def update_run(self, run_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "worker_runs")
         if "metrics" in fields:
             fields["metrics_json"] = _j(fields.pop("metrics"))
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE worker_runs SET {cols} WHERE id=?", (*fields.values(), run_id))
-
-    def update_run_if_status(
-        self, run_id: str, expected_statuses: Iterable[str], **fields: Any
-    ) -> bool:
-        """Compare-and-set run update (see ``update_subtask_if_status``).
-        Returns True iff the guarded write matched."""
-        if not fields:
-            return False
-        if "metrics" in fields:
-            fields["metrics_json"] = _j(fields.pop("metrics"))
-        expected = [str(s) for s in expected_statuses]
-        ph = ",".join("?" for _ in expected) or "''"
-        cols = ", ".join(f"{k}=?" for k in fields)
-        with self.transaction() as c:
-            cur = c.execute(
-                f"UPDATE worker_runs SET {cols} WHERE id=? AND status IN ({ph})",
-                (*fields.values(), run_id, *expected),
-            )
-            return cur.rowcount == 1
 
     def total_run_cost_usd(self) -> float:
         """Cumulative actual spend recorded across ALL worker runs (the
@@ -875,6 +971,7 @@ class SqliteStorage:
     def update_approval(self, approval_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "approvals")
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE approvals SET {cols} WHERE id=?", (*fields.values(), approval_id))
@@ -922,6 +1019,7 @@ class SqliteStorage:
     def update_execution(self, handle_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "state", "executions")
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(
@@ -1074,6 +1172,7 @@ class SqliteStorage:
     def update_session(self, session_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "manager_sessions")
         if "metadata" in fields:
             fields["metadata_json"] = _j(fields.pop("metadata"))
         cols = ", ".join(f"{k}=?" for k in fields)

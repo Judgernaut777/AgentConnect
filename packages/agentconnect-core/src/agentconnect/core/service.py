@@ -9,6 +9,7 @@ noticing.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -103,6 +104,12 @@ from .models import (
     WorkerRun,
     Workspace,
 )
+from ..common.transitions import (
+    CancelResult,
+    EntityNotFound,
+    TransitionAuthority,
+    TransitionRefused,
+)
 from .routing import RouteExplanation, RoutePolicy, WorkerRegistry, route
 from .storage import SqliteStorage, default_db_path
 from .toolconnect_client import (
@@ -110,6 +117,15 @@ from .toolconnect_client import (
     ToolDecision,
     ToolUseAuthorization,
     split_tool_ref,
+)
+from .transition_vocab import (
+    APPROVAL_STATUS_VOCAB,
+    EXECUTION_STATE_VOCAB,
+    REVIEW_STATUS_VOCAB,
+    RUN_STATUS_VOCAB,
+    SESSION_STATUS_VOCAB,
+    SUBTASK_STATUS_VOCAB,
+    TASK_STATUS_VOCAB,
 )
 from .workers import WorkerContext, WorkerResult
 
@@ -128,6 +144,15 @@ TaskContextPack = ContextPack
 _TO_IN_PROGRESS = frozenset({TaskStatus.queued, TaskStatus.needs_approval})
 _TO_NEEDS_REVIEW = frozenset({TaskStatus.queued, TaskStatus.in_progress})
 _TO_NEEDS_APPROVAL = frozenset({TaskStatus.queued, TaskStatus.in_progress})
+
+#: Every status `complete_task` may leave FOR `succeeded` — derived from the
+#: vocabulary so the two can never drift: exactly the statuses with a declared
+#: `-> succeeded` edge (all non-terminals today). Used with `advance` so the
+#: already-succeeded / already-terminal check and the write are ONE atomic
+#: guarded store operation, not a stale read followed by a blind write.
+_COMPLETABLE_TASK_STATUSES = frozenset(
+    s for s in TaskStatus if TaskStatus.succeeded in TASK_STATUS_VOCAB.edges.get(s, frozenset())
+)
 
 #: Executions that can still receive a signal.
 _LIVE_EXECUTION_STATES = frozenset({
@@ -215,6 +240,41 @@ class AgentConnectService:
         #: denies rather than degrades. It authorizes and records only; it is never on the
         #: invocation data path. Bound from config by `toolconnect_governor_from_env`.
         self.tool_governor: Optional[Any] = None
+
+        # The one transition authority, per vocabulary (docs/CONSISTENCY_REVIEW.md
+        # consolidation: "one transition authority"). Each is a
+        # `TransitionAuthority` over the SAME generic `SqliteStorage.transition_row`
+        # writer, bound to a different table via `functools.partial` — no second
+        # door: every state/status write in this class goes through one of these
+        # seven, never a bare `storage.update_*(status=...)`.
+        self._task_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=TASK_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "tasks"),
+        )
+        self._subtask_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=SUBTASK_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "subtasks"),
+        )
+        self._run_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=RUN_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "worker_runs"),
+        )
+        self._review_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=REVIEW_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "reviews"),
+        )
+        self._approval_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=APPROVAL_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "approvals"),
+        )
+        self._session_status_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=SESSION_STATUS_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "manager_sessions"),
+        )
+        self._execution_state_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=EXECUTION_STATE_VOCAB,
+            writer=functools.partial(self.storage.transition_row, "executions"),
+        )
 
     def bind_observability(self, emitter: ObservabilityEmitter) -> None:
         self.observability = emitter
@@ -345,14 +405,16 @@ class AgentConnectService:
 
         The guard matters: a subtask starting to run must not silently clear a
         ``needs_review`` task, and a terminal task must never be resurrected by a
-        late worker result or a replayed webhook.
+        late worker result or a replayed webhook. Routed through the shared
+        `TransitionAuthority`'s `advance()` verb (docs/CONSISTENCY_REVIEW.md:
+        one transition authority) — atomic now (the old read-then-write here
+        was two separate steps), same no-op semantics.
         """
-        task = self._require_task(task_id)
-        if task.status in TERMINAL_TASK_STATUSES or task.status is to:
-            return
-        if task.status not in only_from:
-            return
-        self._touch(task_id, status=to.value)
+        self._require_task(task_id)  # NotFound for an unknown task, as before
+        self._task_status_authority.advance(
+            task_id, to, only_from=only_from, actor="system", task_id=task_id,
+            extra_fields={"updated_at": self._now()},
+        )
 
     # ----------------------------------------------------------------- tasks
     def create_task(self, request: CreateTaskRequest) -> Task:
@@ -397,14 +459,36 @@ class AgentConnectService:
         return self.storage.list_tasks(filters or TaskFilters())
 
     def cancel_task(self, task_id: str, actor: str = "system") -> Task:
-        task = self._require_task(task_id)
-        if task.status in TERMINAL_TASK_STATUSES:
-            raise Conflict(f"task {task_id} is already {task.status.value}")
-        self._touch(task_id, status=TaskStatus.cancelled.value)
+        """Cancel a task. Converged cancel semantic
+        (docs/CONSISTENCY_REVIEW.md adjudication): cancelling an already-
+        terminal (or raced-to-terminal) task is a NO-OP SUCCESS returning the
+        task as-is — no `Conflict`, no duplicate `task_cancelled` event —
+        mirroring `WorkQueue.cancel_for_task` (the only battle-tested shape of
+        the three that used to exist) and converging with
+        `RouterService.cancel_task`'s dict-shaped equivalent. An unknown task
+        id is a different failure class and still raises `NotFound`.
+        """
+        try:
+            result = self._task_status_authority.cancel(
+                task_id, cancelled=TaskStatus.cancelled, actor=actor, task_id=task_id,
+                extra_fields={"updated_at": self._now()},
+            )
+        except EntityNotFound:
+            raise NotFound(f"unknown task {task_id!r}") from None
+        if result.already_terminal:
+            return self._require_task(task_id)
         self.record_event(task_id, "task_cancelled", actor, {})
         self._observe(EventType.task_cancelled, task_id=task_id, agent_id=actor,
                       agent_role="operator", outcome=ObservationOutcome.cancelled)
         self._reap_task_observation(task_id, ObservationOutcome.cancelled)
+        # Cascade: a cancelled task's still-live subtasks are cancelled too
+        # (mirrors RouterService.cancel_task -> WorkQueue.cancel_for_task;
+        # closes the divergence where only Engine B's cancel reached its
+        # dependent work). cancel_subtask is itself idempotent (see below), so
+        # a subtask a concurrent caller already finished is a harmless no-op.
+        for subtask in self.storage.list_subtasks(task_id):
+            if subtask.status not in subtasks_policy.TERMINAL:
+                self.cancel_subtask(subtask.id)
         return self._require_task(task_id)
 
     # ---------------------------------------------------------------- claims
@@ -436,15 +520,26 @@ class AgentConnectService:
             self.storage.insert_claim(claim, conn=conn)
             if role_enum is ClaimRole.primary_manager:
                 task = self._require_task(task_id)
-                status = (
-                    task.status.value
-                    if task.status not in (TaskStatus.queued,)
-                    else TaskStatus.in_progress.value
-                )
-                conn.execute(
-                    "UPDATE tasks SET current_manager=?, status=?, updated_at=? WHERE id=?",
-                    (manager_id, status, now, task_id),
-                )
+                if task.status is TaskStatus.queued:
+                    # Composed onto THIS transaction's conn (never a fresh
+                    # `transaction()` span — `SqliteStorage.transaction()` is
+                    # reentrant-LOCK but not commit-reentrant, so a self-
+                    # committing call here would commit the claim insert
+                    # above early). One commit covers the claim, the status
+                    # flip, and the transition audit row together.
+                    self._task_status_authority.transition(
+                        task_id, TaskStatus.in_progress, actor=manager_id, task_id=task_id,
+                        extra_fields={"current_manager": manager_id, "updated_at": now},
+                        conn=conn,
+                    )
+                else:
+                    # Keep-status branch (today's behavior unchanged): claiming
+                    # a task that is not `queued` (including a terminal one)
+                    # only ever updates who holds it, never its status.
+                    conn.execute(
+                        "UPDATE tasks SET current_manager=?, updated_at=? WHERE id=?",
+                        (manager_id, now, task_id),
+                    )
         self.record_event(task_id, "task_claimed", manager_id, {"role": role_enum.value})
         self._observe(EventType.task_claimed, task_id=task_id, agent_id=manager_id,
                       agent_role="manager", metadata={"role": role_enum.value})
@@ -664,8 +759,9 @@ class AgentConnectService:
             if review is None:
                 raise NotFound(f"unknown review {review_id!r}")
             reviews_policy.check_claimable(review, manager_id)
-            self.storage.update_review(
-                review_id, conn=conn, status=ReviewStatus.claimed.value, updated_at=now
+            self._review_status_authority.transition(
+                review_id, ReviewStatus.claimed, actor=manager_id, task_id=review.task_id,
+                extra_fields={"updated_at": now}, conn=conn,
             )
         claimed = self._require_review(review_id)
         self._observe(EventType.review_claimed, task_id=claimed.task_id, review_id=review_id,
@@ -702,9 +798,9 @@ class AgentConnectService:
                 )
 
         now = self._now()
-        self.storage.update_review(
-            review_id, status=request.status.value, result_artifact_id=result_artifact_id,
-            updated_at=now,
+        self._review_status_authority.transition(
+            review_id, request.status, actor=request.completed_by, task_id=review.task_id,
+            extra_fields={"result_artifact_id": result_artifact_id, "updated_at": now},
         )
         self.storage.dismiss_inbox_items(review_id, now)
 
@@ -714,9 +810,12 @@ class AgentConnectService:
             if r.status in (ReviewStatus.open, ReviewStatus.claimed, ReviewStatus.in_progress)
         ]
         if not remaining:
-            task = self._require_task(review.task_id)
-            if task.status is TaskStatus.needs_review:
-                self._touch(review.task_id, status=TaskStatus.in_progress.value)
+            self._task_status_authority.advance(
+                review.task_id, TaskStatus.in_progress,
+                only_from=frozenset({TaskStatus.needs_review}),
+                actor="system", task_id=review.task_id,
+                extra_fields={"updated_at": self._now()},
+            )
         self.record_event(
             review.task_id, "review_completed", request.completed_by,
             {"review_id": review_id, "status": request.status.value,
@@ -940,12 +1039,11 @@ class AgentConnectService:
                 continue  # a nested release (see above) already handled it
             if self._unmet_dependencies(current.depends_on):
                 continue  # went stale between the scan and now
-            subtasks_policy.check_transition(current, SubtaskStatus.queued)
             metadata = dict(current.metadata)
             metadata.pop("blocked_on", None)
-            self.storage.update_subtask(
-                current.id, status=SubtaskStatus.queued.value, metadata=metadata,
-                updated_at=self._now(),
+            self._subtask_status_authority.transition(
+                current.id, SubtaskStatus.queued, actor="system", task_id=task_id,
+                extra_fields={"metadata": metadata, "updated_at": self._now()},
             )
             self.record_event(
                 task_id, "subtask_released", "system",
@@ -989,13 +1087,12 @@ class AgentConnectService:
                 if current.status is not SubtaskStatus.blocked:
                     continue  # already dispatched/terminal — nothing to strand
                 now = self._now()
-                subtasks_policy.check_transition(current, SubtaskStatus.failed)
                 metadata = dict(current.metadata)
                 metadata.pop("blocked_on", None)
                 metadata["dependency_failed"] = parent_id
-                self.storage.update_subtask(
-                    current.id, status=SubtaskStatus.failed.value, metadata=metadata,
-                    updated_at=now,
+                self._subtask_status_authority.transition(
+                    current.id, SubtaskStatus.failed, actor="system", task_id=task_id,
+                    extra_fields={"metadata": metadata, "updated_at": now},
                 )
                 reason = f"dependency {parent_id} failed; cannot run"
                 # Record a durable attempt + ledger event so the cascade failure
@@ -1032,13 +1129,16 @@ class AgentConnectService:
         approval = self.storage.pending_approval_for(subtask_id) or self._create_approval(
             subtask, RouteExplanation(**subtask.route_reason)
         )
-        self.storage.update_approval(
-            approval.id, status=ApprovalStatus.granted.value, decided_by=approved_by,
-            max_cost_usd=max_cost_usd, decided_at=now,
+        self._approval_status_authority.transition(
+            approval.id, ApprovalStatus.granted, actor=approved_by,
+            task_id=subtask.parent_task_id,
+            extra_fields={"decided_by": approved_by, "max_cost_usd": max_cost_usd,
+                          "decided_at": now},
         )
-        self.storage.update_subtask(
-            subtask_id, status=SubtaskStatus.queued.value, approved_by=approved_by,
-            approved_max_cost_usd=max_cost_usd, updated_at=now,
+        self._subtask_status_authority.transition(
+            subtask_id, SubtaskStatus.queued, actor=approved_by, task_id=subtask.parent_task_id,
+            extra_fields={"approved_by": approved_by, "approved_max_cost_usd": max_cost_usd,
+                          "updated_at": now},
         )
         self.storage.dismiss_inbox_items(subtask_id, now)
         self.record_event(
@@ -1070,16 +1170,17 @@ class AgentConnectService:
             raise Conflict(
                 f"subtask {subtask_id} is {subtask.status.value}, not needs_approval"
             )
-        subtasks_policy.check_transition(subtask, SubtaskStatus.failed)
         now = self._now()
         pending = self.storage.pending_approval_for(subtask_id)
         if pending:
-            self.storage.update_approval(
-                pending.id, status=ApprovalStatus.denied.value, decided_by=denied_by,
-                reason=reason, decided_at=now,
+            self._approval_status_authority.transition(
+                pending.id, ApprovalStatus.denied, actor=denied_by,
+                task_id=subtask.parent_task_id,
+                extra_fields={"decided_by": denied_by, "reason": reason, "decided_at": now},
             )
-        self.storage.update_subtask(
-            subtask_id, status=SubtaskStatus.failed.value, updated_at=now
+        self._subtask_status_authority.transition(
+            subtask_id, SubtaskStatus.failed, actor=denied_by, task_id=subtask.parent_task_id,
+            extra_fields={"updated_at": now},
         )
         self.storage.dismiss_inbox_items(subtask_id, now)
         self.record_event(
@@ -1117,6 +1218,53 @@ class AgentConnectService:
     def list_approvals(self, task_id: str) -> list[ApprovalRecord]:
         return self.storage.list_approvals(task_id)
 
+    def expire_approval(self, approval_id: str, actor: str = "system") -> ApprovalRecord:
+        """A pending approval's clock ran out with no human decision.
+
+        This is the adapter boundary this module's docstring declares: the
+        Temporal activity that used to poke `storage.update_approval` directly
+        now calls this instead (closes docs/CONSISTENCY_REVIEW.md finding #1
+        — the approval-row write and its subtask-side cascade were split
+        across the activity and the service, a TOCTOU the subtask-side check
+        never covered). Replay-safe: an approval a concurrent
+        `grant_approval`/`deny_subtask` already decided is returned unchanged,
+        never re-expired.
+        """
+        record = self.get_approval(approval_id)
+        try:
+            self._approval_status_authority.transition(
+                approval_id, ApprovalStatus.expired, actor=actor, task_id=record.task_id,
+                extra_fields={"decided_by": actor, "decided_at": self._now()},
+            )
+        except TransitionRefused:
+            # Lost the race to a concurrent grant/deny — the winner's decision
+            # stands; return it as-is (replay-safe, mirrors
+            # `record_approval_decision`'s own pre-existing pending check).
+            return self.get_approval(approval_id)
+        self.record_event(
+            record.task_id, "approval_expired", actor, {"approval_id": approval_id},
+        )
+        self._observe(EventType.approval_expired, task_id=record.task_id,
+                      subtask_id=record.subtask_id, agent_id=actor, agent_role="system",
+                      outcome=ObservationOutcome.failed)
+        # Same cascade tail `deny_subtask` runs: an expired approval must not
+        # strand its subtask in `needs_approval` forever.
+        subtask = self.storage.get_subtask(record.subtask_id)
+        if subtask is not None and subtask.status is SubtaskStatus.needs_approval:
+            self._subtask_status_authority.transition(
+                record.subtask_id, SubtaskStatus.failed, actor=actor, task_id=record.task_id,
+                extra_fields={"updated_at": self._now()},
+            )
+            self.storage.dismiss_inbox_items(record.subtask_id, self._now())
+            self._signal_entity(
+                "subtask", record.subtask_id, "approval_denied", {"reason": "expired"},
+            )
+            self._close_observation_handles(
+                "subtask", record.subtask_id, ObservationOutcome.denied,
+            )
+            self._settle_parent_after_subtask(record.task_id)
+        return self.get_approval(approval_id)
+
     def put_execution(self, handle: ExecutionHandle) -> ExecutionHandle:
         return self.storage.upsert_execution(handle)
 
@@ -1127,9 +1275,35 @@ class AgentConnectService:
         return self.storage.executions_for(entity_type, entity_id)
 
     def update_execution(self, handle_id: str, **fields: Any) -> None:
-        if "state" in fields and hasattr(fields["state"], "value"):
-            fields["state"] = fields["state"].value
-        self.storage.update_execution(handle_id, updated_at=self._now(), **fields)
+        """The one funnel every execution-state writer (`DirectExecutionBackend`,
+        the Temporal client, `cancel_subtask`) calls. A `state` field is routed
+        through the `execution_state` authority's permissive `converge()`
+        mirror (never raises — an execution handle is a best-effort mirror,
+        not a strict pipeline); every other field is a plain passthrough.
+        `handle_id` may be the handle's own id OR its `workflow_id` (mirrors
+        `SqliteStorage.update_execution`'s ``WHERE handle_id=? OR
+        workflow_id=?``) — resolved to the real `handle_id` first, since the
+        authority's writer keys strictly on the primary key.
+        """
+        if "state" not in fields:
+            self.storage.update_execution(handle_id, updated_at=self._now(), **fields)
+            return
+        state = fields.pop("state")
+        state_enum = state if isinstance(state, ExecutionState) else ExecutionState(state)
+        resolved = self.storage.get_execution(handle_id)
+        if resolved is None:
+            # Unknown handle (e.g. a dead workflow server's stray late signal):
+            # nothing to transition. Preserve any other fields as a no-op
+            # passthrough exactly as before (matches `OR workflow_id=?`
+            # matching nothing -> zero rows affected).
+            if fields:
+                self.storage.update_execution(handle_id, updated_at=self._now(), **fields)
+            return
+        extra = dict(fields)
+        extra["updated_at"] = self._now()
+        self._execution_state_authority.converge(
+            resolved.handle_id, state_enum, actor="system", extra_fields=extra,
+        )
 
     def _signal_entity(
         self, entity_type: str, entity_id: str, name: str, payload: dict[str, Any]
@@ -1147,15 +1321,35 @@ class AgentConnectService:
         subtask = self._require_subtask(subtask_id)
         return SubtaskDetail(subtask=subtask, runs=self.storage.list_runs(subtask_id))
 
-    def cancel_subtask(self, subtask_id: str) -> None:
+    def cancel_subtask(self, subtask_id: str) -> CancelResult:
+        """Cancel a subtask. Converged cancel semantic
+        (docs/CONSISTENCY_REVIEW.md adjudication): cancelling an already-
+        terminal subtask is a no-op success — no `Conflict` — the same
+        meaning `cancel_task` now shares. An unknown id still raises
+        `NotFound`. Returns the authority's `CancelResult` so surfaces that
+        must SAY whether anything actually changed (`cancel_agent`'s wire
+        shape) can report it without re-reading — protocol adapters that
+        only need the side effect ignore the return value.
+        """
         subtask = self._require_subtask(subtask_id)
-        if subtask.status in subtasks_policy.TERMINAL:
-            raise Conflict(f"subtask {subtask_id} is already {subtask.status.value}")
         now = self._now()
+        try:
+            result = self._subtask_status_authority.cancel(
+                subtask_id, cancelled=SubtaskStatus.cancelled, actor="system",
+                task_id=subtask.parent_task_id, extra_fields={"updated_at": now},
+            )
+        except EntityNotFound:
+            raise NotFound(f"unknown subtask {subtask_id!r}") from None
+        if result.already_terminal:
+            return result
         live = [
             h for h in self.storage.executions_for("subtask", subtask_id)
             if h.state in _LIVE_EXECUTION_STATES
         ]
+        # Every LIVE run row (not just one) is cancelled through the
+        # `run_status` authority's idempotent `cancel()` — closes the
+        # previously-unguarded loop where two concurrent cancels of the same
+        # subtask could each try to double-write the same run row.
         for run in self.storage.list_runs(subtask_id):
             if run.status is RunStatus.running:
                 if subtask.assigned_worker:
@@ -1163,25 +1357,29 @@ class AgentConnectService:
                         self.registry.get(subtask.assigned_worker).cancel(run.id)
                     except NotFound:
                         pass
-                self.storage.update_run(
-                    run.id, status=RunStatus.cancelled.value, finished_at=now
+                self._run_status_authority.cancel(
+                    run.id, cancelled=RunStatus.cancelled, actor="system",
+                    task_id=subtask.parent_task_id, extra_fields={"finished_at": now},
                 )
-        # Mark the ledger terminal FIRST, then tell the backend. Ordering matters:
-        # a backend whose cancel() calls back into the service must find a
-        # terminal subtask and stop, rather than recurse.
-        self.storage.update_subtask(
-            subtask_id, status=SubtaskStatus.cancelled.value, updated_at=now
-        )
+        # The ledger was already marked terminal above (before telling the
+        # backend). Ordering matters: a backend whose cancel() calls back
+        # into the service must find a terminal subtask and stop, rather than
+        # recurse.
         for handle in live:
-            self.storage.update_execution(
-                handle.handle_id, state=ExecutionState.cancelled.value, updated_at=now
+            self._execution_state_authority.converge(
+                handle.handle_id, ExecutionState.cancelled, actor="system",
+                task_id=subtask.parent_task_id, extra_fields={"updated_at": now},
             )
             try:
                 self.execution.cancel(handle.handle_id)
             except Exception as exc:  # a dead workflow server must not strand the ledger
                 _log.warning("execution cancel(%s) failed: %s", handle.handle_id, exc)
+        self._observe(EventType.subtask_cancelled, task_id=subtask.parent_task_id,
+                      subtask_id=subtask_id, delegation_id=subtask.delegation_id,
+                      agent_role="worker", outcome=ObservationOutcome.cancelled)
         self._close_observation_handles("subtask", subtask_id, ObservationOutcome.cancelled)
         self._settle_parent_after_subtask(subtask.parent_task_id)
+        return result
 
     def explain_route(self, subtask_id: str) -> RouteExplanation:
         subtask = self._require_subtask(subtask_id)
@@ -1230,8 +1428,12 @@ class AgentConnectService:
         )
 
         if explanation.selected_worker is not None:
-            self.storage.update_subtask(
-                subtask.id, status=SubtaskStatus.queued.value, updated_at=now
+            # `transition()`'s current==dst no-op covers the idempotent replay
+            # (subtask already `queued`); a real needs_approval -> queued edge
+            # goes through the normal FSM check.
+            self._subtask_status_authority.transition(
+                subtask.id, SubtaskStatus.queued, actor="router", task_id=subtask.parent_task_id,
+                extra_fields={"updated_at": now},
             )
             self._observe(EventType.subtask_routed, task_id=subtask.parent_task_id,
                           subtask_id=subtask.id, delegation_id=subtask.delegation_id,
@@ -1246,8 +1448,9 @@ class AgentConnectService:
             return explanation
 
         if explanation.needs_approval:
-            self.storage.update_subtask(
-                subtask.id, status=SubtaskStatus.needs_approval.value, updated_at=now
+            self._subtask_status_authority.transition(
+                subtask.id, SubtaskStatus.needs_approval, actor="router",
+                task_id=subtask.parent_task_id, extra_fields={"updated_at": now},
             )
             self._advance_task(
                 subtask.parent_task_id, TaskStatus.needs_approval, _TO_NEEDS_APPROVAL
@@ -1256,8 +1459,9 @@ class AgentConnectService:
                 self._create_approval(subtask, explanation)
             return explanation
 
-        self.storage.update_subtask(
-            subtask.id, status=SubtaskStatus.failed.value, updated_at=now
+        self._subtask_status_authority.transition(
+            subtask.id, SubtaskStatus.failed, actor="router", task_id=subtask.parent_task_id,
+            extra_fields={"updated_at": now},
         )
         self.record_attempt(
             subtask.parent_task_id,
@@ -1293,19 +1497,20 @@ class AgentConnectService:
         caps = worker.capabilities()
         now = self._now()
 
-        # Atomic claim (queued -> running) BEFORE any slow work: a single
-        # guarded UPDATE (the WorkQueue's claim pattern) so two concurrent
-        # run_subtask calls — a Temporal activity retry racing the original, two
-        # transports driving the same subtask — can never both pass a plain
-        # read-check during the governor round-trip and double-execute the
-        # worker's side effects. The loser gets a typed Conflict, mirroring
-        # WorkQueue's fenced lease_lost.
-        claimed = self.storage.update_subtask_if_status(
-            subtask.id, (SubtaskStatus.queued.value,),
-            status=SubtaskStatus.running.value,
-            assigned_worker=caps.worker_id, updated_at=now,
+        # Atomic claim (queued -> running) BEFORE any slow work: the
+        # `subtask_status` authority's `advance()` verb (the WorkQueue claim
+        # pattern, generalized) so two concurrent run_subtask calls — a
+        # Temporal activity retry racing the original, two transports driving
+        # the same subtask — can never both pass a plain read-check during
+        # the governor round-trip and double-execute the worker's side
+        # effects. The loser gets a typed Conflict, mirroring WorkQueue's
+        # fenced lease_lost.
+        claimed = self._subtask_status_authority.advance(
+            subtask.id, SubtaskStatus.running, only_from=frozenset({SubtaskStatus.queued}),
+            actor=caps.worker_id, task_id=subtask.parent_task_id,
+            extra_fields={"assigned_worker": caps.worker_id, "updated_at": now},
         )
-        if not claimed:
+        if claimed is None:
             live = self._require_subtask(subtask.id)
             raise Conflict(
                 f"subtask {subtask.id} is {live.status.value}; "
@@ -1411,13 +1616,16 @@ class AgentConnectService:
         # must NOT resurrect it to succeeded/failed or attach a result artifact.
         # cancelled is terminal and final; the late result is recorded as an
         # attempt (audit) and otherwise discarded.
-        landed = self.storage.update_subtask_if_status(
-            subtask.id, (SubtaskStatus.running.value,),
-            status=(SubtaskStatus.succeeded if succeeded else SubtaskStatus.failed).value,
-            result_artifact_id=artifact_ids[0] if artifact_ids else None,
-            updated_at=now,
+        landed_status = SubtaskStatus.succeeded if succeeded else SubtaskStatus.failed
+        landed = self._subtask_status_authority.advance(
+            subtask.id, landed_status, only_from=frozenset({SubtaskStatus.running}),
+            actor=worker_id, task_id=subtask.parent_task_id,
+            extra_fields={
+                "result_artifact_id": artifact_ids[0] if artifact_ids else None,
+                "updated_at": now,
+            },
         )
-        if not landed:
+        if landed is None:
             live = self._require_subtask(subtask.id)
             self.record_attempt(
                 subtask.parent_task_id,
@@ -1431,13 +1639,15 @@ class AgentConnectService:
                 ),
             )
             return live
-        self.storage.update_run_if_status(
-            run.id, (RunStatus.running.value,),
-            status=(RunStatus.succeeded if succeeded else RunStatus.failed).value,
-            finished_at=now,
-            output_artifact_id=artifact_ids[0] if artifact_ids else None,
-            metrics=result.metrics,
-            error=result.error,
+        run_status = RunStatus.succeeded if succeeded else RunStatus.failed
+        self._run_status_authority.advance(
+            run.id, run_status, only_from=frozenset({RunStatus.running}),
+            actor=worker_id, task_id=subtask.parent_task_id,
+            extra_fields={
+                "finished_at": now,
+                "output_artifact_id": artifact_ids[0] if artifact_ids else None,
+                "metrics": result.metrics, "error": result.error,
+            },
         )
         summary = result.summary or ("Worker succeeded" if succeeded else "Worker failed")
         if result.warnings:
@@ -1493,7 +1703,8 @@ class AgentConnectService:
         """Refuse a subtask whose declared tool set the governor denied.
 
         The subtask never runs: no worker is spawned, no run row is created, no
-        artifact is written. It moves ``queued -> failed`` (a valid transition) with
+        artifact is written. It moves ``running -> failed`` (the atomic claim
+        above already advanced it to `running`; a valid transition) with
         an attempt recorded so the refusal is durable in the ledger, and a
         ``subtask.denied`` observation carrying the blocking tool and whether the deny
         was a policy rule or a fail-closed outage.
@@ -1504,9 +1715,15 @@ class AgentConnectService:
         )
         if authz.decision and authz.decision.reason:
             reason = f"{reason}: {authz.decision.reason[:160]}"
-        subtasks_policy.check_transition(subtask, SubtaskStatus.failed)
-        self.storage.update_subtask(
-            subtask.id, status=SubtaskStatus.failed.value, updated_at=now,
+        # `advance()`, not the strict `transition()`: a concurrent
+        # `cancel_subtask` can land in the window between the atomic
+        # queued->running claim (above, in `_execute`) and this write — the
+        # governor's running->failed write must be REFUSED (audited) in that
+        # case, not raise and not resurrect the cancelled subtask.
+        self._subtask_status_authority.advance(
+            subtask.id, SubtaskStatus.failed, only_from=frozenset({SubtaskStatus.running}),
+            actor=worker_id, task_id=subtask.parent_task_id,
+            extra_fields={"updated_at": now},
         )
         self.record_attempt(
             subtask.parent_task_id,
@@ -1540,7 +1757,11 @@ class AgentConnectService:
             if s.status is SubtaskStatus.needs_approval
         ]
         if not waiting:
-            self._touch(task_id, status=TaskStatus.in_progress.value)
+            self._task_status_authority.advance(
+                task_id, TaskStatus.in_progress,
+                only_from=frozenset({TaskStatus.needs_approval}),
+                actor="system", task_id=task_id, extra_fields={"updated_at": self._now()},
+            )
 
     # -------------------------------------------------------------- handoff
     def get_handoff_summary(
@@ -1860,15 +2081,21 @@ class AgentConnectService:
         entity_type, row = self._handle_for_entity(entity_id)
         result: dict[str, Any] = {"entity_id": entity_id, "entity_type": entity_type}
         # An already-terminal entity cannot be re-cancelled, but its live pane may
-        # still linger (remain-on-exit). Swallow the Conflict and still reap the pane
-        # below — "cancel" from the operator's view means "stop watching this".
+        # still linger (remain-on-exit). Report that truthfully and still reap the
+        # pane below — "cancel" from the operator's view means "stop watching this".
         if entity_type == "subtask":
-            try:
-                self.cancel_subtask(entity_id)
-                result["cancelled"] = True
-            except Conflict as exc:
+            # `cancel_subtask` no longer raises `Conflict` for an already-
+            # terminal subtask (converged idempotent cancel), so the wire shape
+            # is built from the authority's `CancelResult` instead: the
+            # pre-authority contract — `cancelled: false` plus the exact legacy
+            # detail string — is preserved, not silently flipped to a fake
+            # `cancelled: true` for a subtask this call did not change.
+            res = self.cancel_subtask(entity_id)
+            if res.already_terminal:
                 result["cancelled"] = False
-                result["detail"] = str(exc)
+                result["detail"] = f"subtask {entity_id} is already {res.state.value}"
+            else:
+                result["cancelled"] = True
         elif entity_type == "session":
             try:
                 self.end_shell(entity_id, exit_code=130)
@@ -2283,9 +2510,16 @@ class AgentConnectService:
         session = self._require_session(session_id)
         if session.status not in (SessionStatus.prepared, SessionStatus.running):
             raise Conflict(f"session {session_id} is {session.status.value}")
-        self.storage.update_session(
-            session_id, status=SessionStatus.running.value, shell_command=shell_command
-        )
+        if session.status is SessionStatus.prepared:
+            self._session_status_authority.transition(
+                session_id, SessionStatus.running, actor=session.manager_id,
+                task_id=session.task_id, extra_fields={"shell_command": shell_command},
+            )
+        else:
+            # Already `running`: restarting the shell command is not itself a
+            # state transition (the guard above already accepts this case) —
+            # a plain field write, never touching `status`.
+            self.storage.update_session(session_id, shell_command=shell_command)
         self.record_event(
             session.task_id, "shell_started", session.manager_id,
             {"session_id": session_id, "command": shell_command},
@@ -2299,7 +2533,10 @@ class AgentConnectService:
         session = self._require_session(session_id)
         now = self._now()
         status = SessionStatus.ended if exit_code == 0 else SessionStatus.failed
-        self.storage.update_session(session_id, status=status.value, ended_at=now)
+        self._session_status_authority.converge(
+            session_id, status, actor=session.manager_id, task_id=session.task_id,
+            extra_fields={"ended_at": now},
+        )
         # The token dies with the shell. A leaked `.env.agentconnect` is then inert.
         self.storage.revoke_tokens_for_session(session_id, now)
         self.record_event(
@@ -2668,7 +2905,31 @@ class AgentConnectService:
                 + "\n".join(f"- {p}" for p in report.problems)
             )
 
-        self._touch(task_id, status=TaskStatus.succeeded.value)
+        # The write IS the gate: `advance` applies queued/in_progress/... ->
+        # succeeded atomically inside the locked span and returns None when the
+        # fresh current was already terminal — INCLUDING already `succeeded`.
+        # The entry precheck above is only a fast path over a stale snapshot;
+        # two interleaved complete_task calls can both pass it, and the strict
+        # `transition()` verb treats current==dst as a silent no-op success,
+        # which would let the loser fall through and re-fire the completion
+        # side effects (events, observability, external completion_hooks).
+        # Exactly ONE caller gets a non-None result here; every other lands in
+        # Conflict below with no side effects. This also closes the
+        # complete-after-terminal gap: a task a concurrent actor already drove
+        # to CANCELLED/FAILED can no longer be completed out from under that —
+        # `force` bypasses `audit_task`, never the FSM.
+        landed = self._task_status_authority.advance(
+            task_id, TaskStatus.succeeded, only_from=_COMPLETABLE_TASK_STATUSES,
+            actor=completed_by, task_id=task_id,
+            extra_fields={"updated_at": self._now()},
+        )
+        if landed is None:
+            stored = self._require_task(task_id).status
+            if stored is TaskStatus.succeeded:
+                raise Conflict(f"task {task_id} is already succeeded")
+            raise Conflict(
+                f"task {task_id} is {stored.value}; cannot be marked succeeded"
+            )
         self.record_event(
             task_id, "task_completed", completed_by,
             {"forced": force, "warnings": report.warnings,
@@ -2730,10 +2991,21 @@ class AgentConnectService:
                 continue
             if session.started_at > cutoff:
                 continue
-            self.storage.update_session(
-                session.id, status=SessionStatus.abandoned.value, ended_at=self._now()
-            )
+            try:
+                self._session_status_authority.transition(
+                    session.id, SessionStatus.abandoned, actor="stale-sweep",
+                    task_id=session.task_id, extra_fields={"ended_at": self._now()},
+                )
+            except TransitionRefused:
+                # A concurrent sweep (reconcile_orphans' session loop drives the
+                # same authority) already abandoned this session — the loser's
+                # refusal was audited; nothing left to do here.
+                continue
             self.revoke_session_tokens(session.id)
+            self._observe(EventType.session_abandoned, task_id=session.task_id,
+                          session_id=session.id, delegation_id=session.delegation_id,
+                          agent_id="stale-sweep", agent_role=session.mode.value,
+                          outcome=ObservationOutcome.failed)
             abandoned.append(session.id)
         return abandoned
 
@@ -2818,10 +3090,17 @@ class AgentConnectService:
             meta["reconciled"] = {"at": now, "reason": reason,
                                   "detected_by": entry["detected_by"],
                                   "prior_status": session.status.value}
-            self.storage.update_session(
-                session.id, status=SessionStatus.abandoned.value, ended_at=now,
-                metadata=meta,
-            )
+            try:
+                self._session_status_authority.transition(
+                    session.id, SessionStatus.abandoned, actor="reconcile",
+                    task_id=session.task_id,
+                    extra_fields={"ended_at": now, "metadata": meta},
+                )
+            except TransitionRefused:
+                # `abandon_stale_sessions` (a distinct sweep driving the SAME
+                # authority) already abandoned this session concurrently —
+                # its refusal is audited; nothing left to reconcile.
+                continue
             self.revoke_session_tokens(session.id)
             self._close_observation_handles("session", session.id,
                                              ObservationOutcome.failed)
@@ -2857,16 +3136,22 @@ class AgentConnectService:
             metrics = dict(run.metrics or {})
             metrics["reconciled"] = {"at": now, "reason": reason,
                                      "detected_by": entry["detected_by"]}
-            self.storage.update_run(
-                run.id, status=RunStatus.failed.value, finished_at=now,
-                error=f"reconciled: {reason}", metrics=metrics,
+            # The run write is now guarded (closes finding #3: it was
+            # previously a bare, unfenced UPDATE with no CAS at all).
+            self._run_status_authority.advance(
+                run.id, RunStatus.failed, only_from=frozenset({RunStatus.running}),
+                actor="reconcile", task_id=(subtask.parent_task_id if subtask else None),
+                extra_fields={"finished_at": now, "error": f"reconciled: {reason}",
+                             "metrics": metrics},
             )
             if subtask is not None and subtask.status is SubtaskStatus.running:
-                flipped = self.storage.update_subtask_if_status(
-                    run.subtask_id, (SubtaskStatus.running.value,),
-                    status=SubtaskStatus.failed.value, updated_at=now,
+                flipped = self._subtask_status_authority.advance(
+                    run.subtask_id, SubtaskStatus.failed,
+                    only_from=frozenset({SubtaskStatus.running}),
+                    actor="reconcile", task_id=subtask.parent_task_id,
+                    extra_fields={"updated_at": now},
                 )
-                if flipped:
+                if flipped is not None:
                     # Crash-reconcile must not diverge from the normal terminal-
                     # failure path (_record_result): settle the parent and
                     # cascade-fail any sibling still `blocked` on this subtask —

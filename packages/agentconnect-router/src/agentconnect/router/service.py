@@ -45,7 +45,8 @@ from ..common.schemas import (
     TaskSummary,
     WorkerResult,
 )
-from ..common.state import TERMINAL_STATES, assert_transition
+from ..common.state import TASK_STATE_VOCAB
+from ..common.transitions import EntityNotFound, TransitionAuthority, TransitionRefused
 from ..common.tokens import estimate_io_tokens
 from ..common.workqueue import WorkQueue
 from .gateway import GatewayResult, ProviderGateway
@@ -129,6 +130,17 @@ class RouterService:
     # (bring-your-own AgentRuntime) wires its own governance.
     tool_governor: Optional[Any] = None
     governed_principal: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        # The one transition authority for Engine B's `task_state` column,
+        # shared with `WorkQueue`'s ticket-status mirror (`self.workqueue`'s
+        # `__init__` is handed this SAME instance, never a second one built
+        # from the same vocabulary — goal: one transition authority).
+        self._task_state_authority: TransitionAuthority = TransitionAuthority(
+            vocabulary=TASK_STATE_VOCAB, writer=self.memory.transition_task,
+        )
+        if self.workqueue is not None:
+            self.workqueue.bind_task_state_authority(self._task_state_authority)
 
     # ------------------------------------------------------------- factory
     @classmethod
@@ -495,24 +507,27 @@ class RouterService:
             return None
 
     def _transition(self, task_id: str, current: TaskState, dst: TaskState) -> TaskState:
-        """FSM-checked, terminal-safe state write.
+        """FSM-checked, terminal-safe state write — routed through the shared
+        ``TransitionAuthority`` (docs/CONSISTENCY_REVIEW.md: one transition
+        authority).
 
-        ``assert_transition`` validates against the caller's in-memory view; the
-        store write is additionally GUARDED against the live row (one atomic
-        ``UPDATE ... WHERE state NOT IN <terminal>``), because the in-memory
-        view can be stale: a concurrent ``cancel_task`` may have driven the task
-        to terminal CANCELLED mid-pipeline. In that case the write is refused
-        and :class:`TaskSuperseded` is raised — the pipeline stops, the
-        cancellation stands, and the caller returns the stored terminal summary.
+        ``current`` (the caller's in-memory view) is accepted for call-site
+        compatibility but is NOT what gates the write: the authority re-reads
+        the stored state fresh, inside its writer's lock, and validates
+        against THAT — never a caller-supplied value, which can be stale (read
+        outside the lock) and would otherwise produce a spurious refusal for a
+        legal concurrent write. A concurrent ``cancel_task`` that already drove
+        the task to terminal CANCELLED mid-pipeline still refuses this write —
+        :class:`TaskSuperseded` is raised — the pipeline stops, the
+        cancellation stands, and the caller returns the stored terminal
+        summary.
         """
-        assert_transition(current, dst)
-        exclude = {s.value for s in TERMINAL_STATES if s is not dst}
-        updated, stored = self.memory.update_task_guarded(
-            task_id, exclude_states=exclude, state=dst.value
-        )
-        if not updated:
-            raise TaskSuperseded(task_id, stored)
-        return dst
+        try:
+            return self._task_state_authority.transition(
+                task_id, dst, actor="router", task_id=task_id,
+            )
+        except TransitionRefused as exc:
+            raise TaskSuperseded(task_id, exc.stored) from exc
 
     # --------------------------------------------------------- MCP: submit_task
     def submit_task(self, submission: TaskSubmission) -> TaskSummary:
@@ -1448,40 +1463,39 @@ class RouterService:
         return {"task_id": task_id, "priority": "urgent", "note": "Priority raised; requeue on next dispatch."}
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
-        """Cancel a non-terminal task. CANCELLED is terminal and FINAL: the
-        guarded pipeline writes (``_transition``) can never overwrite it, and
-        any work-queue tickets linked to this task are cancelled too so a pull
+        """Cancel a task. CANCELLED is terminal and FINAL: the guarded
+        pipeline writes (``_transition``) can never overwrite it, and any
+        work-queue tickets linked to this task are cancelled too so a pull
         worker cannot claim (or successfully report) work for it afterwards.
 
-        Cancelling an already-terminal task is an ERROR-shaped result
-        (``{"error": "already_terminal", ...}``) — the same "cancel-after-
-        terminal is a conflict" semantic AgentConnectService.cancel_subtask
-        raises as ``Conflict``, expressed in this surface's typed-dict error
-        idiom — so callers of either engine can share one idempotency check.
+        Converged cancel semantic (docs/CONSISTENCY_REVIEW.md adjudication):
+        cancelling an already-terminal (or raced-to-terminal) task is a NO-OP
+        SUCCESS reporting the stored state — never error-shaped — the one
+        meaning both engines now share (mirrors ``WorkQueue.cancel_for_task``,
+        the only battle-tested shape of the three that used to exist). An
+        unknown task id is a different failure class and still returns
+        ``{"error": "task_not_found"}``.
         """
-        task = self.memory.get_task(task_id)
-        if task is None:
-            return {"error": "task_not_found"}
-        current = TaskState(task["state"])
-        if current in TERMINAL_STATES:
-            return {
-                "error": "already_terminal", "task_id": task_id, "state": current.value,
-                "note": "already terminal",
-            }
         try:
-            self._transition(task_id, current, TaskState.CANCELLED)
-        except TaskSuperseded as exc:
-            # Lost the race to another terminal writer between the read above
-            # and the guarded write.
+            result = self._task_state_authority.cancel(
+                task_id, cancelled=TaskState.CANCELLED, actor="router", task_id=task_id,
+            )
+        except EntityNotFound:
+            return {"error": "task_not_found"}
+        if result.already_terminal:
             return {
-                "error": "already_terminal", "task_id": task_id,
-                "state": exc.stored_state, "note": "already terminal",
+                "task_id": task_id, "state": result.state.value,
+                "already_terminal": True, "cancelled_tickets": [],
             }
         self.memory.update_task(task_id, summary="Cancelled by manager.")
         # Audit: cancellation is a state mutation like any other and must be
         # reconstructable from the task's log (previously the one unlogged
-        # terminal transition in this file).
-        self.memory.append_log(task_id, f"cancelled by manager (was {current.value})")
+        # terminal transition in this file). The authority already wrote its
+        # own generic transition audit row; this line preserves the exact
+        # legacy message existing tests/tooling grep for.
+        self.memory.append_log(
+            task_id, f"cancelled by manager (was {result.previous_state.value})"
+        )
         cancelled_tickets: list[str] = []
         if self.workqueue is not None:
             cancelled_tickets = self.workqueue.cancel_for_task(task_id)
@@ -1492,7 +1506,7 @@ class RouterService:
                 )
         return {
             "task_id": task_id, "state": TaskState.CANCELLED.value,
-            "cancelled_tickets": cancelled_tickets,
+            "already_terminal": False, "cancelled_tickets": cancelled_tickets,
         }
 
     # ----------------------------------------------------------- internals

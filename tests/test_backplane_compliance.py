@@ -974,15 +974,24 @@ def test_complete_refuses_a_task_whose_audit_fails(svc, task):
 
 
 def test_complete_marks_the_ledger_succeeded_then_updates_linear(svc, task):
+    # Mechanical update, no semantic change: `complete_task` now writes the
+    # ledger through `_task_status_authority.transition` (the one transition
+    # authority), not the bare `_touch` this spy used to hook — the assertion
+    # itself ("ledger before linear") is unchanged.
     order: list[str] = []
-    original = svc._touch
+    # (Second mechanical update: `complete_task` now drives the succeeded
+    # write through the atomic `advance` verb — the write IS the
+    # already-terminal gate — so the spy hooks `advance`, counting only the
+    # call that actually applied.)
+    original = svc._task_status_authority.advance
 
-    def spy_touch(task_id, **fields):
-        if fields.get("status") == "succeeded":
+    def spy_advance(entity_id, dst, **kwargs):
+        result = original(entity_id, dst, **kwargs)
+        if getattr(dst, "value", dst) == "succeeded" and result is not None:
             order.append("ledger")
-        original(task_id, **fields)
+        return result
 
-    svc._touch = spy_touch
+    svc._task_status_authority.advance = spy_advance
 
     def linear_hook(task_id: str) -> None:
         # Acceptance 13: by the time the tracker hears, the ledger already says so.

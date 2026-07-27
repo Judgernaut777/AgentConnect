@@ -93,9 +93,7 @@ class BackplaneActivities:
         elif decision == "denied":
             self.service.deny_subtask(record.subtask_id, decided_by or "human", reason)
         else:
-            self.service.storage.update_approval(
-                approval_id, status="expired", decided_at=self.service._now()
-            )
+            self.service.expire_approval(approval_id, actor=decided_by or "system")
         return self.service.get_approval(approval_id).model_dump(mode="json")
 
     # ------------------------------------------------------------ execution

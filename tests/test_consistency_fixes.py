@@ -125,14 +125,23 @@ def test_cancel_mid_flight_wins_over_completion():
     assert any("pipeline result discarded" in m for m in messages)
 
 
-def test_cancel_task_already_terminal_is_error_shaped_like_core_conflict():
+def test_cancel_task_already_terminal_is_noop_success():
+    """Converged semantic (docs/CONSISTENCY_REVIEW.md adjudication, goal item
+    1's explicit directive): cancel of an already-terminal task is a NO-OP
+    SUCCESS reporting the stored state, on both engines — never error-shaped.
+    This test used to pin the opposite ("core raises Conflict; router returns
+    a typed error"), a divergence the goal explicitly asks to converge away in
+    favor of the one shape already proven safe under concurrent/retried
+    callers (`WorkQueue.cancel_for_task`'s). Terminal-finality — the actual
+    safety property this test protects — is asserted below just as strictly:
+    the state is still reported as COMPLETE, never silently changed.
+    """
     svc = _router()
     summary = svc.submit_task(_submission())
     assert summary.status == TaskState.COMPLETE
     res = svc.cancel_task(summary.task_id)
-    # Converged semantic: cancel-after-terminal is an ERROR on both engines
-    # (core raises Conflict; the router returns its typed error dict).
-    assert res["error"] == "already_terminal"
+    assert "error" not in res
+    assert res["already_terminal"] is True
     assert res["state"] == "COMPLETE"
 
 
@@ -203,15 +212,26 @@ def _queue(mem=None):
     return mem, WorkQueue(mem, load_routing())
 
 
+def _force_state(mem, task_id, state):
+    """Test-only state seeding through the ONE legitimate `tasks.state` writer
+    (`transition_task`, the authority's LockedWriter). The old shortcut — a
+    bare `update_task` with a `state` keyword — is now rejected at runtime, exactly
+    so no production caller can flip the column outside the authority; tests
+    that need to TELEPORT a task into a scenario state (including deliberately
+    illegal jumps that simulate crash windows) hand-roll the decide closure."""
+    applied, stored = mem.transition_task(task_id, lambda _cur: ({"state": state}, None))
+    assert applied and stored == state
+
+
 def test_workqueue_report_cannot_resurrect_cancelled_task():
     mem, wq = _queue()
     task_id = mem.create_task({"task": "x"})
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
     ticket = wq.add(task="x", origin="t", privacy_class="public", payload="p",
                     task_id=task_id)
     got = wq.claim_next("worker-1", "local_only", capabilities=[])[0]
     # Another engine cancels the task while the lease is still valid.
-    mem.update_task(task_id, state="CANCELLED")
+    _force_state(mem, task_id, "CANCELLED")
 
     out = wq.report("worker-1", "local_only", ticket["ticket_id"],
                     got["lease_token"], {"status": "completed"})
@@ -224,11 +244,11 @@ def test_workqueue_report_cannot_resurrect_cancelled_task():
 def test_workqueue_reap_cannot_resurrect_cancelled_task():
     mem, wq = _queue()
     task_id = mem.create_task({"task": "x"})
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
     wq.add(task="x", origin="t", privacy_class="public", payload="p",
            task_id=task_id, max_attempts=1)
     wq.claim_next("worker-1", "local_only", capabilities=[], lease_seconds=1)
-    mem.update_task(task_id, state="CANCELLED")
+    _force_state(mem, task_id, "CANCELLED")
     wq.reap_expired(now=time.time() + 3600)  # attempts exhausted -> park path
     assert _task_state(mem, task_id) == "CANCELLED"
 
@@ -236,7 +256,7 @@ def test_workqueue_reap_cannot_resurrect_cancelled_task():
 def test_workqueue_task_state_transitions_are_audited():
     mem, wq = _queue()
     task_id = mem.create_task({"task": "x"})
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
     ticket = wq.add(task="x", origin="t", privacy_class="public", payload="p",
                     task_id=task_id)
     got = wq.claim_next("worker-1", "local_only", capabilities=[])[0]
@@ -273,7 +293,7 @@ def test_claim_gate_is_atomic_against_cancelled_task_even_if_ticket_open():
     mem, wq = _queue()
     task_id = mem.create_task({"task": "x"})
     wq.add(task="x", origin="t", privacy_class="public", payload="p", task_id=task_id)
-    mem.update_task(task_id, state="CANCELLED")
+    _force_state(mem, task_id, "CANCELLED")
     assert wq.claim_next("worker-1", "local_only", capabilities=[]) == []
 
 
@@ -680,12 +700,12 @@ def test_workqueue_report_records_tokens_and_cost_on_evaluation():
 
 # --------------------------------------------------------------------------- #
 # Low advisory: the task-state mirror self-heals after a crash between the
-# terminal ticket commit and _set_task_state.
+# terminal ticket commit and _mirror_task_state.
 # --------------------------------------------------------------------------- #
 def test_task_state_mirror_self_heals_on_report_retry_and_reap():
     mem, wq = _queue()
     task_id = mem.create_task({"task": "x"})
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
     ticket = wq.add(task="x", origin="t", privacy_class="public", payload="p",
                     task_id=task_id)
     got = wq.claim_next("worker-1", "local_only", capabilities=[])[0]
@@ -694,7 +714,7 @@ def test_task_state_mirror_self_heals_on_report_retry_and_reap():
     assert _task_state(mem, task_id) == "COMPLETE"
     # Simulate the crash window: the ticket-terminal commit landed but the task
     # mirror write was lost.
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
 
     # A retried report (idempotent 'already_reported') re-drives the mirror.
     out = wq.report("worker-1", "local_only", ticket["ticket_id"],
@@ -703,6 +723,6 @@ def test_task_state_mirror_self_heals_on_report_retry_and_reap():
     assert _task_state(mem, task_id) == "COMPLETE"
 
     # And so does the periodic reaper, with no report retry at all.
-    mem.update_task(task_id, state="RUNNING")
+    _force_state(mem, task_id, "RUNNING")
     wq.reap_expired(now=time.time())
     assert _task_state(mem, task_id) == "COMPLETE"
