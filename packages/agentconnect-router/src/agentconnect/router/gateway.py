@@ -32,6 +32,11 @@ class GatewayResult:
     model: str
 
 
+class GatewayError(RuntimeError):
+    """A live provider call failed. Deliberately carries only the provider id
+    and exception type — never the resolved secret or raw provider response."""
+
+
 class ProviderGateway:
     def __init__(
         self,
@@ -78,10 +83,16 @@ class ProviderGateway:
     def _call_cloud(self, cfg: ProviderConfig, req: GenerateRequest) -> GatewayResult:
         """Cloud call. Resolves the API key at call time and never returns it.
 
-        The call itself is delegated to LiteLLM (maintained multi-provider I/O),
-        and degrades to a deterministic stub when the SDK/network/credentials are
-        unavailable, so the pipeline stays exercisable offline. A production build
-        would remove the stub fallback and surface errors.
+        The call itself is delegated to LiteLLM (maintained multi-provider I/O).
+        The deterministic stub exists ONLY for the credential-less/offline case
+        (no resolvable key), so the pipeline stays exercisable offline. A LIVE
+        call that fails (network partition, auth failure, provider 500) is
+        FAIL-CLOSED: the error propagates — the same semantic as every other
+        dispatch failure — so the router records the task FAILED and reconciles
+        quota with status='failed'/zero tokens, instead of laundering an outage
+        into a fabricated 'completed' record with non-zero cost that poisons the
+        cost ledger and provider evaluations. The secret itself is never leaked
+        into the raised error (see GatewayError wrapping below).
         """
         try:
             api_key = self._secrets.resolve(cfg.secret_ref)  # noqa: F841  (used below, never logged)
@@ -91,9 +102,12 @@ class ProviderGateway:
         if api_key:
             try:
                 return self._call_via_litellm(cfg, req, api_key)
-            except Exception:
-                # Fall through to the deterministic stub rather than leaking why.
-                pass
+            except Exception as exc:
+                # Fail closed, without leaking the key: re-raise as a typed
+                # error naming provider + exception type only.
+                raise GatewayError(
+                    f"cloud call to {cfg.provider_id} failed: {type(exc).__name__}"
+                ) from exc
 
         text = f"[cloud-stub:{cfg.provider_id}/{req.model_id}] task {req.task_id} (no live call)."
         return GatewayResult(

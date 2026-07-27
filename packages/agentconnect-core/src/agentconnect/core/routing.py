@@ -57,6 +57,15 @@ class RoutePolicy(BaseModel):
     without an explicit human approval carrying its own ceiling."""
 
     max_cost_usd: float = 0.0
+    #: Cumulative spend cap across ALL recorded runs (the RouterService engine's
+    #: BudgetManager semantic, narrowed): when set, routing fails the
+    #: ``budget_allowed`` gate once actual recorded spend plus this subtask's
+    #: estimate would exceed it — closing the "each call individually under the
+    #: per-call ceiling, cumulative spend unbounded and never summed" gap.
+    #: ``None`` keeps the historic per-call-only behavior; a period/windowed
+    #: budget (BudgetManager convergence) is DEFERRED — see
+    #: docs/CONSISTENCY_REVIEW.md.
+    max_total_cost_usd: Optional[float] = None
 
 
 class RejectedWorker(BaseModel):
@@ -135,6 +144,7 @@ def _preferred_match(subtask: Subtask, caps: WorkerCapabilities) -> bool:
 def _gate_failure(
     subtask: Subtask, caps: WorkerCapabilities, estimate: WorkerEstimate,
     healthy: bool, health_detail: str, ceiling: float,
+    policy: Optional[RoutePolicy] = None, spent_usd: float = 0.0,
 ) -> Optional[tuple[str, str]]:
     """First failing gate as ``(gate, human_reason)``, or None if all pass."""
     if not healthy:
@@ -161,6 +171,18 @@ def _gate_failure(
         return (
             "budget_allowed",
             f"estimated ${estimate.estimated_cost_usd:.4f} exceeds ceiling ${ceiling:.4f}",
+        )
+    if (
+        policy is not None
+        and policy.max_total_cost_usd is not None
+        and estimate.estimated_cost_usd > 0
+        and spent_usd + estimate.estimated_cost_usd > policy.max_total_cost_usd
+    ):
+        return (
+            "budget_allowed",
+            f"cumulative spend ${spent_usd:.4f} + estimated "
+            f"${estimate.estimated_cost_usd:.4f} exceeds total cap "
+            f"${policy.max_total_cost_usd:.4f}",
         )
     if caps.requires_approval and not subtask.approved_by:
         return (
@@ -217,9 +239,14 @@ def _local_estimate(worker: WorkerAdapter, subtask: Subtask) -> Optional[dict[st
 
 
 def route(
-    subtask: Subtask, registry: WorkerRegistry, policy: Optional[RoutePolicy] = None
+    subtask: Subtask, registry: WorkerRegistry, policy: Optional[RoutePolicy] = None,
+    spent_usd: float = 0.0,
 ) -> RouteExplanation:
-    """Filter, score, select — and explain, whatever the outcome."""
+    """Filter, score, select — and explain, whatever the outcome.
+
+    ``spent_usd`` is the cumulative actual spend already recorded across runs
+    (Storage.total_run_cost_usd), gated against ``policy.max_total_cost_usd``
+    when that cap is set."""
     policy = policy or RoutePolicy()
     ceiling = _effective_ceiling(subtask, policy)
     explanation = RouteExplanation(subtask_id=subtask.id)
@@ -232,7 +259,8 @@ def route(
         health = worker.health()
         estimate = worker.estimate(subtask, None)
         failure = _gate_failure(
-            subtask, caps, estimate, health.available, health.detail, ceiling
+            subtask, caps, estimate, health.available, health.detail, ceiling,
+            policy=policy, spent_usd=spent_usd,
         )
         if failure is not None:
             gate, reason = failure

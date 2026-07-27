@@ -15,7 +15,7 @@ import pytest
 
 from agentconnect.common.config import ProviderConfig
 from agentconnect.common.schemas import GenerateRequest
-from agentconnect.router.gateway import ProviderGateway
+from agentconnect.router.gateway import GatewayError, ProviderGateway
 
 
 class _FakeSecrets:
@@ -113,14 +113,20 @@ def test_cloud_falls_back_to_stub_without_a_key():
     assert called["n"] == 0  # no key -> LiteLLM is never called
 
 
-def test_cloud_stub_fallback_when_litellm_raises():
+def test_cloud_live_call_failure_is_fail_closed_and_never_a_fabricated_success():
     def boom(**kwargs):
-        raise RuntimeError("provider 500")
+        raise RuntimeError("provider 500 carrying sk-x maybe")
 
     gw = ProviderGateway(secret_resolver=_FakeSecrets("sk-x"), completion_fn=boom)
-    result = gw.call(_cloud_cfg(), _req())
-    # A live-call failure degrades to the deterministic stub, never leaks the reason.
-    assert result.output_text.startswith("[cloud-stub:")
+    # A LIVE call that fails must raise (so the router records FAILED and
+    # reconciles quota as a failure) — never degrade to the stub, which would
+    # launder an outage into a 'completed' record with fabricated cost.
+    with pytest.raises(GatewayError) as exc_info:
+        gw.call(_cloud_cfg(), _req())
+    # The typed error names provider + exception type only — never the secret
+    # or the raw provider response.
+    assert "openai_paid" in str(exc_info.value)
+    assert "sk-x" not in str(exc_info.value)
 
 
 def test_cloud_real_litellm_via_mock_response():

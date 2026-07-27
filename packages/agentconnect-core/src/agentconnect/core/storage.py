@@ -22,7 +22,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from .execution import ExecutionHandle
 from .models import (
@@ -615,6 +615,34 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(f"UPDATE subtasks SET {cols} WHERE id=?", (*fields.values(), subtask_id))
 
+    def update_subtask_if_status(
+        self, subtask_id: str, expected_statuses: Iterable[str], **fields: Any
+    ) -> bool:
+        """Compare-and-set subtask update: one guarded ``UPDATE ... WHERE status
+        IN (...)`` so the status check and the write are atomic (the WorkQueue's
+        claim pattern). Returns True iff this call won the transition. Closes
+        the TOCTOU windows where (a) two concurrent ``run_subtask`` calls both
+        pass the plain read-check and double-execute the worker, and (b) a stale
+        in-flight ``worker.run()`` result resurrects a subtask a concurrent
+        ``cancel_subtask`` already drove terminal (zombie write)."""
+        if not fields:
+            return False
+        if "route_reason" in fields:
+            fields["route_reason_json"] = _j(fields.pop("route_reason"))
+        if "metadata" in fields:
+            fields["metadata_json"] = _j(fields.pop("metadata"))
+        if "depends_on" in fields:
+            fields["depends_on_json"] = _j(fields.pop("depends_on"))
+        expected = [str(s) for s in expected_statuses]
+        ph = ",".join("?" for _ in expected) or "''"
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.transaction() as c:
+            cur = c.execute(
+                f"UPDATE subtasks SET {cols} WHERE id=? AND status IN ({ph})",
+                (*fields.values(), subtask_id, *expected),
+            )
+            return cur.rowcount == 1
+
     def list_subtasks(self, task_id: str) -> list[Subtask]:
         with self._lock:
             rows = self._conn.execute(
@@ -663,6 +691,37 @@ class SqliteStorage:
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE worker_runs SET {cols} WHERE id=?", (*fields.values(), run_id))
+
+    def update_run_if_status(
+        self, run_id: str, expected_statuses: Iterable[str], **fields: Any
+    ) -> bool:
+        """Compare-and-set run update (see ``update_subtask_if_status``).
+        Returns True iff the guarded write matched."""
+        if not fields:
+            return False
+        if "metrics" in fields:
+            fields["metrics_json"] = _j(fields.pop("metrics"))
+        expected = [str(s) for s in expected_statuses]
+        ph = ",".join("?" for _ in expected) or "''"
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.transaction() as c:
+            cur = c.execute(
+                f"UPDATE worker_runs SET {cols} WHERE id=? AND status IN ({ph})",
+                (*fields.values(), run_id, *expected),
+            )
+            return cur.rowcount == 1
+
+    def total_run_cost_usd(self) -> float:
+        """Cumulative actual spend recorded across ALL worker runs (the
+        ``estimated_cost_usd`` metric each paid worker reports after really
+        running). Feeds the cumulative spend cap in routing — per-call estimate
+        gating alone lets unbounded spend accrue one approved call at a time."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(CAST(json_extract(metrics_json,"
+                " '$.estimated_cost_usd') AS REAL)), 0.0) AS total FROM worker_runs"
+            ).fetchone()
+        return float(row["total"] or 0.0)
 
     def list_runs(self, subtask_id: str) -> list[WorkerRun]:
         with self._lock:

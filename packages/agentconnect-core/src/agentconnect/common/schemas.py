@@ -143,6 +143,12 @@ class Usage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     model_id: Optional[str] = None
+    #: Self-reported dollar cost of the run (a pull worker paying for its own
+    #: model has no other channel into the ledger). Recorded on the task's
+    #: evaluation for observability/reconciliation — it is NOT billed against a
+    #: router-side budget (the worker's spend is its own), and being
+    #: self-reported it is never trusted as an authorization input.
+    cost_usd: Optional[float] = None
 
 
 class SubTask(BaseModel):

@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS work_queue (
     allowed_tiers   TEXT,               -- json cache; NOT trusted for the claim
     required_capabilities TEXT,         -- json list; matching filter, not a gate
     priority        TEXT DEFAULT 'normal',
-    status          TEXT NOT NULL,      -- open|claimed|in_review|done|parked|failed
+    status          TEXT NOT NULL,      -- open|claimed|in_review|done|parked|failed|cancelled
     assignee        TEXT,               -- advisory router hint; never enforced
     lease_holder    TEXT,
     lease_tier      TEXT,
@@ -245,6 +245,52 @@ class SharedMemory:
         self._conn.execute(
             f"UPDATE tasks SET {cols} WHERE task_id=?", (*fields.values(), task_id)
         )
+        self._conn.commit()
+
+    @_synchronized
+    def update_task_guarded(
+        self, task_id: str, *, exclude_states: Iterable[str], **fields: Any
+    ) -> tuple[bool, Optional[str]]:
+        """Compare-and-set task update: apply ``fields`` only when the stored
+        ``state`` is NOT in ``exclude_states`` — a single guarded ``UPDATE``, so
+        the check and the write are one atomic statement (mirrors the work
+        queue's guarded claim). Returns ``(updated, stored_state)`` where
+        ``stored_state`` is the row's state after the call (the pre-existing
+        state on refusal, the new one on success, ``None`` if the task does not
+        exist). This is how writers honor terminal-state finality: a concurrent
+        ``cancel_task`` (terminal CANCELLED) can never be silently overwritten
+        by a slower pipeline's completion write.
+        """
+        if not fields:
+            return False, None
+        if "risks" in fields and not isinstance(fields["risks"], str):
+            fields["risks"] = json.dumps(fields["risks"])
+        fields["updated_at"] = _now()
+        excluded = [str(s) for s in exclude_states]
+        cols = ", ".join(f"{k}=?" for k in fields)
+        ph = ",".join("?" for _ in excluded) or "''"
+        cur = self._conn.execute(
+            f"UPDATE tasks SET {cols} WHERE task_id=? AND state NOT IN ({ph})",
+            (*fields.values(), task_id, *excluded),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT state FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        return cur.rowcount == 1, (row["state"] if row is not None else None)
+
+    @_synchronized
+    def delete_task_cascade(self, task_id: str) -> None:
+        """Remove a task row and its dependent ledger rows (artifacts, logs,
+        routing decisions). ONLY for unwinding rows minted by a call that lost
+        an idempotency race (e.g. ``enqueue_task`` re-sent with a ``dedup_key``
+        that already owns a ticket): such rows describe a task that was never
+        exposed to any caller, and no GC sweep exists — mirrors
+        ``WorkQueue.add``'s orphan-artifact cleanup. Never call this on a task
+        another actor may reference."""
+        for table in ("artifacts", "logs", "routing_decisions"):
+            self._conn.execute(f"DELETE FROM {table} WHERE task_id=?", (task_id,))
+        self._conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
         self._conn.commit()
 
     def get_task(self, task_id: str) -> Optional[dict[str, Any]]:

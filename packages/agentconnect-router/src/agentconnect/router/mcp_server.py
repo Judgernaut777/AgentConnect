@@ -191,22 +191,47 @@ def build_mcp_server(
     *,
     host: Optional[str] = None,
     port: Optional[int] = None,
+    reaper_interval: Optional[float] = None,
 ):
     """Construct the FastMCP server bound to a RouterService.
 
     ``host``/``port`` are only meaningful for the SSE / streamable-HTTP transports
     (the shared multi-harness instance, Model B); they are ignored under stdio.
+
+    ``reaper_interval``: seconds between work-queue lease reaps. The MCP surface
+    mounts the same queue_* verbs as the HTTP pull routes, so it carries the
+    same self-healing contract (runtime/transport.py): without a reaper, a
+    worker that dies mid-lease strands its ticket ``claimed`` forever — an
+    MCP-only deployment previously had NO automatic recovery at all. ``None``
+    reads ``AGENTCONNECT_REAPER_INTERVAL`` (default 30.0); ``0`` disables (e.g.
+    when an external scheduler calls ``reap_expired``). The daemon thread and
+    stop event are stashed on the returned server as
+    ``_agentconnect_reaper`` so an embedding process can stop it.
     """
     from mcp.server.fastmcp import FastMCP
 
     svc = service or _build_service()
     workers = worker_tiers if worker_tiers is not None else _load_worker_tiers()
+    if reaper_interval is None:
+        try:
+            reaper_interval = float(os.environ.get("AGENTCONNECT_REAPER_INTERVAL", "30"))
+        except ValueError:
+            reaper_interval = 30.0
     fastmcp_kwargs: dict[str, Any] = {}
     if host is not None:
         fastmcp_kwargs["host"] = host
     if port is not None:
         fastmcp_kwargs["port"] = port
     mcp = FastMCP("agentconnect-router", **fastmcp_kwargs)
+
+    # Self-healing for the queue_* surface (mirrors runtime/transport.py's
+    # startup reaper): a worker that dies mid-lease must not strand its ticket
+    # 'claimed' forever just because this deployment mounts the queue over MCP
+    # instead of the HTTP pull routes. Daemon thread; per-tick errors swallowed
+    # by start_reaper's loop.
+    if svc.workqueue is not None and reaper_interval and reaper_interval > 0:
+        thread, stop = svc.workqueue.start_reaper(reaper_interval)
+        mcp._agentconnect_reaper = (thread, stop)  # type: ignore[attr-defined]
 
     @mcp.tool()
     def submit_task(

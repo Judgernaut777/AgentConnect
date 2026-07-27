@@ -74,11 +74,18 @@ from .privacy import admissible_classes as _privacy_admissible_classes
 from .privacy import admits as _privacy_admits
 from .privacy import allowed_tiers as _privacy_allowed_tiers
 from .schemas import PrivacyClass, ProviderPrivacyTier, TaskState, WorkerResult
+from .state import TERMINAL_STATES as _TASK_TERMINAL_STATES
 
 _TRUSTED_TIER = ProviderPrivacyTier.local_only.value
 
 # Terminal / non-reopenable ticket statuses.
-_TERMINAL = {"done", "failed"}
+_TERMINAL = {"done", "failed", "cancelled"}
+
+# Task-ledger terminal states, as stored string values. The queue mirrors ticket
+# outcomes onto linked tasks, but a task another engine already drove terminal
+# (COMPLETE/FAILED/CANCELLED — most importantly an operator's cancel) is FINAL:
+# the mirror write is refused, never a silent resurrection.
+_TASK_TERMINAL_VALUES = {s.value for s in _TASK_TERMINAL_STATES}
 
 # Ceiling on a single heartbeat/renew extension: the same anti-starvation
 # reasoning as MAX_CLAIM_BATCH (transport.py) — an authorized-but-buggy or
@@ -394,10 +401,17 @@ class WorkQueue:
             f"                    WHERE d.ticket_id=?"
             f"                      AND NOT EXISTS (SELECT 1 FROM work_queue p"
             f"                                       WHERE p.ticket_id=d.depends_on"
-            f"                                         AND p.status='done'))",
+            f"                                         AND p.status='done'))"
+            # Cancellation is honored at claim time: a ticket whose linked task
+            # was driven to terminal CANCELLED (RouterService.cancel_task) must
+            # never be handed to a worker — folded into the one guarded UPDATE
+            # so the check and the claim are atomic.
+            f"   AND (task_id IS NULL OR NOT EXISTS ("
+            f"        SELECT 1 FROM tasks t WHERE t.task_id=work_queue.task_id"
+            f"          AND t.state=?))",
             (
                 identity, tier, token, expires, now, now, json.dumps(prov),
-                ticket_id, *admissible, ticket_id,
+                ticket_id, *admissible, ticket_id, TaskState.CANCELLED.value,
             ),
         )
         if cur.rowcount != 1:
@@ -537,6 +551,23 @@ class WorkQueue:
                 # worker's 503 back-off) re-drives the idempotent cascade rather
                 # than short-circuiting on 'already_reported' and stranding them.
                 self._cascade_failure(ticket_id, now)
+            # Self-heal the linked task's mirrored state the same way: the
+            # ticket-terminal commit and _set_task_state are separate
+            # transactions too, so a crash between them leaves the task stuck
+            # non-terminal forever. A retried report re-drives the idempotent
+            # mirror (the terminal-state guard in _set_task_state makes this
+            # safe — a CANCELLED task is never resurrected by it).
+            if raw["task_id"]:
+                if raw["status"] == "failed":
+                    self._set_task_state(raw["task_id"], TaskState.FAILED)
+                elif raw["status"] == "done":
+                    self._set_task_state(raw["task_id"], TaskState.COMPLETE)
+                elif raw["status"] == "in_review":
+                    self._set_task_state(raw["task_id"], TaskState.REVIEW_READY)
+            if raw["status"] == "cancelled":
+                # The linked task was cancelled while this worker held the
+                # lease; its (valid, un-expired) fence is void by design.
+                return {"error": "ticket_cancelled"}
             if raw["status"] in ("in_review", "done", "failed"):
                 return {"error": "already_reported"}
             return {"error": "not_claimable"}
@@ -638,6 +669,14 @@ class WorkQueue:
             "task_id": raw["task_id"],
             "status": eval_status,
             "confidence": wr.confidence,
+            # Worker-reported usage/cost lands on the evaluation row (the same
+            # channel the router's push paths use) instead of vanishing into
+            # the opaque work_result blob. Observability, not billing: a pull
+            # worker's spend is its own, and the figures are self-reported.
+            "model": wr.usage.model_id if wr.usage else None,
+            "input_tokens": wr.usage.input_tokens if wr.usage else None,
+            "output_tokens": wr.usage.output_tokens if wr.usage else None,
+            "cost_usd": wr.usage.cost_usd if wr.usage else None,
         })
         if not succeeded:
             # Only a terminal failure drives the task to FAILED; a requeue
@@ -653,6 +692,28 @@ class WorkQueue:
             self._set_task_state(raw["task_id"],
                                  TaskState.COMPLETE if trusted else TaskState.REVIEW_READY)
         return {"ticket_status": new_status, "result_status": result_status, "result_ref": result_ref}
+
+    def _result_usage(self, result_ref: Optional[str]) -> dict[str, Any]:
+        """Best-effort usage/cost fields for an evaluation row, re-read from the
+        stored WorkerResult artifact (used by approve/reject, which don't hold
+        the parsed result). Missing/unparseable -> all None, never an error."""
+        empty: dict[str, Any] = {
+            "model": None, "input_tokens": None, "output_tokens": None, "cost_usd": None,
+        }
+        if not result_ref:
+            return empty
+        try:
+            wr = WorkerResult.model_validate_json(self._read_artifact_full(result_ref))
+        except Exception:
+            return empty
+        if wr.usage is None:
+            return empty
+        return {
+            "model": wr.usage.model_id,
+            "input_tokens": wr.usage.input_tokens,
+            "output_tokens": wr.usage.output_tokens,
+            "cost_usd": wr.usage.cost_usd,
+        }
 
     # ---------------------------------------------------------- review gate
     @_synchronized
@@ -689,6 +750,7 @@ class WorkQueue:
         self._conn.commit()
         self.memory.record_evaluation({
             "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "completed",
+            **self._result_usage(raw["result_ref"]),
         })
         if raw["task_id"]:
             self._set_task_state(raw["task_id"], TaskState.COMPLETE)
@@ -719,6 +781,11 @@ class WorkQueue:
                 # re-drives the idempotent cascade instead of just reporting
                 # 'not_in_review' and leaving them stranded.
                 self._cascade_failure(ticket_id, now)
+                # And the linked task's mirrored state (see report()): a crash
+                # between the terminal ticket commit and _set_task_state would
+                # otherwise leave it non-terminal forever.
+                if raw["task_id"]:
+                    self._set_task_state(raw["task_id"], TaskState.FAILED)
             return {"error": "not_in_review"}
         prov = json.loads(raw["provenance"] or "[]")
         prov.append({"event": "review", "reviewer": reviewer_id, "verdict": "rejected",
@@ -747,6 +814,7 @@ class WorkQueue:
         self._conn.commit()
         self.memory.record_evaluation({
             "provider": raw["lease_holder"], "task_id": raw["task_id"], "status": "failed",
+            **self._result_usage(raw["result_ref"]),
         })
         if requeue:
             return {"ticket_status": "open", "result_status": "rejected"}
@@ -826,6 +894,43 @@ class WorkQueue:
             return {"error": "dependency_cycle"}
         return {"ok": True}
 
+    # ---------------------------------------------------------------- cancel
+    @_synchronized
+    def cancel_for_task(self, task_id: str, now: Optional[float] = None) -> list[str]:
+        """Cancel every non-terminal ticket linked to ``task_id``.
+
+        The task-side cancel (``RouterService.cancel_task``) calls this so a
+        cancellation reaches the queue: open/claimed/in_review/parked tickets
+        move to terminal ``cancelled`` (a live lease is cleared — the holder's
+        next fenced ``report``/``renew`` gets a typed error, exactly as after a
+        reaper requeue). Because a cancelled ticket can never reach ``done``,
+        dependents are cascade-failed just as for a terminally-failed parent —
+        never stranded ``blocked`` forever. Idempotent; returns the ticket ids
+        cancelled by THIS call."""
+        now = _now() if now is None else now
+        rows = self._conn.execute(
+            "SELECT ticket_id, provenance FROM work_queue"
+            " WHERE task_id=? AND status NOT IN ('done','failed','cancelled')",
+            (task_id,),
+        ).fetchall()
+        cancelled: list[str] = []
+        for row in rows:
+            prov = json.loads(row["provenance"] or "[]")
+            prov.append({"event": "cancel", "cause": "task_cancelled", "ts": now})
+            self._conn.execute(
+                "UPDATE work_queue SET status='cancelled', result_status='cancelled',"
+                " park_reason='task_cancelled', lease_holder=NULL, lease_tier=NULL,"
+                " lease_token=NULL, lease_expires_at=NULL, provenance=?, updated_at=?,"
+                " completed_at=?"
+                " WHERE ticket_id=? AND status NOT IN ('done','failed','cancelled')",
+                (json.dumps(prov), now, now, row["ticket_id"]),
+            )
+            cancelled.append(row["ticket_id"])
+        self._conn.commit()
+        for ticket_id in cancelled:
+            self._cascade_failure(ticket_id, now)
+        return cancelled
+
     # ---------------------------------------------------------------- reaper
     @_synchronized
     def reap_expired(self, now: Optional[float] = None) -> dict[str, list[str]]:
@@ -875,15 +980,33 @@ class WorkQueue:
         # parking cascades, matching report()/reject()/the parked loop.
         stranded = self._conn.execute(
             "SELECT p.ticket_id AS pid FROM work_queue p"
-            " WHERE (p.status='failed'"
+            " WHERE (p.status IN ('failed','cancelled')"
             "        OR (p.status='parked' AND p.park_reason='max_attempts_exhausted'))"
             "   AND EXISTS (SELECT 1 FROM work_queue_deps d"
             "               JOIN work_queue c ON c.ticket_id=d.ticket_id"
             "               WHERE d.depends_on=p.ticket_id"
-            "                 AND c.status NOT IN ('done','failed'))"
+            "                 AND c.status NOT IN ('done','failed','cancelled'))"
         ).fetchall()
         for r in stranded:
             self._cascade_failure(r["pid"], now)
+        # Self-heal the task-state mirror across ticks: a crash between a
+        # ticket's terminal commit and its _set_task_state leaves the linked
+        # task non-terminal forever (no retry path revisits it once the ticket
+        # is terminal). Re-drive the idempotent mirror for any terminal ticket
+        # whose task is still non-terminal; the terminal-state guard in
+        # _set_task_state keeps this from ever resurrecting a CANCELLED task.
+        ph = ",".join("?" for _ in _TASK_TERMINAL_VALUES)
+        desynced = self._conn.execute(
+            f"SELECT w.ticket_id, w.task_id, w.status FROM work_queue w"
+            f" JOIN tasks t ON t.task_id=w.task_id"
+            f" WHERE w.status IN ('done','failed') AND t.state NOT IN ({ph})",
+            tuple(_TASK_TERMINAL_VALUES),
+        ).fetchall()
+        for r in desynced:
+            self._set_task_state(
+                r["task_id"],
+                TaskState.COMPLETE if r["status"] == "done" else TaskState.FAILED,
+            )
         return {"requeued": requeued, "parked": parked}
 
     def start_reaper(
@@ -1129,6 +1252,25 @@ class WorkQueue:
         plane and tests, NOT for handing to a worker."""
         return self._raw(ticket_id)
 
+    @_synchronized
+    def find_by_dedup(self, dedup_key: str) -> Optional[dict[str, Any]]:
+        """The existing ticket for a ``dedup_key``, as a public row, or None.
+        Lets an enqueuing caller (RouterService.enqueue_task) detect an
+        idempotent retry BEFORE minting upstream ledger rows (task, sanitized
+        payload, routing decision) that a dedup hit inside :meth:`add` would
+        orphan."""
+        row = self._conn.execute(
+            "SELECT * FROM work_queue WHERE dedup_key=?", (dedup_key,)
+        ).fetchone()
+        return self._public_row(row) if row is not None else None
+
+    def task_id_for_ticket(self, ticket_id: str) -> Optional[str]:
+        """The linked task_id for a ticket — control-plane only (task_id is a
+        live handle into the un-redacted submission and never crosses to a
+        worker). Used to detect a lost enqueue idempotency race."""
+        raw = self._raw(ticket_id)
+        return raw["task_id"] if raw is not None else None
+
     def _status_row(self, row: Any) -> dict[str, Any]:
         d = dict(row)
         derived = d["status"]
@@ -1159,6 +1301,39 @@ class WorkQueue:
 
     def _set_task_state(self, task_id: str, state: TaskState) -> None:
         """Drive a linked task's state. S1 core is framework-free, so it writes
-        the store directly (the router pipeline's strict FSM is layered in S2)."""
-        if self.memory.get_task(task_id) is not None:
-            self.memory.update_task(task_id, state=state.value)
+        the store directly (the router pipeline's strict FSM is layered in S2) —
+        but terminal-state finality still holds across engines: a task already
+        COMPLETE/FAILED/CANCELLED (e.g. cancelled by the router's manager while
+        a ticket was still leased) is never overwritten. The refused write is
+        audited to the task's log, as is every accepted transition, so a
+        ticket-driven task-state change is reconstructable from the task alone."""
+        task = self.memory.get_task(task_id)
+        if task is None:
+            return
+        current = task["state"]
+        if current in _TASK_TERMINAL_VALUES:
+            if current != state.value:
+                self.memory.append_log(
+                    task_id,
+                    f"work_queue refused task-state overwrite {current} -> {state.value}: "
+                    "terminal state is final",
+                    level="warn",
+                )
+            return
+        updated, stored = self.memory.update_task_guarded(
+            task_id, exclude_states=_TASK_TERMINAL_VALUES, state=state.value
+        )
+        if updated:
+            self.memory.append_log(
+                task_id, f"work_queue task-state {current} -> {state.value}"
+            )
+        else:
+            # Lost an atomic race to a concurrent terminal writer (cancel_task
+            # in another thread/process) between the read above and the guarded
+            # write. The guard held; record the refusal.
+            self.memory.append_log(
+                task_id,
+                f"work_queue refused task-state overwrite {stored} -> {state.value}: "
+                "terminal state is final",
+                level="warn",
+            )
