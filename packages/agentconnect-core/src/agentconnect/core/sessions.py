@@ -317,3 +317,37 @@ def build_operator_scope(actor: str) -> dict[str, Any]:
         "review_id": None,
         "actions": sorted(actions_for(SessionMode.operator)),
     }
+
+
+#: The action name a publish token's scope carries — a single, narrow action
+#: with no `ACTIONS_BY_MODE` composition of its own (docs/EVENT_BUS.md shared
+#: event bus contract v1, "PUBLISH"). Deliberately not folded into
+#: `MANAGER_ACTIONS`/`OPERATOR_ACTIONS`: a publish token authenticates a
+#: SIBLING PRODUCT, not an agent or a human operator of THIS deployment, and
+#: it should be unable to reach any other action even if one of those sets
+#: later grew a mistake.
+PUBLISH_EVENT_ACTION = "publish_event"
+
+
+def build_publish_scope(source_product: str) -> dict[str, Any]:
+    """A publish token speaks for exactly one `source_product`, forever — the
+    scope that `AgentConnectService.authorize`'s `publish_event` binding
+    check enforces against. Like an operator scope it is bound to no task
+    (`task_id`/`review_id` are `None`), but unlike an operator scope it can
+    reach exactly one action.
+
+    Hand-built rather than composed via `actions_for(SessionMode)`: this is
+    not a managed-agent mode at all (no `launch` ever produces one), so there
+    is no `SessionMode` member for it to route through — the same reasoning
+    `build_operator_scope` documents for why operator tokens are their own
+    path.
+    """
+    return {
+        "session_id": f"publisher:{source_product}",
+        "manager_id": f"publisher:{source_product}",
+        "mode": "publisher",
+        "source_product": source_product,
+        "task_id": None,
+        "review_id": None,
+        "actions": [PUBLISH_EVENT_ACTION],
+    }
