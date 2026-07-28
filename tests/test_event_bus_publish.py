@@ -70,6 +70,50 @@ def test_migration_backfills_a_pre_existing_database(tmp_path):
     SqliteStorage(db_path).close()
 
 
+def test_open_upgrades_a_truly_pre_source_product_event_log(tmp_path):
+    """Regression: a real upgrade path. Build an `event_log` table that predates
+    the `source_product` column entirely (raw SQL, no column), then open
+    SqliteStorage on it. The source_product index must be created only AFTER the
+    ALTER adds the column — building it inside executescript's _SCHEMA would throw
+    `no such column: source_product` on this exact shape (an existing table makes
+    `CREATE TABLE IF NOT EXISTS` a no-op, so the column is absent when the index
+    runs). Caught live when a persistent deploy volume crash-looped on upgrade."""
+    import sqlite3
+    from agentconnect.core.storage import SqliteStorage
+
+    db_path = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE event_log (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            ts REAL NOT NULL,
+            type TEXT NOT NULL,
+            outcome TEXT,
+            actor TEXT NOT NULL DEFAULT '',
+            task_id TEXT, subtask_id TEXT, run_id TEXT, review_id TEXT,
+            session_id TEXT, delegation_id TEXT, parent_delegation_id TEXT,
+            workspace_id TEXT, entity_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO event_log (event_id, ts, type)
+        VALUES ('legacy-ev-1', 1785000000.0, 'task.created');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    storage = SqliteStorage(db_path)  # must not raise "no such column: source_product"
+    cols = {r["name"] for r in storage._conn.execute("PRAGMA table_info(event_log)")}
+    assert "source_product" in cols
+    idx = {r[1] for r in storage._conn.execute("PRAGMA index_list(event_log)")}
+    assert "idx_eventlog_source" in idx
+    rows = storage.list_bus_events(limit=10)
+    assert rows and rows[0]["source_product"] == "agentconnect"  # legacy row backfilled
+    storage.close()
+
+
 def test_append_bus_event_ingested_dedups_by_event_id(tmp_path):
     from agentconnect.core.storage import SqliteStorage
 
