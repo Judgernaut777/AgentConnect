@@ -289,6 +289,7 @@ docs/ARCHITECTURE.md         # detailed design notes + section map
 docs/WORK_QUEUE.md           # federated pull-based work queue design
 docs/REMOTE_DISPATCH.md      # router-driven remote-worker push dispatch
 docs/MULTI_HARNESS.md        # interchangeable manager harnesses over one control plane
+docs/ORGANIZATION_AWARE_SETUP.md  # the Work plane's part in Connect's org-aware onboarding (design direction)
 ```
 
 ## Production: two machines over mutual TLS
