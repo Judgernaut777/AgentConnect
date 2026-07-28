@@ -40,6 +40,8 @@ from .models import (
     ExternalRef,
     InboxItem,
     ManagerSession,
+    PRIVACY_STRICTNESS,
+    PrivacyTier,
     Review,
     SessionToken,
     Subtask,
@@ -199,12 +201,19 @@ CREATE TABLE IF NOT EXISTS event_log (
     task_id TEXT, subtask_id TEXT, run_id TEXT, review_id TEXT, session_id TEXT,
     delegation_id TEXT, parent_delegation_id TEXT, workspace_id TEXT,
     entity_id TEXT,
-    payload_json TEXT NOT NULL DEFAULT '{}'
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    source_product TEXT NOT NULL DEFAULT 'agentconnect'
 );
 CREATE INDEX IF NOT EXISTS idx_eventlog_task ON event_log(task_id, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_type ON event_log(type, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_subtask ON event_log(subtask_id, seq);
 """
+# NOTE: the idx_eventlog_source index is deliberately NOT in _SCHEMA. On a database
+# created before source_product existed, `CREATE TABLE IF NOT EXISTS event_log` is a
+# no-op (the table already exists without the column), so an index over
+# source_product would fail with "no such column" during executescript — before
+# _migrate() ever runs its ALTER. It is created in _migrate(), after the column is
+# guaranteed to exist, so both fresh and upgraded databases build it correctly.
 
 #: Columns added after the initial schema shipped. Existing databases created by
 #: an earlier version are brought forward with ``ALTER TABLE ADD COLUMN`` at open
@@ -248,6 +257,48 @@ def _u(text: Optional[str], fallback: Any) -> Any:
         return fallback
 
 
+def _redact_ingested_payload(payload: Optional[dict], privacy_tier: Optional[str]) -> dict:
+    """Fail-closed store-side re-redaction for a FOREIGN (multi-product
+    publish ingress) event, before it is ever readable (docs/EVENT_BUS.md
+    shared event bus contract v1, "PRIVACY"). Never trusts a publisher's own
+    pre-redaction — this runs unconditionally, even for a payload that looks
+    already clean.
+
+    An unparseable or missing `privacy_tier` is treated as the strictest tier
+    (`secret_sensitive`), the same asymmetric failure mode
+    `observability.tree._safe_tier` uses for the same reason: leaking by
+    default is the one failure a redaction boundary must never have.
+
+    `local_only`/`secret_sensitive` (``PRIVACY_STRICTNESS >= 3``, matching
+    every other write-time tier gate in this codebase —
+    `AgentConnectService._tier_gated_free_text`, `_subtask_event_meta`)
+    replace the WHOLE payload with a bounded marker, reusing the exact
+    strings `/observe/tree` already withholds text with — one vocabulary for
+    "this content was withheld", not two. Looser tiers still pass through the
+    metadata scrubber (`SqliteEventLogProvider._scrub`) as defense in depth:
+    dropped known-sensitive keys, masked credential-shaped keys, bounded
+    strings — the same treatment every internally emitted event's metadata
+    already gets before it can reach `event_log`.
+    """
+    # Local imports: `storage.py` is imported very early in
+    # `agentconnect.core`'s own `__init__`, before the observability
+    # subpackage is guaranteed to be fully initialized — a top-level import
+    # here would risk a circular-import order dependency neither module
+    # actually has today, but a local import costs nothing and stays safe if
+    # that ever changes.
+    from .observability.providers.event_log import _scrub
+    from .observability.tree import _WITHHELD_TEXT
+
+    try:
+        tier = PrivacyTier(privacy_tier) if privacy_tier is not None else None
+    except ValueError:
+        tier = None
+    if tier is None or PRIVACY_STRICTNESS.get(tier, 4) >= 3:
+        marker = _WITHHELD_TEXT.get(tier, _WITHHELD_TEXT[PrivacyTier.secret_sensitive])
+        return {"redacted": marker}
+    return _scrub(payload or {})
+
+
 class SqliteStorage:
     def __init__(self, path: str | os.PathLike[str] = ":memory:") -> None:
         self.path = str(path)
@@ -284,6 +335,30 @@ class SqliteStorage:
         # `observation_handles` may be absent in a pre-observability database even
         # though `_SCHEMA` (CREATE IF NOT EXISTS) just ran — it did create it. The
         # ALTER loop above is the only backfill needed.
+        #
+        # `event_log.source_product` (shared ecosystem event bus, multi-product
+        # publish ingress — docs/EVENT_BUS.md) needs a NOT NULL DEFAULT, unlike
+        # the generic nullable-TEXT columns the loop above adds, so it is not in
+        # `_MIGRATIONS`: SQLite's `ALTER TABLE ADD COLUMN` accepts a non-null
+        # default and backfills every existing row with it in the same
+        # statement — every event ever written before this field existed was, in
+        # fact, written by AgentConnect itself.
+        event_log_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(event_log)").fetchall()
+        }
+        if "source_product" not in event_log_columns:
+            self._conn.execute(
+                "ALTER TABLE event_log ADD COLUMN source_product TEXT NOT NULL "
+                "DEFAULT 'agentconnect'"
+            )
+        # Created here, not in _SCHEMA, so it is built only after the column above is
+        # guaranteed present on both fresh and pre-source_product databases (see the
+        # NOTE by _SCHEMA). IF NOT EXISTS keeps it idempotent across reopens.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eventlog_source "
+            "ON event_log(source_product, seq)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -433,18 +508,29 @@ class SqliteStorage:
         session_id: Optional[str] = None, delegation_id: Optional[str] = None,
         parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
         entity_id: Optional[str] = None, payload: Optional[dict] = None,
+        source_product: str = "agentconnect",
     ) -> bool:
         """Raw `INSERT OR IGNORE` on the caller's connection — the one write
-        path both event-bus producers (§0: structural + rich) share. Returns
-        whether a row was actually inserted (`False` on an `event_id`
-        duplicate — idempotency, never a second door for a replayed id)."""
+        path every event-bus producer (§0: structural + rich + the multi-
+        product publish ingress) shares. Returns whether a row was actually
+        inserted (`False` on an `event_id` duplicate — idempotency, never a
+        second door for a replayed id).
+
+        `source_product` defaults to `"agentconnect"`, so every existing call
+        site (Path 1's same-commit `state.changed`, Path 2's rich events) is
+        unchanged and correctly attributed — every event they ever write
+        genuinely originates inside AgentConnect. A foreign product's event
+        (docs/EVENT_BUS.md shared event bus contract v1) passes its own value
+        via `append_bus_event_ingested`, never through this default.
+        """
         cur = conn.execute(
             "INSERT OR IGNORE INTO event_log (event_id,ts,type,outcome,actor,task_id,"
             "subtask_id,run_id,review_id,session_id,delegation_id,parent_delegation_id,"
-            "workspace_id,entity_id,payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "workspace_id,entity_id,payload_json,source_product) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (event_id, time.time(), type, outcome, actor, task_id, subtask_id, run_id,
              review_id, session_id, delegation_id, parent_delegation_id, workspace_id,
-             entity_id, _j(payload or {})),
+             entity_id, _j(payload or {}), source_product),
         )
         return cur.rowcount == 1
 
@@ -456,28 +542,63 @@ class SqliteStorage:
         session_id: Optional[str] = None, delegation_id: Optional[str] = None,
         parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
         entity_id: Optional[str] = None, payload: Optional[dict] = None,
+        source_product: str = "agentconnect",
     ) -> Optional[int]:
         """Path 2 (rich, advisory) entry point — its own transaction, since
         the rich providers are called well after the ledger commit that
         triggered them. Returns the new `seq`, or `None` if `event_id` was
-        already present (idempotent replay)."""
+        already present (idempotent replay).
+
+        `source_product` defaults to `"agentconnect"` — every internal caller
+        (`SqliteEventLogProvider`, the Engine B bridge) is unaffected. The
+        multi-product publish ingress (`append_bus_event_ingested`) is the
+        only caller that ever passes a different value, and only after its
+        own re-redaction pass.
+        """
         with self.transaction() as c:
             inserted = self._insert_event_row(
                 c, event_id=event_id, type=type, outcome=outcome, actor=actor,
                 task_id=task_id, subtask_id=subtask_id, run_id=run_id,
                 review_id=review_id, session_id=session_id, delegation_id=delegation_id,
                 parent_delegation_id=parent_delegation_id, workspace_id=workspace_id,
-                entity_id=entity_id, payload=payload,
+                entity_id=entity_id, payload=payload, source_product=source_product,
             )
             if not inserted:
                 return None
             row = c.execute("SELECT last_insert_rowid() AS seq").fetchone()
             return int(row["seq"])
 
+    def append_bus_event_ingested(
+        self, *, event_id: str, type: str, source_product: str,  # noqa: A002
+        outcome: Optional[str] = None, actor: str = "",
+        task_id: Optional[str] = None, subtask_id: Optional[str] = None,
+        run_id: Optional[str] = None, review_id: Optional[str] = None,
+        session_id: Optional[str] = None, delegation_id: Optional[str] = None,
+        parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        entity_id: Optional[str] = None, payload: Optional[dict] = None,
+        privacy_tier: Optional[str] = None,
+    ) -> Optional[int]:
+        """The multi-product publish ingress's ONE write path (`POST /events`,
+        docs/EVENT_BUS.md shared event bus contract v1). The only difference
+        from `append_bus_event`: `payload` is re-validated and re-redacted
+        against `privacy_tier` HERE, fail-closed, before it is ever readable —
+        a buggy or hostile publisher's own "pre-redaction" is never trusted.
+        `source_product` is REQUIRED (no default): every ingested row must
+        say, in the store's own words, who it came from.
+        """
+        redacted = _redact_ingested_payload(payload, privacy_tier)
+        return self.append_bus_event(
+            event_id=event_id, type=type, outcome=outcome, actor=actor,
+            task_id=task_id, subtask_id=subtask_id, run_id=run_id,
+            review_id=review_id, session_id=session_id, delegation_id=delegation_id,
+            parent_delegation_id=parent_delegation_id, workspace_id=workspace_id,
+            entity_id=entity_id, payload=redacted, source_product=source_product,
+        )
+
     def list_bus_events(
         self, since: int = 0, limit: int = 100,
         types: Optional[list[str]] = None, task_id: Optional[str] = None,
-        outcome: Optional[str] = None,
+        outcome: Optional[str] = None, source_products: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         """Replay/poll the canonical event stream. `since` is EXCLUSIVE (`seq
         > since`) — a consumer resumes with the last `seq` it saw, never with
@@ -495,6 +616,10 @@ class SqliteStorage:
         if outcome:
             sql += " AND outcome=?"
             params.append(outcome)
+        if source_products:
+            marks = ",".join("?" * len(source_products))
+            sql += f" AND source_product IN ({marks})"
+            params.extend(source_products)
         sql += " ORDER BY seq ASC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -518,6 +643,7 @@ class SqliteStorage:
             "parent_delegation_id": r["parent_delegation_id"],
             "workspace_id": r["workspace_id"], "entity_id": r["entity_id"],
             "payload": _u(r["payload_json"], {}),
+            "source_product": r["source_product"],
         }
 
     @staticmethod

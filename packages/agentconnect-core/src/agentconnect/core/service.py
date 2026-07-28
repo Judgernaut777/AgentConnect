@@ -95,6 +95,7 @@ from .models import (
     SessionMode,
     SessionStatus,
     SessionToken,
+    SourceProduct,
     Subtask,
     SubtaskDetail,
     SubtaskRequest,
@@ -2126,17 +2127,59 @@ class AgentConnectService:
     def list_bus_events(
         self, since: int = 0, limit: int = 100,
         types: Optional[list[str]] = None, task_id: Optional[str] = None,
-        outcome: Optional[str] = None,
+        outcome: Optional[str] = None, source_products: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         """The canonical, replayable ecosystem event stream (docs/EVENT_BUS.md).
         Thin pass-through to storage — `GET /events` and `GET /events/stream`
         are its only callers today."""
         return self.storage.list_bus_events(
             since=since, limit=limit, types=types, task_id=task_id, outcome=outcome,
+            source_products=source_products,
         )
 
     def latest_bus_seq(self) -> int:
         return self.storage.latest_bus_seq()
+
+    def publish_event(
+        self, *, type: str, source_product: str, event_id: Optional[str] = None,  # noqa: A002
+        outcome: Optional[str] = None, actor: str = "",
+        task_id: Optional[str] = None, subtask_id: Optional[str] = None,
+        run_id: Optional[str] = None, review_id: Optional[str] = None,
+        session_id: Optional[str] = None, delegation_id: Optional[str] = None,
+        parent_delegation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        entity_id: Optional[str] = None, payload: Optional[dict[str, Any]] = None,
+        privacy_tier: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Ingest one FOREIGN product's event onto the shared bus (`POST
+        /events`, docs/EVENT_BUS.md shared event bus contract v1). Callers
+        must already have authorized the `publish_event` action for
+        `source_product` via :meth:`authorize` — this method does no auth of
+        its own, exactly like `list_bus_events`/every other thin service-layer
+        wrapper.
+
+        `event_id` is assigned here when the caller omits one — mirroring
+        every other ledger write (`create_task`, `record_decision`, …), and
+        letting a publisher optionally pre-set it for its own idempotent-retry
+        story, the same property Path 2's `event_id` `UNIQUE` constraint
+        already gives internal emission.
+
+        The actual privacy re-validation/re-redaction happens in storage
+        (`SqliteStorage.append_bus_event_ingested`) — never here, and never
+        trusting whatever the publisher already did to `payload` before
+        sending it. Returns the wire shape the contract specifies: `{"seq":
+        int | None, "event_id": str}` (`seq` is `None` only on an idempotent
+        `event_id` replay — no new row, so no new `seq`).
+        """
+        eid = event_id or ids.new_id(ids.EVENT)
+        seq = self.storage.append_bus_event_ingested(
+            event_id=eid, type=type, source_product=source_product,
+            outcome=outcome, actor=actor, task_id=task_id, subtask_id=subtask_id,
+            run_id=run_id, review_id=review_id, session_id=session_id,
+            delegation_id=delegation_id, parent_delegation_id=parent_delegation_id,
+            workspace_id=workspace_id, entity_id=entity_id, payload=payload,
+            privacy_tier=privacy_tier,
+        )
+        return {"seq": seq, "event_id": eid}
 
     def observe_tree(
         self, task_id: Optional[str] = None, include_terminal: bool = False,
@@ -2804,6 +2847,7 @@ class AgentConnectService:
     def authorize(
         self, token: str, action: str, *,
         task_id: Optional[str] = None, review_id: Optional[str] = None,
+        source_product: Optional[str] = None,
     ) -> dict[str, Any]:
         """Check a token against one action, in one scope. Raises, never returns False.
 
@@ -2819,12 +2863,24 @@ class AgentConnectService:
         2. `AGENT_FORBIDDEN_ACTIONS` — denied to every *managed agent* mode. This is
            where `complete_task` and `promote_memory_candidate` live: an agent does
            not certify its own work, and does not promote its own output to truth.
-        3. The mode's own action list, then the token's task/review binding.
+        3. The mode's own action list, then the token's task/review/source-product
+           binding.
 
         `task_id` / `review_id` bind the request to the token's scope. A manager
         token minted for task A cannot act on task B even though `record_attempt`
         is in its action list — the action is permitted, the *target* is not. An
         operator scope carries no binding and is therefore unscoped.
+
+        `source_product` is the analogous binding for `publish_event`
+        (docs/EVENT_BUS.md shared event bus contract v1) — but UNLIKE `task_id`/
+        `review_id` it is never `None`-permissive on the token side: a publish
+        token's scope MUST carry a `source_product`, or the action is refused
+        outright, because an unscoped publish token would defeat the whole
+        anti-forgery property the contract exists for. When the caller also
+        passes a claimed `source_product` (the request body's own field) it
+        must equal the token's bound one, or this is a hard `PolicyViolation`
+        (-> 403) — a token authorized to publish as `toolconnect` can never
+        write a row claiming `computeconnect`.
         """
         record = self.storage.get_token_by_hash(sessions_mod.hash_token(token or ""))
         if record is None:
@@ -2847,6 +2903,20 @@ class AgentConnectService:
             raise PolicyViolation(
                 f"action {action!r} is not permitted for a {mode} session token"
             )
+
+        if action == sessions_mod.PUBLISH_EVENT_ACTION:
+            bound_source = scope.get("source_product")
+            if not bound_source:
+                raise PolicyViolation(
+                    "this token has no source_product scope; publish_event "
+                    "requires a source-scoped publish token (see "
+                    "`mint_publish_token`)"
+                )
+            if source_product is not None and source_product != bound_source:
+                raise PolicyViolation(
+                    f"this token is scoped to source_product {bound_source!r}; "
+                    f"it cannot publish events as {source_product!r}"
+                )
 
         for name, requested in (("task_id", task_id), ("review_id", review_id)):
             bound = scope.get(name)
@@ -3016,6 +3086,37 @@ class AgentConnectService:
         token = SessionToken(
             id=ids.new_id(ids.TOKEN), session_id=sessions_mod.OPERATOR_SESSION_ID,
             scope=sessions_mod.build_operator_scope(actor.strip()),
+            expires_at=now + max(1, ttl_seconds), created_at=now, plaintext=plaintext,
+        )
+        self.storage.insert_token(token, sessions_mod.hash_token(plaintext))
+        return token
+
+    def mint_publish_token(
+        self, source_product: str, ttl_seconds: int = sessions_mod.DEFAULT_TOKEN_TTL_SECONDS,
+    ) -> SessionToken:
+        """Issue a credential scoped to publish onto the shared ecosystem
+        event bus as exactly one `source_product` (docs/EVENT_BUS.md shared
+        event bus contract v1). Never minted by `launch` — like an operator
+        token, this is deliberately its own path (see `mint_operator_token`),
+        because it authenticates a SIBLING PRODUCT rather than an agent or a
+        human operator of this deployment.
+
+        The resulting token can reach exactly one action
+        (`sessions.PUBLISH_EVENT_ACTION`) and is bound to `source_product`
+        forever — `authorize()`'s `publish_event` binding check is what makes
+        a compromised token unable to forge another product's events.
+        """
+        sp = (source_product or "").strip()
+        if sp not in {p.value for p in SourceProduct}:
+            raise InvalidRequest(
+                f"unknown source_product {source_product!r}; must be one of "
+                f"{sorted(p.value for p in SourceProduct)}"
+            )
+        now = self._now()
+        plaintext = sessions_mod.mint_token()
+        token = SessionToken(
+            id=ids.new_id(ids.TOKEN), session_id=f"publisher:{sp}",
+            scope=sessions_mod.build_publish_scope(sp),
             expires_at=now + max(1, ttl_seconds), created_at=now, plaintext=plaintext,
         )
         self.storage.insert_token(token, sessions_mod.hash_token(plaintext))

@@ -106,6 +106,10 @@ ROUTE_ACTIONS: dict[tuple[str, str], str] = {
     # ecosystem event bus (docs/EVENT_BUS.md) — operator-plane, fleet-wide ledger read
     ("GET", "/events"): "list_events",
     ("GET", "/events/stream"): "list_events",
+    # multi-product publish ingress (shared event bus contract v1) — a
+    # source-scoped publish token, never an operator/manager/reviewer one;
+    # see `AgentConnectService.authorize`'s `publish_event` binding check.
+    ("POST", "/events"): "publish_event",
     # live observability tree (docs/EVENT_BUS.md §8) — same operator-plane
     # posture as /events (the HTML page itself is public; see PUBLIC_ROUTES).
     ("GET", "/observe/tree"): "observe_tree",

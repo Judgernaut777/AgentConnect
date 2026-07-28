@@ -135,6 +135,27 @@ def strictest(tiers: list[PrivacyTier]) -> PrivacyTier:
     return max(tiers, key=lambda t: PRIVACY_STRICTNESS[t])
 
 
+class SourceProduct(str, Enum):
+    """Which Connect-family product authored an event on the shared ecosystem
+    event bus (docs/EVENT_BUS.md, shared event bus contract v1).
+
+    Every event AgentConnect writes for itself defaults to `agentconnect`
+    (the migration/backfill for rows written before this field existed, and
+    the internal `_observe(...)` emission path today). A foreign product
+    publishes as itself via `POST /events`, authenticated by a publish token
+    minted for exactly one member of this enum
+    (`AgentConnectService.mint_publish_token`) — a token scoped to
+    `toolconnect` can never write a row claiming `computeconnect` (the
+    anti-forgery property `AgentConnectService.authorize` enforces for the
+    `publish_event` action).
+    """
+
+    agentconnect = "agentconnect"
+    brainconnect = "brainconnect"
+    toolconnect = "toolconnect"
+    computeconnect = "computeconnect"
+
+
 class FilesystemAccess(str, Enum):
     none = "none"
     readonly = "readonly"
