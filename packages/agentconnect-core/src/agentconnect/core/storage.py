@@ -207,8 +207,13 @@ CREATE TABLE IF NOT EXISTS event_log (
 CREATE INDEX IF NOT EXISTS idx_eventlog_task ON event_log(task_id, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_type ON event_log(type, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_subtask ON event_log(subtask_id, seq);
-CREATE INDEX IF NOT EXISTS idx_eventlog_source ON event_log(source_product, seq);
 """
+# NOTE: the idx_eventlog_source index is deliberately NOT in _SCHEMA. On a database
+# created before source_product existed, `CREATE TABLE IF NOT EXISTS event_log` is a
+# no-op (the table already exists without the column), so an index over
+# source_product would fail with "no such column" during executescript — before
+# _migrate() ever runs its ALTER. It is created in _migrate(), after the column is
+# guaranteed to exist, so both fresh and upgraded databases build it correctly.
 
 #: Columns added after the initial schema shipped. Existing databases created by
 #: an earlier version are brought forward with ``ALTER TABLE ADD COLUMN`` at open
@@ -347,6 +352,13 @@ class SqliteStorage:
                 "ALTER TABLE event_log ADD COLUMN source_product TEXT NOT NULL "
                 "DEFAULT 'agentconnect'"
             )
+        # Created here, not in _SCHEMA, so it is built only after the column above is
+        # guaranteed present on both fresh and pre-source_product databases (see the
+        # NOTE by _SCHEMA). IF NOT EXISTS keeps it idempotent across reopens.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eventlog_source "
+            "ON event_log(source_product, seq)"
+        )
 
     def close(self) -> None:
         with self._lock:
