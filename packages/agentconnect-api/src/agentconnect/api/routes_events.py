@@ -21,11 +21,14 @@ from typing import Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from agentconnect.core.errors import InvalidRequest
+from agentconnect.core.models import SourceProduct
 from agentconnect.core.observability.model import EventType
 from agentconnect.core.service import AgentConnectService
 
+from .authz import bearer_token
 from .routes_tasks import service
 
 router = APIRouter(tags=["events"])
@@ -33,6 +36,11 @@ router = APIRouter(tags=["events"])
 #: The full wire vocabulary, for `?type=` validation. Built once from the
 #: canonical enum (docs/EVENT_BUS.md §4) rather than duplicated here.
 _VALID_TYPES = frozenset(t.value for t in EventType)
+
+#: The full `source_product` vocabulary, for `?source_product=` validation and
+#: `POST /events` body validation. Built once from the canonical enum
+#: (shared event bus contract v1) rather than duplicated here.
+_VALID_SOURCE_PRODUCTS = frozenset(sp.value for sp in SourceProduct)
 
 #: How many consecutive empty polls between SSE keepalive comments.
 _KEEPALIVE_EVERY = 15
@@ -51,26 +59,110 @@ def _parse_types(raw: Optional[str]) -> Optional[list[str]]:
     return types
 
 
+def _parse_source_products(raw: Optional[str]) -> Optional[list[str]]:
+    """`?source_product=a,b` -> `["a", "b"]`, or `None` when omitted. Mirrors
+    `_parse_types`: an unknown product name is a 400, never a silently-empty
+    filter."""
+    if not raw:
+        return None
+    products = [p.strip() for p in raw.split(",") if p.strip()]
+    unknown = sorted(set(products) - _VALID_SOURCE_PRODUCTS)
+    if unknown:
+        raise InvalidRequest(f"unknown source_product(s): {', '.join(unknown)}")
+    return products
+
+
 @router.get("/events")
 def list_events(
     request: Request, since: int = 0, limit: int = 100,
     type: Optional[str] = None, task_id: Optional[str] = None,  # noqa: A002
-    outcome: Optional[str] = None,
+    outcome: Optional[str] = None, source_product: Optional[str] = None,
 ) -> dict[str, Any]:
     """Replay-from-`since` / poll surface. `since` is EXCLUSIVE (`seq >
     since`) — a consumer resumes with the last `seq` it saw, never with
     arithmetic on it: `seq` is monotonic but not necessarily dense."""
     svc = service(request)
     types = _parse_types(type)
+    source_products = _parse_source_products(source_product)
     events = svc.list_bus_events(
         since=since, limit=limit, types=types, task_id=task_id, outcome=outcome,
+        source_products=source_products,
     )
     return {"events": events, "latest_seq": svc.latest_bus_seq()}
+
+
+class PublishEventBody(BaseModel):
+    """`POST /events` request body — the envelope MINUS `seq` (shared event
+    bus contract v1, "PUBLISH"). `event_id`/`ts` are also caller-optional: the
+    store assigns them when absent, exactly as it already does for every
+    internally emitted event."""
+
+    type: str  # noqa: A003 — wire field name, matches the envelope
+    source_product: str
+    event_id: Optional[str] = None
+    outcome: Optional[str] = None
+    actor: str = ""
+    task_id: Optional[str] = None
+    subtask_id: Optional[str] = None
+    run_id: Optional[str] = None
+    review_id: Optional[str] = None
+    session_id: Optional[str] = None
+    delegation_id: Optional[str] = None
+    parent_delegation_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    entity_id: Optional[str] = None
+    #: The publisher's OWN declared privacy tier for `payload`
+    #: (`public | public_redacted | repo_sensitive | local_only |
+    #: secret_sensitive`). Advisory only in the sense that the store never
+    #: trusts it blindly — it re-validates and re-redacts against this value
+    #: server-side (docs/EVENT_BUS.md, "PRIVACY") — but it IS the value that
+    #: redaction decision is made against, so an absent/unparseable tier
+    #: fails CLOSED to the strictest.
+    privacy_tier: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/events", status_code=201)
+def publish_event(body: PublishEventBody, request: Request) -> dict[str, Any]:
+    """Multi-product publish ingress (shared event bus contract v1). Auth is a
+    publish token scoped to exactly `body.source_product`
+    (`AgentConnectService.mint_publish_token` /
+    `authorize(..., "publish_event", source_product=...)`) — a mismatch
+    between the token's bound product and this field is a hard 403, the
+    anti-forgery property the contract exists for.
+
+    The row this writes is stamped with the AUTHENTICATED scope's
+    `source_product`, never blindly with the body's claim — `authorize()`
+    already 403s a mismatch, but writing from the scope rather than the body
+    is the belt to that suspenders: even a future loosening of the binding
+    check could not turn this route into a forgery vector.
+    """
+    if body.type not in _VALID_TYPES:
+        raise InvalidRequest(f"unknown event type: {body.type}")
+    if body.source_product not in _VALID_SOURCE_PRODUCTS:
+        raise InvalidRequest(f"unknown source_product: {body.source_product}")
+    svc = service(request)
+    token = bearer_token(request)
+    scope = svc.authorize(
+        token, "publish_event", source_product=body.source_product,
+    )
+    authenticated_source = scope["source_product"]
+    return svc.publish_event(
+        type=body.type, source_product=authenticated_source,
+        event_id=body.event_id,
+        outcome=body.outcome, actor=body.actor or scope.get("manager_id", ""),
+        task_id=body.task_id, subtask_id=body.subtask_id, run_id=body.run_id,
+        review_id=body.review_id, session_id=body.session_id,
+        delegation_id=body.delegation_id, parent_delegation_id=body.parent_delegation_id,
+        workspace_id=body.workspace_id, entity_id=body.entity_id,
+        payload=body.payload, privacy_tier=body.privacy_tier,
+    )
 
 
 def sse_lines(
     svc: AgentConnectService, cursor: int, types: Optional[list[str]], interval: float,
     *, should_stop: Optional[Callable[[], bool]] = None,
+    source_products: Optional[list[str]] = None,
 ) -> Iterator[str]:
     """The generator `GET /events/stream` serves — factored out as a plain,
     directly-testable function (no FastAPI/ASGI/httpx transport involved) so
@@ -86,7 +178,9 @@ def sse_lines(
     yield "retry: 3000\n\n"
     idle = 0
     while should_stop is None or not should_stop():
-        rows = svc.list_bus_events(since=cursor, limit=200, types=types)
+        rows = svc.list_bus_events(
+            since=cursor, limit=200, types=types, source_products=source_products,
+        )
         if rows:
             idle = 0
             for row in rows:
@@ -107,6 +201,7 @@ def sse_lines(
 @router.get("/events/stream")
 def stream_events(
     request: Request, since: Optional[int] = None, type: Optional[str] = None,  # noqa: A002
+    source_product: Optional[str] = None,
 ) -> StreamingResponse:
     """Live SSE tail. `since` (query) takes priority over a `Last-Event-ID`
     resume header, which takes priority over "start from the current tail"
@@ -117,6 +212,7 @@ def stream_events(
     """
     svc = service(request)
     types = _parse_types(type)
+    source_products = _parse_source_products(source_product)
     if since is not None:
         cursor = since
     else:
@@ -135,7 +231,8 @@ def stream_events(
     should_stop = getattr(request.app.state, "sse_should_stop", None)
 
     return StreamingResponse(
-        sse_lines(svc, cursor, types, interval, should_stop=should_stop),
+        sse_lines(svc, cursor, types, interval, should_stop=should_stop,
+                 source_products=source_products),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

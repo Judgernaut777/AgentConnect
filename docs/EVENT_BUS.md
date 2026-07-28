@@ -1,19 +1,47 @@
 # AgentConnect Ecosystem Event Bus
 
-**Status: Part 1 + Part 2 shipped** — canonical store, vocabulary, structural
-emission, `GET /events` + `GET /events/stream` (Part 1); the live
+**Status: Part 1 + Part 2 + Part 3 shipped** — canonical store, vocabulary,
+structural emission, `GET /events` + `GET /events/stream` (Part 1); the live
 observability tree `GET /observe/tree` and the self-contained operator HTML
-page `GET /observe` (Part 2, §8).
+page `GET /observe` (Part 2, §8); the multi-product publish ingress —
+`POST /events`, the `source_product` envelope field, source-scoped publish
+tokens, and store-side privacy re-redaction of foreign events (Part 3, §9).
 
 AgentConnect owns one append-only, sequenced event stream — `event_log`, a
 table in the same SQLite ledger every other backplane state lives in — that
 BrainConnect, ToolConnect, and ComputeConnect (and any other Connect-family
-service) can replay or tail over HTTP. This is **not a new service**: it is a
-read surface on the existing ledger, authenticated the same way as every
-other AgentConnect route. It carries three producer grades: Engine A's
-same-commit `state.changed` skeleton, Engine A's rich advisory events, and
-Engine B's advisory bridge (`RouterService`/`WorkQueue` transitions, §3) —
-each with its delivery guarantee stated explicitly below.
+service) can replay or tail over HTTP, and now also **publish onto** (§9).
+This is **not a new service**: it is a read *and* write surface on the
+existing ledger, authenticated the same way as every other AgentConnect
+route. It carries four producer grades: Engine A's same-commit
+`state.changed` skeleton, Engine A's rich advisory events, Engine B's
+advisory bridge (`RouterService`/`WorkQueue` transitions, §3), and a foreign
+product's own ingested events (§9) — each with its delivery guarantee stated
+explicitly below.
+
+## 0. Contract doctrine (read this before publishing anything)
+
+The shared bus is **one cross-product, append-only, replayable event STREAM
+for observability, analytics, and debugging.** It is a **PROJECTION of each
+product's own ledger, never a system of record, and never authoritative for
+anything.**
+
+- **Publishers emit best-effort and never block on it.** A publisher's own
+  store is its authority; a down or slow event bus must never break a
+  publisher's real work. `POST /events` is an ordinary synchronous HTTP call
+  from this process's point of view — the "never block" property is an
+  obligation on the CALLER (fire the publish off a background path, tolerate
+  its failure, never gate a real decision on its response), not something
+  this route enforces for you.
+- **The bus is never consulted to make a decision.** ToolConnect's own
+  `AssertionRecord`, ComputeConnect's own placement ledger, BrainConnect's
+  own promotion state — each stays authoritative in its own product. The bus
+  is where you go to *observe* what already happened, never where you go to
+  *decide* what should happen next.
+- **A publisher pre-redacts, but the store never trusts that.** See §9's
+  privacy re-validation — every ingested event is re-checked and, if
+  necessary, re-redacted against its own declared `privacy_tier` before it is
+  ever readable, regardless of what the publisher already did.
 
 ## 1. Envelope
 
@@ -34,7 +62,8 @@ each with its delivery guarantee stated explicitly below.
   "parent_delegation_id": "deleg_...",
   "workspace_id": null,
   "entity_id": null,
-  "payload": { "summary": "..." }
+  "payload": { "summary": "..." },
+  "source_product": "agentconnect"
 }
 ```
 
@@ -61,8 +90,16 @@ Field semantics:
   (redundant with one of the correlation ids above for most vocabularies;
   present so `execution_state` transitions, which have no `event_log` FK
   column of their own, are still traceable).
-- `payload` — privacy-safe, bounded (see §7). Never a prompt, transcript, or
+- `payload` — privacy-safe, bounded (see §6). Never a prompt, transcript, or
   free-form content field.
+- `source_product` — **required**, `agentconnect | brainconnect | toolconnect
+  | computeconnect` (§9). Every event this repository writes for itself
+  (every existing producer below — Path 1, Path 2, the Engine B bridge) is
+  `"agentconnect"`, including every row written before this field existed
+  (an additive migration backfills them, §9.1). A foreign product's own
+  event, ingested via `POST /events`, carries that product's name instead —
+  never chosen by the request body, always the AUTHENTICATED publish
+  token's bound product (§9.2).
 
 ## 2. Seq contract
 
@@ -81,13 +118,25 @@ Field semantics:
 
 ## 3. Delivery guarantees per producer path
 
-Three producers write into the same `event_log` table, with **disjoint
+Four producers write into the same `event_log` table, with **disjoint
 coverage by construction** — no dedup problem, because nothing ever emits the
 same logical event through two paths: Path 1 and Path 2 cover Engine A with
-disjoint event types, and the Engine B bridge covers a different engine on a
+disjoint event types, the Engine B bridge covers a different engine on a
 different database entirely (its `state.changed` rows are distinguishable by
 the `engine: "b"` payload marker and their `task_state`/`ticket_status`
-vocabularies, which Path 1 never writes).
+vocabularies, which Path 1 never writes), and the multi-product publish
+ingress (§9) covers events this repository never generates at all —
+distinguishable by `source_product != "agentconnect"`, which no internal
+producer ever writes.
+
+**The ingress carries NO delivery guarantee of its own** — unlike Path 1/2/
+Engine-B, which describe AgentConnect's own commits, an ingested row exists
+if and only if a foreign product's own `POST /events` call actually
+succeeded. Per the contract doctrine (§0), that call is best-effort BY THE
+PUBLISHER'S OWN DESIGN: a publisher that chooses to drop a failed publish on
+the floor (the correct choice — it must never block its own real work on
+this bus) simply leaves a gap in the bus's view of that product's history.
+The bus is a projection; the gap is not this repository's bug to fix.
 
 ### Path 1 — `state.changed` (structural, same-commit, guaranteed)
 
@@ -200,6 +249,11 @@ member of this enum. New members added for the event bus:
 | `provider_degraded` | `provider.degraded` | `_note_component_health`, edge-triggered |
 | `provider_recovered` | `provider.recovered` | `_note_component_health`, edge-triggered |
 | `tool_executed` | `tool.executed` | **reserved** — no producer yet; see §4.2 |
+| `grant_issued` | `grant.issued` | **reserved for ToolConnect** — capability.* category (§9.4); no producer in this repo |
+| `grant_redeemed` | `grant.redeemed` | **reserved for ToolConnect** — capability.* category (§9.4); no producer in this repo |
+| `generation_placed` | `compute.generation.placed` | **reserved for ComputeConnect** — compute.* category (§9.4); no producer in this repo |
+| `generation_refused` | `compute.generation.refused` | **reserved for ComputeConnect** — compute.* category (§9.4); no producer in this repo |
+| `memory_rejected` | `memory.rejected` | **reserved for BrainConnect** — knowledge.* category (§9.4); no producer in this repo |
 
 ### 4.1 Mapping from this document's originating GOAL vocabulary
 
@@ -254,7 +308,7 @@ action `list_events`, which is operator-plane only
 bound to one manager/reviewer token's task scope. Auth is the ordinary
 `Authorization: Bearer <operator-token>` header every other route uses.
 
-### `GET /events?since=0&limit=100&type=a,b&task_id=&outcome=`
+### `GET /events?since=0&limit=100&type=a,b&task_id=&outcome=&source_product=a,b`
 
 ```json
 { "events": [ /* envelope, §1 */ ], "latest_seq": 128 }
@@ -265,10 +319,19 @@ bound to one manager/reviewer token's task scope. Auth is the ordinary
 - `type` (comma-separated) — an unknown type name is a `400 invalid_request`,
   never a silently-empty filter.
 - `task_id`, `outcome` — exact-match filters.
+- `source_product` (comma-separated, §9) — `agentconnect | brainconnect |
+  toolconnect | computeconnect`. An unknown product name is a `400
+  invalid_request`, same posture as `type`. **Omitted entirely (the
+  default)**: every existing consumer sees everything, internal and foreign
+  events interleaved by `seq` — this filter is additive, nothing about the
+  unfiltered response changed.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8790/events?since=0&limit=50&type=task.created,subtask.completed"
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8790/events?source_product=toolconnect,computeconnect"
 ```
 
 ### `GET /events/stream` (Server-Sent Events)
@@ -276,7 +339,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 The live tail. `since` (query) takes priority over a `Last-Event-ID` resume
 header, which takes priority over "start from the current tail" (a fresh
 live-only subscriber gets `latest_bus_seq()` as its starting cursor, not
-`0`). Each frame:
+`0`). Accepts the same `type` and `source_product` filters as `GET /events`.
+Each frame:
 
 ```
 id: 42
@@ -347,6 +411,13 @@ The browser-facing operator page (`GET /observe`, §8) fetch-polls `GET
 - **Engine B bridge events carry no free text at all** — `{vocabulary, src,
   dst, engine}` only; `reason` is omitted because no privacy tier is in scope
   at that layer to gate it (§3, Engine B bridge).
+- **A foreign (ingested) event's `payload` is re-validated and re-redacted at
+  the STORE, unconditionally** — see §9.3. This is a different mechanism from
+  every rule above (which all gate at WRITE time, inside AgentConnect's own
+  process, against a `Subtask`'s tier): an ingested event carries its own
+  `privacy_tier` claim with no `Subtask` behind it at all, and the store
+  never trusts a publisher's own pre-redaction of `payload` regardless of
+  what that claim says.
 
 ## 7. Consumer guidance
 
@@ -474,3 +545,150 @@ detail (prompt, tool, model, tokens, cost, lease, artifacts, elapsed,
 delegation ids) in a side panel. It intentionally fetch-polls rather than
 using `EventSource` (see §5) — a browser `EventSource` cannot set an
 `Authorization` header.
+
+## 9. Multi-product publish ingress (Part 3)
+
+Every event described in §1–§8 originates INSIDE this repository. This
+section is the one exception: a sibling Connect-family product publishes its
+OWN event onto the same stream, over HTTP, authenticated by a credential
+scoped to exactly that product.
+
+Read the contract doctrine in §0 first — this route is a projection ingress,
+not a decision surface, and a publisher must never block real work on it.
+
+### 9.1 Schema and migration
+
+`event_log` gained one column: `source_product TEXT NOT NULL DEFAULT
+'agentconnect'`. A fresh database gets it from `_SCHEMA` directly; an
+existing database is brought forward at open time
+(`SqliteStorage._migrate`) via `ALTER TABLE event_log ADD COLUMN
+source_product TEXT NOT NULL DEFAULT 'agentconnect'` — SQLite backfills
+every pre-existing row with that default in the same statement, which is
+also the factually correct backfill: every row ever written before this
+column existed really was written by AgentConnect itself.
+
+### 9.2 `POST /events` — publish
+
+```json
+{
+  "type": "grant.issued",
+  "source_product": "toolconnect",
+  "event_id": "publisher-chosen-id-optional",
+  "outcome": null,
+  "actor": "toolconnect-governor",
+  "task_id": "task_...",
+  "subtask_id": null, "run_id": null, "review_id": null, "session_id": null,
+  "delegation_id": null, "parent_delegation_id": null, "workspace_id": null,
+  "entity_id": null,
+  "privacy_tier": "public",
+  "payload": { "grant_id": "grant_ab12" }
+}
+```
+
+Response `201`: `{"seq": 129, "event_id": "publisher-chosen-id-optional"}`.
+`seq` is `null` on an idempotent `event_id` replay (a duplicate publish —
+same `event_id` as a row already stored — inserts nothing new, exactly like
+Path 2's own `event_id UNIQUE` idempotency).
+
+Body = the envelope (§1) MINUS `seq`. `event_id` and `ts` are caller-optional
+— the store assigns both when absent (`ts` always; `event_id` only if the
+caller did not pre-set one, letting a publisher drive its own idempotent-
+retry story the same way Path 2 already can). `type` must be a known
+`EventType` wire id (§4) or `400 invalid_request`; `source_product` must be
+one of the four known products or `400 invalid_request`.
+
+**Auth: a publish token, scoped to exactly one `source_product`, forever.**
+Minted via `AgentConnectService.mint_publish_token(source_product,
+ttl_seconds=...)` (CLI: `agentconnect tokens publish --source-product
+toolconnect`) — never by `launch`, and refused to a managed agent session by
+the CLI's own operator-command guard, the same posture as `tokens issue`. The
+resulting token can reach exactly one action, `publish_event`, and no other —
+it is not a manager, reviewer, readonly, or operator token, and none of
+those token kinds can reach `publish_event` either.
+
+**The anti-forgery property**: `AgentConnectService.authorize`'s
+`publish_event` binding check requires the token's scope to carry a
+`source_product`, and — when the request also names one, which `POST
+/events` always does — requires the two to match exactly. A token minted for
+`toolconnect` presented against a request claiming `source_product:
+"computeconnect"` is refused with `403 policy_violation` before any row is
+written. The row that DOES get written is stamped with the AUTHENTICATED
+scope's `source_product`, never blindly copied from the request body — belt
+and suspenders on top of the 403.
+
+```bash
+TOKEN=$(agentconnect tokens publish --source-product toolconnect | jq -r .token)
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"grant.issued","source_product":"toolconnect","privacy_tier":"public","payload":{"grant_id":"grant_ab12"}}' \
+  http://localhost:8790/events
+```
+
+### 9.3 Privacy re-validation (fail-closed, at the store)
+
+Every ingested event's `payload` passes through
+`SqliteStorage.append_bus_event_ingested` (the ingress's ONE write path,
+just as `append_bus_event`/`_insert_event_row` are the one write path for
+every other producer) BEFORE it is ever readable:
+
+1. `privacy_tier` (a plain string on the request) is parsed against
+   `PrivacyTier`. Missing or unparseable — **fails closed to
+   `secret_sensitive`**, the same asymmetric failure mode
+   `observability.tree._safe_tier` already uses for read-time redaction, for
+   the same reason: leaking by default is the one failure a redaction
+   boundary must never have.
+2. `local_only`/`secret_sensitive` (`PRIVACY_STRICTNESS >= 3`) — the WHOLE
+   `payload` is replaced with `{"redacted": "<marker>"}`, reusing the exact
+   marker strings `/observe/tree` already withholds text with
+   (`"[withheld: local_only]"` / `"[redacted: secret_sensitive]"`, §8) — one
+   vocabulary for "this content was withheld", not two.
+3. Every looser tier still passes through the SAME metadata scrubber every
+   internal event's payload already gets
+   (`SqliteEventLogProvider._scrub` — drops known-sensitive keys, masks
+   credential-shaped keys, bounds every string) — defense in depth: a
+   publisher's own `public`-tier claim does not exempt it from the ordinary
+   scrub.
+
+This re-validation happens **regardless of what the publisher already did**
+to `payload` before sending it. A publisher SHOULD still pre-redact (defense
+in depth, and it reduces what crosses the wire at all) — but the store's
+behavior does not depend on that having happened correctly.
+
+### 9.4 Vocabulary namespaces (reserved for future publishers)
+
+§4's table lists the wire ids reserved for each product's category. Two
+design choices, stated explicitly because they are easy to get backwards:
+
+- **A namespace category (`capability.*`, `compute.*`, `knowledge.*`) is a
+  grouping label, not a literal string prefix.** Wire ids stay whatever they
+  already were, or would naturally be, WITHOUT a category prefix glued on —
+  `grant.issued`, not `capability.grant.issued`; `compute.generation.placed`,
+  not `compute.capability.generation.placed`. This matches every existing
+  wire id in the enum (`tool.authorized`, not `capability.tool.authorized`;
+  `provider.offline`, not `compute.provider.offline`).
+- **A concept that already shipped a wire id keeps it, tagged with
+  `source_product` instead of forked into a parallel string.** `tool.
+  authorized`/`outcome=denied` already covers ToolAuthorized/ToolDenied for
+  ToolConnect; `provider.offline`/`degraded`/`recovered` already cover
+  provider health for ComputeConnect; `memory.captured`/`memory.promoted`
+  already cover capture/promotion for BrainConnect. None of those were
+  renamed or duplicated — a future publisher tags its own emission of one of
+  these with its `source_product` and the existing wire id, rather than the
+  bus growing `capability.tool.authorized` as a synonym of `tool.authorized`.
+  New members exist ONLY where no wire id already covered the concept:
+  `grant.issued`/`grant.redeemed` (ToolConnect), `compute.generation.
+  placed`/`compute.generation.refused` (ComputeConnect), `memory.rejected`
+  (BrainConnect).
+
+No ToolConnect, ComputeConnect, or BrainConnect publisher exists in this
+repository today — the wire ids above are reserved ahead of that
+integration, the same posture `tool.executed` (§4.2) already established for
+a single reserved id.
+
+### 9.5 Consuming foreign events
+
+`GET /events`/`GET /events/stream` gained a `source_product` filter (§5),
+comma-separated like `type`. Omitted entirely (the default for every
+existing consumer), nothing changes — foreign events are simply interleaved
+with internal ones in `seq` order, same as the Engine B bridge's rows
+already are. A consumer that wants only ToolConnect's own view of the world:
+`GET /events?source_product=toolconnect`.

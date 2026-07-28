@@ -452,6 +452,31 @@ def _cmd_tokens_issue(svc: AgentConnectService, a: argparse.Namespace) -> None:
     })
 
 
+def _cmd_tokens_publish(svc: AgentConnectService, a: argparse.Namespace) -> None:
+    """Mint a publish token for `POST /events` (shared ecosystem event bus,
+    docs/EVENT_BUS.md contract v1). Scoped to exactly one `source_product`
+    forever — a mismatch between this token's product and a publish
+    request's own `source_product` field is a hard 403
+    (`AgentConnectService.authorize`'s anti-forgery binding check).
+
+    Printed once, like an operator token. `_refuse_operator_command` denies
+    this to a managed agent session for the same reason it denies `tokens
+    issue`: minting either kind of unscoped-by-task credential is an
+    operator action.
+    """
+    token = svc.mint_publish_token(a.source_product, ttl_seconds=a.ttl)
+    _emit({
+        "token": token.plaintext,
+        "source_product": a.source_product,
+        "mode": "publisher",
+        "expires_at": token.expires_at,
+        "usage": f'curl -H "Authorization: Bearer {token.plaintext}" '
+                 f'-d \'{{"type":"...","source_product":"{a.source_product}",...}}\' '
+                 f'.../events',
+        "warning": "shown once; store it as you would a password",
+    })
+
+
 def _cmd_complete(svc: AgentConnectService, a: argparse.Namespace) -> None:
     if a.review:
         result = svc.complete_review_audited(
@@ -686,6 +711,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="who this credential speaks for; recorded on every action")
     q.add_argument("--ttl", type=int, default=12 * 3600, help="seconds (default 12h)")
     q.set_defaults(func=_cmd_tokens_issue, group="tokens")
+
+    q = tokens.add_parser(
+        "publish",
+        help="mint a source-scoped publish token for the shared event bus (shown once)",
+    )
+    q.add_argument("--source-product", required=True, dest="source_product",
+                   choices=["agentconnect", "brainconnect", "toolconnect", "computeconnect"],
+                   help="the ONE product this token may publish events as")
+    q.add_argument("--ttl", type=int, default=12 * 3600, help="seconds (default 12h)")
+    q.set_defaults(func=_cmd_tokens_publish, group="tokens")
 
     p = top.add_parser("complete", help="mark complete — only if the audit passes")
     p.add_argument("task_id", nargs="?")

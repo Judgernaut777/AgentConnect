@@ -37,12 +37,52 @@ _MASK_SUBSTRINGS = ("token", "secret", "api_key", "apikey", "password",
 
 _MAX_STRING = 500
 
+#: How deep the recursive scrubber will descend into nested objects/arrays
+#: before it stops inspecting and withholds the remaining subtree wholesale. A
+#: FOREIGN (publish-ingress) payload is attacker-controlled JSON: without a
+#: bound, a deeply nested body could exhaust the stack, and — more importantly —
+#: a secret buried below the point we inspect would otherwise pass through
+#: unscrubbed. The limit is generous for any legitimate event payload.
+_MAX_DEPTH = 8
 
-def _scrub(metadata: dict[str, Any]) -> dict[str, Any]:
+
+def _scrub_value(value: Any, depth: int) -> Any:
+    """Recursively scrub one value. Descends into nested dicts (so credential-
+    shaped keys are masked and known-sensitive keys dropped at ANY depth, not
+    just the top level) and into lists/tuples, bounds every string, and never
+    raises — a value that cannot be represented is replaced with a bounded
+    `repr()` rather than dropped silently or leaked whole."""
+    if depth > _MAX_DEPTH:
+        # Past the bound we refuse to pass the subtree through: a secret nested
+        # below here would escape inspection, so fail closed.
+        return "[nested too deep]"
+    if isinstance(value, dict):
+        return _scrub(value, depth)
+    if isinstance(value, (list, tuple)):
+        return [_scrub_value(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        return value[:_MAX_STRING]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    try:
+        import json as _json
+
+        _json.dumps(value)
+        return value
+    except Exception:  # noqa: BLE001 — never let a weird value break scrubbing
+        try:
+            return repr(value)[:200]
+        except Exception:  # noqa: BLE001
+            return "[unrepresentable]"
+
+
+def _scrub(metadata: dict[str, Any], depth: int = 0) -> dict[str, Any]:
     """Drop known-sensitive keys, mask credential-shaped ones, bound every
-    remaining string, and never raise — a value that cannot be represented is
-    replaced with a bounded `repr()` rather than dropped silently or leaked
-    whole."""
+    remaining string, and recurse into nested objects/arrays so the same key
+    masking applies at every depth (a secret nested one level deep must not
+    survive — docs/EVENT_BUS.md §9.3). Never raises."""
+    if depth > _MAX_DEPTH:
+        return {"redacted": "[nested too deep]"}
     out: dict[str, Any] = {}
     for key, value in (metadata or {}).items():
         lower = str(key).lower()
@@ -51,21 +91,7 @@ def _scrub(metadata: dict[str, Any]) -> dict[str, Any]:
         if any(s in lower for s in _MASK_SUBSTRINGS):
             out[key] = "[redacted]"
             continue
-        if isinstance(value, str):
-            out[key] = value[:_MAX_STRING]
-        elif isinstance(value, (int, float, bool)) or value is None:
-            out[key] = value
-        else:
-            try:
-                import json as _json
-
-                _json.dumps(value)
-                out[key] = value
-            except Exception:  # noqa: BLE001 — never let a weird value break scrubbing
-                try:
-                    out[key] = repr(value)[:200]
-                except Exception:  # noqa: BLE001
-                    out[key] = "[unrepresentable]"
+        out[key] = _scrub_value(value, depth + 1)
     return out
 
 

@@ -714,6 +714,24 @@ def test_the_operator_may_mint_one_outside_a_managed_session(svc, monkeypatch, c
     assert svc.authorize(token, "complete_task")["mode"] == "operator"
 
 
+def test_an_agent_shell_cannot_mint_itself_a_publish_token(svc, monkeypatch, capsys):
+    """Minting a publish token is the same operator-only hole as `tokens
+    issue` (docs/EVENT_BUS.md shared event bus contract v1): it would grant a
+    managed agent session a credential it was never issued."""
+    assert _cli_main(["tokens", "publish", "--source-product", "toolconnect"],
+                     svc, mode="manager", monkeypatch=monkeypatch) == 2
+    assert "forbidden_action" in capsys.readouterr().err
+
+
+def test_the_operator_may_mint_a_publish_token_outside_a_managed_session(svc, monkeypatch, capsys):
+    assert _cli_main(["tokens", "publish", "--source-product", "toolconnect"], svc,
+                     monkeypatch=monkeypatch) == 0
+    token = json.loads(capsys.readouterr().out)["token"]
+    assert token.startswith("act_")
+    scope = svc.authorize(token, "publish_event", source_product="toolconnect")
+    assert scope["source_product"] == "toolconnect"
+
+
 def test_a_reviewer_may_still_complete_its_own_review(svc, task, monkeypatch):
     """Completing a review is a reviewer action; completing a task is not."""
     artifact = svc.create_artifact(task.id, CreateArtifactRequest(

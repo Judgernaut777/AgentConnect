@@ -148,6 +148,42 @@ class EventType(str, Enum):
     #: member ships so the wire identifier is fixed ahead of that integration.
     tool_executed = "tool.executed"
 
+    # ---- Shared ecosystem event bus, multi-product publish ingress
+    # (docs/EVENT_BUS.md, "shared event bus contract v1"). New members below
+    # are only added where no existing wire id already covers the concept —
+    # several of the contract's namespace categories reuse wire ids that
+    # shipped long before `source_product` existed, tagged with the new field
+    # instead of forked into a parallel string (wire values are stable, never
+    # renamed, per this enum's own docstring above):
+    #   * capability.* (ToolConnect) — `tool.authorized` (+ `outcome=denied`
+    #     for a deny, §4.2 of the doc) and the reserved `tool.executed` above
+    #     already cover `ToolAuthorized`/`ToolDenied`/`ToolExecuted`; only
+    #     `grant.issued`/`grant.redeemed` are genuinely new concepts.
+    #   * compute.* (ComputeConnect) — `provider.offline`/`provider.degraded`/
+    #     `provider.recovered` above already cover provider health; only the
+    #     per-generation placement/refusal decisions are new.
+    #   * knowledge.* (BrainConnect) — `memory.captured`/`memory.promoted`
+    #     above already cover capture/promotion; only a candidate's outright
+    #     rejection is new. BrainConnect's own publisher is deferred, but the
+    #     wire id is reserved now per the contract.
+    #: A capability grant (a durable, redeemable authorization — distinct
+    #: from the per-call `tool.authorized` decision) was issued.
+    grant_issued = "grant.issued"
+    #: A previously issued grant was redeemed (consumed) for one invocation.
+    grant_redeemed = "grant.redeemed"
+    #: A generation request was placed on a specific compute provider —
+    #: distinct from `compute_placed` ("compute.placed"), which is
+    #: AgentConnect's own subtask-routing decision, not a ComputeConnect
+    #: generation placement.
+    generation_placed = "compute.generation.placed"
+    #: A generation request was refused (no eligible provider, budget/quota
+    #: exhausted, policy deny, ...).
+    generation_refused = "compute.generation.refused"
+    #: A memory candidate was considered and NOT promoted — the outcome
+    #: `memory.captured`/`memory.promoted` do not cover. Carries no claim
+    #: content, same posture as `memory_promoted`.
+    memory_rejected = "memory.rejected"
+
 
 class ObservationState(str, Enum):
     """The normalized agent state model (Part III).
