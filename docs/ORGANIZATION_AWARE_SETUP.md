@@ -54,9 +54,12 @@ broader policy on top rather than rebuilding the ledger.
 
 ## Boundary
 
-AgentConnect remains a **compliance and control layer, not a security sandbox**, at organizational
-scale too. Org-aware setup adds structure to *who may do what and whether it is recorded*; it does
-not turn the Work plane into an isolation boundary it was never built to be.
+AgentConnect **manages workspace isolation through pluggable enforcement providers; it is not
+itself a container or virtualization implementation** — at organizational scale too. Org-aware
+setup adds structure to *who may do what and whether it is recorded*, and may require a minimum
+isolation level per workspace, project, or department; the selected enforcement provider is what
+holds that boundary, not the Work plane's ledger. The tier that ships today is Level 0–1; see
+[WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md) and [SETUP_INTEGRATION.md](SETUP_INTEGRATION.md).
 
 ## See also
 
