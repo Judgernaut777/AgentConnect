@@ -5,7 +5,7 @@
 > [BrainConnect](https://github.com/Judgernaut777/BrainConnect) for trusted long-term
 > memory.
 
-AgentConnect is a task, artifact, decision, review, routing, and handoff backplane for coding agents. It provides a managed launch / shell workflow for tools like Codex or Claude Code, records agent work in an operator ledger, injects bounded context into workers, supports review and audit, and prevents normal managed-agent sessions from completing their own tasks. It is a compliance/control layer, not a security sandbox.
+AgentConnect is the **Work plane** of the [Connect ecosystem](https://github.com/Judgernaut777/Connect): a task, artifact, decision, review, routing, and handoff backplane for coding agents. It provides a managed launch / shell workflow for tools like Codex or Claude Code — coordinating them as interchangeable native executors, never replacing them — records agent work in an operator ledger, injects bounded context into workers, supports review and audit, and prevents normal managed-agent sessions from completing their own tasks. It owns the workspace lifecycle and **manages workspace isolation through pluggable enforcement providers; it is not itself a container or virtualization implementation** ([WORKSPACE_ISOLATION.md](docs/WORKSPACE_ISOLATION.md)). The tier that ships today is managed execution (Level 0–1); container and microVM enforcement are design direction.
 
 > Agents may think and work inside their own harness. But durable work must enter
 > AgentConnect. **If it is not recorded in AgentConnect, it did not happen.**
@@ -56,13 +56,18 @@ AgentConnect first, and only then any tracker.
 
 ## Trust boundary
 
-**AgentConnect is not a sandbox.** It is a compliance and control layer. It makes
-AgentConnect the normal path and makes bypasses visible; it does not contain a hostile
-process. `AGENTCONNECT_DB_PATH` is forwarded into the agent's environment on purpose (so
-the agent's tools reach the operator's ledger rather than a private fallback), backend
-credentials never are, and `AGENTCONNECT_MODE` restricts what the CLI will do inside a
-managed session. Direct SQLite, filesystem, and environment tampering are out of scope
-and would need OS-level isolation.
+**AgentConnect is not *itself* an isolation runtime.** It owns the workspace lifecycle and
+isolation *policy*, and delegates *enforcement* to a pluggable provider
+([WORKSPACE_ISOLATION.md](docs/WORKSPACE_ISOLATION.md)). The tier that ships today is
+**Level 0–1** (managed directories, environment, credentials, and tools): it makes
+AgentConnect the normal path and makes bypasses visible, but it **does not contain a
+hostile process** — that containment property arrives with a Level 2–3 provider (a
+container, a microVM, a separate user), which is design direction. `AGENTCONNECT_DB_PATH`
+is forwarded into the agent's environment on purpose (so the agent's tools reach the
+operator's ledger rather than a private fallback), backend credentials never are, and
+`AGENTCONNECT_MODE` restricts what the CLI will do inside a managed session. Direct SQLite,
+filesystem, and environment tampering are outside the current Level 0–1 boundary and would
+need a Level 2–3 enforcement provider.
 
 The **HTTP and MCP transports authenticate**: every route but `GET /health` and every MCP
 tool call resolves the agent's scoped `act_` token through one `authorize()` rule. A

@@ -108,10 +108,15 @@ Worth stating plainly, because a green suite invites more confidence than it has
   [ECOSYSTEM_FINDINGS.md](ECOSYSTEM_FINDINGS.md)).
 * **Temporal is tested against the in-process time-skipping test server**, never a
   deployed cluster.
-* **The compliance layer is not a sandbox.** It makes AgentConnect the normal path and
-  makes bypasses visible. It does not contain a hostile process. An agent that edits its
-  own environment, or opens the SQLite file directly, is stopped by nothing here. That is
-  the documented scope, not an oversight. In particular the **CLI** still opens
+* **The shipped isolation tier (Level 0–1) does not contain a hostile process.**
+  AgentConnect owns the workspace lifecycle and isolation *policy* and delegates
+  *enforcement* to a pluggable provider ([WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md));
+  it is not itself a container or virtualization implementation. Today it ships managed
+  execution (Level 0–1): it makes AgentConnect the normal path and makes bypasses visible.
+  An agent that edits its own environment, or opens the SQLite file directly, is stopped by
+  nothing at this tier — containment arrives with a Level 2–3 provider (a container, a
+  microVM, a separate user), which is design direction, not current runtime. That is the
+  documented scope, not an oversight. In particular the **CLI** still opens
   `AGENTCONNECT_DB_PATH` directly and is guarded only by `AGENTCONNECT_MODE`; the HTTP and
   MCP transports now authenticate, the CLI does not.
 * **The default safety engine is pattern-based.** The `baseline` engine catches the
@@ -136,7 +141,11 @@ Worth stating plainly, because a green suite invites more confidence than it has
   never AgentConnect's task. What stays tracked here is the wire-level test gap above.
   Do not build it from this side.
 * Container / microVM isolation for `agentconnect shell` (the `--container` seam is
-  designed for and deliberately unbuilt).
+  designed for and deliberately unbuilt) — the Level 2–3 enforcement providers in
+  [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md).
+* The generalized [budget model](BUDGET_MODEL.md) (arbitrary amounts/intervals/scopes,
+  overlapping budgets, delegation). The shipped budget is a single global daily/weekly/
+  monthly cap.
 * `TaskWorkflow`, `ManagerHandoffWorkflow`, `WorkerPipelineWorkflow`.
 * Mem0 / Supermemory adapters; soft user-preference memory. Both explicitly excluded.
 * Contradiction *detection* between promoted claims.
