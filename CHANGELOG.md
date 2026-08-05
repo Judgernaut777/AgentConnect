@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — 2026-08-05 — R6: Execution Records close the ADR-048 vertical slice
+
+AgentConnect now emits a durable, hash-sealed **Execution Record** whenever a
+governance-grant redemption gates a tool call at the final invocation boundary —
+the Layer 3 artifact of the ADR-037 taxonomy, completing the slice
+*work request → decision → grant → redemption → execution*.
+
+### Added
+
+* **`agentconnect.core.execution_records`** — a pure module (no I/O, no clock)
+  with the Execution Record model (`record_format_version: "1"`), the
+  ecosystem's canonical-JSON + SHA-256 seal discipline, and the constructive
+  fail-closed rule: `build_execution_record` refuses to build a `succeeded`
+  record without a verified, redeemed Provider Enforcement reference.
+* **`execution_records` ledger table** (additive, `CREATE TABLE IF NOT EXISTS`)
+  with indexes on every linkage id, plus
+  `agentconnect.core.execution_record_store.ExecutionRecordLedger` — the
+  write/traversal door (wraps the storage handle, the same pattern as the
+  event-log providers): verifies the seal, attaches the `prev_hash` chain
+  position inside the write transaction, rejects tampered records, and filters
+  for bidirectional traversal by any id in the chain.
+* **`ToolConnectGovernor.redeem_governance_grant`** — additive client for
+  ToolConnect's `POST /redemptions` (R5), fail-closed like `redeem`.
+  Deliberately not on the `ToolGovernor` Protocol: **the
+  `toolconnect_governor` contract stays 1.1, unbumped**.
+* **Runtime wiring** (`GovernanceLinkage` on `build_execution_graph` /
+  `LangGraphAgentRuntime`): a governance-linked run redeems the signed grant
+  immediately before each side-effecting tool call and emits an Execution
+  Record for every outcome — `succeeded`, `failed`, and `refused` (denial,
+  outage, wrong-grant echo, or no governor bound — all refuse, never degrade
+  into ungoverned execution). Existing behavior with no linkage bound is
+  byte-identical.
+* Tests: `tests/test_execution_records.py` (22), `tests/test_runtime_governance_linkage.py`
+  (12, incl. an end-to-end run over a verbatim copy of governance conformance
+  vector gv-001's signed grant). Gate: 1230 passed → 1264 passed, 17 skipped.
+
 ## Unreleased — 2026-07-24 — ecosystem review: review-finding fixes and doc reconciliation
 
 A sweep over the Connect ecosystem's loose ends: the two remaining code defects
