@@ -25,6 +25,7 @@ SESSION = "session"
 WORKSPACE = "workspace"
 TOKEN = "token"
 DELEGATION = "deleg"
+EXECREC = "execrec"
 
 
 def new_id(prefix: str) -> str:

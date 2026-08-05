@@ -278,3 +278,31 @@ subprotocol with a silent decision-only fallback.
 * [MULTI_HARNESS.md](MULTI_HARNESS.md) — router MCP deployment models.
 * [INTEGRATION_ISSUES.md](INTEGRATION_ISSUES.md) — the defects named above.
 * [SAFETY.md](SAFETY.md) — surfaces, policy, engines.
+
+## 8. Governance-grant redemption and Execution Records (R6)
+
+Addendum (2026-08-05, ADR-048 slice close-out): when a run carries a
+**Connect-Governance execution grant** (the R4 artifact), the final invocation
+boundary changes shape. The contract-1.1 authorize+redeem pair is replaced —
+for that run — by a single point-of-effect redemption:
+`ToolConnectGovernor.redeem_governance_grant(grant, principal, source_id,
+name, args, at=...)` → ToolConnect `POST /redemptions` (R5). The method is
+additive on the concrete governor and deliberately NOT on the `ToolGovernor`
+Protocol, so **the `toolconnect_governor` contract stays 1.1, unbumped** — the
+runtime detects the capability with `getattr` and fails closed when absent.
+
+Every governed call of a governance-linked run emits an **Execution Record**
+(`agentconnect.core.execution_records`, contract pinned by Connect-Governance
+`docs/EXECUTION_RECORD.md`): the full id chain (`work_request_id` ·
+`decision_record_id` · `grant_id` · `correlation_id` · Provider Enforcement
+reference · task/subtask), executor identity, outcome, and a hash seal, stored
+append-only in the ledger's `execution_records` table
+(`agentconnect.core.execution_record_store.ExecutionRecordLedger` — the
+write/traversal door, wrapping the storage handle the way the event-log
+providers do — chains `prev_hash` at write time). Fail closed end to end: a governance-linked
+run with a denied/failed/absent redemption — or no governor at all — refuses
+execution and records `refused`; a `succeeded` record is not constructible
+without a verified redemption. Wiring: `GovernanceLinkage` on
+`build_execution_graph` / `LangGraphAgentRuntime`; the sink is a callable
+(`ExecutionRecordLedger(service.storage).record` in production, `list.append`
+in tests), the same seam idiom as `memory_sink`.

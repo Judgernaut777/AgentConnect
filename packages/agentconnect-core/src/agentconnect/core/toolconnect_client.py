@@ -92,6 +92,36 @@ class RedeemResult:
 
 
 @dataclass(frozen=True)
+class GovernanceRedemption:
+    """The outcome of redeeming a **Connect-Governance execution grant** at
+    ToolConnect's ``POST /redemptions`` point-of-effect route (R5; artifact and
+    provider obligations pinned by Connect-Governance's
+    ``docs/REDEMPTION_CONTRACT.md``).
+
+    ``redeemed`` is ``True`` **only** on the literal JSON ``true`` — never
+    inferred. The linkage fields (``grant_id`` / ``decision_record_id`` /
+    ``correlation_id``) are echoed from the signed grant payload by the
+    provider; they are what an Execution Record (R6) embeds as its
+    Provider Enforcement Record reference. ``unavailable`` marks a
+    transport/shape/contract failure as opposed to a genuine point-of-effect
+    deny (``reason`` then carries the stable failure code, e.g.
+    ``signature_mismatch``, ``expired``, ``already_redeemed``).
+    """
+
+    redeemed: bool
+    reason: str = ""
+    grant_id: str = ""
+    decision_record_id: str = ""
+    correlation_id: str = ""
+    source_id: str = ""
+    name: str = ""
+    failure_codes: tuple[str, ...] = ()
+    unavailable: bool = False
+    contract_version: str = ""
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ToolDecision:
     """AgentConnect's view of a ToolConnect decision.
 
@@ -395,6 +425,75 @@ class ToolConnectGovernor:
             decision_id=str(payload.get("decision_id") or ""),
             source_id=str(payload.get("source_id") or ""),
             name=str(payload.get("name") or ""),
+            contract_version=cv,
+            raw=dict(payload),
+        )
+
+    def redeem_governance_grant(
+        self, grant: Mapping[str, Any], principal: Mapping[str, Any],
+        source_id: str, name: str, args: Mapping[str, Any],
+        *, at: Optional[str] = None,
+    ) -> GovernanceRedemption:
+        """Redeem a Connect-Governance execution grant at the point of effect.
+
+        This is the R5 route (``POST /redemptions``), NOT the contract-1.1
+        ``/grants/{id}/redeem``: the grant artifact is the Ed25519-signed
+        governance object (payload + signature), verified offline by the
+        provider against its configured trust root. The whole artifact is
+        forwarded verbatim — this adapter never parses, re-signs, or mutates
+        it. ``at`` (RFC 3339) is the instant the validity window is judged
+        against; omitted, the provider uses its own request time.
+
+        Same never-raise, fail-closed posture as :meth:`redeem`: any transport
+        failure, non-200, or body without a readable ``"redeemed"`` resolves
+        to ``GovernanceRedemption(redeemed=False, unavailable=True)``. A
+        point-of-effect denial (bad signature, expired window, scope mismatch,
+        replay, missing trust root) is a normal ``redeemed=False`` return with
+        the stable failure code in ``reason`` — denials are decisions, not
+        errors (HTTP 200), mirroring ToolConnect's own contract.
+
+        This method lives on the concrete governor, deliberately NOT on the
+        :class:`ToolGovernor` Protocol: contract 1.1 stays exactly what it
+        was, and runtime callers detect the capability with ``getattr`` (the
+        same pattern the act loop already uses for ``redeem``) and fail closed
+        when it is absent.
+        """
+        body: dict[str, Any] = {
+            "grant": dict(grant), "principal": dict(principal),
+            "source_id": source_id, "name": name, "args": dict(args),
+        }
+        if at is not None:
+            body["at"] = at
+        try:
+            status, payload = self._call("POST", "/redemptions", body)
+        except ToolConnectUnavailable as exc:
+            _log.warning("toolconnect governance redeem unreachable; denying "
+                         "fail-closed: %s", exc)
+            return GovernanceRedemption(
+                False, reason=f"toolconnect unreachable: {exc}", unavailable=True)
+        if status != 200 or not isinstance(payload, dict) or "redeemed" not in payload:
+            _log.warning("toolconnect /redemptions returned %s; denying fail-closed",
+                         status)
+            return GovernanceRedemption(
+                False, reason=f"/redemptions returned {status}", unavailable=True)
+        cv = str(payload.get("contract_version", ""))
+        major = (cv or "0").split(".", 1)[0]
+        if cv and major != EXPECTED_CONTRACT_MAJOR:
+            _log.warning("toolconnect redemption contract v%s incompatible with "
+                         "expected major %s; denying fail-closed", cv,
+                         EXPECTED_CONTRACT_MAJOR)
+            return GovernanceRedemption(
+                False, reason=f"incompatible decision contract v{cv}",
+                unavailable=True, contract_version=cv)
+        return GovernanceRedemption(
+            redeemed=payload.get("redeemed") is True,  # explicit True only
+            reason=str(payload.get("reason", "")),
+            grant_id=str(payload.get("grant_id") or ""),
+            decision_record_id=str(payload.get("decision_record_id") or ""),
+            correlation_id=str(payload.get("correlation_id") or ""),
+            source_id=str(payload.get("source_id") or ""),
+            name=str(payload.get("name") or ""),
+            failure_codes=tuple(str(c) for c in (payload.get("failure_codes") or ())),
             contract_version=cv,
             raw=dict(payload),
         )

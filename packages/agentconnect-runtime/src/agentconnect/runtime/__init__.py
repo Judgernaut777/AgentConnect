@@ -8,6 +8,7 @@ model-manager backends and the router's local clients alike.
 
 from .actions import Action, parse_action
 from .agent import AgentRuntime, LangGraphAgentRuntime, ModelSource, RuntimeConfig
+from .graph import GovernanceLinkage
 from .memory import McpStdioMemorySink, MemorySink, NullMemorySink
 from .pull_worker import PullWorker
 from .results import worker_result_from_state
@@ -18,6 +19,7 @@ from .workspace import Workspace, WorkspaceError
 __all__ = [
     "Action",
     "AgentRuntime",
+    "GovernanceLinkage",
     "HttpAgentRuntime",
     "LangGraphAgentRuntime",
     "McpStdioMemorySink",
