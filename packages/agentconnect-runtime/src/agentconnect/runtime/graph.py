@@ -12,6 +12,8 @@ selection — stays in the router.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 from agentconnect.common.schemas import GenerateRequest
@@ -27,9 +29,64 @@ from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .memory import MemorySink
+    from agentconnect.core.execution_records import ExecutionRecord
     from agentconnect.core.toolconnect_client import ToolGovernor
 
 _log = logging.getLogger(__name__)
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _new_execrec_id() -> str:
+    from agentconnect.core import ids  # local: keeps the import graph shallow
+
+    return ids.new_id(ids.EXECREC)
+
+
+@dataclass(frozen=True)
+class GovernanceLinkage:
+    """R6 wiring: the governance context under which this run's tool calls
+    execute (ADR-048 vertical slice).
+
+    When bound to ``build_execution_graph``, the act/tool loop redeems the
+    carried **Connect-Governance execution grant** at ToolConnect's
+    point-of-effect route (``POST /redemptions``, R5) immediately before every
+    side-effecting tool call, and emits an **Execution Record** —
+    ``sink(record)`` — for every governed call: ``succeeded``/``failed`` after
+    execution, ``refused`` when redemption denied or the capability is absent.
+    Fail-closed holds end to end: no successful redemption → no execution →
+    and (enforced again inside ``build_execution_record``) no "succeeded"
+    record.
+
+    The linkage ids (``work_request_id`` / ``decision_record_id`` /
+    ``grant_id`` / ``correlation_id``) are read from the SIGNED grant payload
+    at emission time — they are the issuer's attestation, not the runtime's
+    say-so — with the redemption's echoes as fallback.
+
+    ``sink`` is a plain callable (the same seam idiom as ``memory_sink``):
+    tests pass ``list.append``; production wiring passes
+    ``ExecutionRecordLedger(storage).record``. Sink failures are logged and
+    never mask the tool result — the audit path must not destroy work that
+    already ran, exactly like ToolConnect's best-effort outcome recording.
+    """
+
+    grant: Mapping[str, Any]
+    sink: Callable[["ExecutionRecord"], None]
+    executor_id: str = "agentconnect-runtime"
+    executor_kind: str = "worker"
+    harness: str = "agentconnect-runtime"
+    subtask_id: Optional[str] = None
+    #: Instant presented to the provider for the validity window (RFC 3339).
+    #: None → the provider judges against its own request time. Tests pin it.
+    at: Optional[str] = None
+    #: Wall-clock seam for the record's started/finished timestamps; the runtime
+    #: is not a purity-bound component, so the default is the real UTC clock.
+    clock: Callable[[], str] = _utc_now_rfc3339
+    #: Record-id minter (uuid-backed by default; tests pin a counter).
+    record_id_factory: Callable[[], str] = _new_execrec_id
+
 
 
 def build_execution_graph(
@@ -45,6 +102,7 @@ def build_execution_graph(
     tool_governor: "ToolGovernor | None" = None,
     governed_principal: Optional[Mapping[str, Any]] = None,
     governed_source_id: str = "agentconnect-runtime",
+    governance: Optional[GovernanceLinkage] = None,
 ) -> Any:
     """Build and compile the worker graph bound to one workspace. When a
     ``checkpointer`` is supplied (a LangGraph ``BaseCheckpointSaver``), the graph
@@ -57,7 +115,15 @@ def build_execution_graph(
     not the model's *declared* tool set (that's the cheap early gate the router/core
     layer already does before a worker even spawns), but the literal args about to
     run. ``None`` (the default) preserves today's ungoverned behavior byte-for-byte;
-    every existing runtime test passes with no fixture changes required."""
+    every existing runtime test passes with no fixture changes required.
+
+    ``governance`` (R6) layers the ADR-048 slice on top of that seam: when a
+    :class:`GovernanceLinkage` is bound, the final-boundary check becomes a
+    governance-grant redemption (ToolConnect ``POST /redemptions``) instead of
+    the contract-1.1 authorize+redeem pair, and every governed call leaves an
+    Execution Record on the linkage's sink. The two paths never mix on one
+    call: a governance-linked run executes under the signed grant or not at
+    all."""
 
     def act(state: RuntimeState) -> dict[str, Any]:
         req = GenerateRequest(
@@ -80,6 +146,63 @@ def build_execution_graph(
             "model_id": resp.model_id or config.model_id,
         }
 
+    def emit_execution_record(
+        linkage: GovernanceLinkage, state: RuntimeState, tool_name: str,
+        *, outcome: str, redemption: Any = None, refusal_reason: Optional[str] = None,
+        started_at: str = "", finished_at: str = "",
+    ) -> None:
+        """Build and sink one Execution Record. Never raises: a broken audit
+        sink must not crash a run whose tool already executed (or whose
+        refusal is itself the evidence)."""
+        from agentconnect.core.execution_records import (
+            ExecutorIdentity, ProviderEnforcementRef, ToolIdentity,
+            build_execution_record,
+        )
+
+        payload = linkage.grant.get("payload") if isinstance(linkage.grant, Mapping) else None
+        payload = payload if isinstance(payload, Mapping) else {}
+
+        def _link(field_name: str) -> str:
+            echoed = str(getattr(redemption, field_name, "") or "")
+            return echoed or str(payload.get(field_name) or "")
+
+        reason = str(getattr(redemption, "reason", "") or "")
+        enforcement = ProviderEnforcementRef(
+            provider_id=str(payload.get("provider_id") or ""),
+            grant_id=_link("grant_id"),
+            redemption_outcome=("redeemed" if getattr(redemption, "redeemed", False)
+                                else f"denied:{reason or 'unavailable'}"),
+            # What the Harness positively knows: a redemption that succeeded
+            # passed verification; a denial's `verified` nuance lives in the
+            # provider's own audit record (reachable via grant_id).
+            verified=bool(getattr(redemption, "redeemed", False)),
+            enforced_at=str(linkage.at or ""),
+        )
+        try:
+            record = build_execution_record(
+                execution_record_id=linkage.record_id_factory(),
+                work_request_id=str(payload.get("work_request_id") or ""),
+                task_id=state["task_id"],
+                subtask_id=linkage.subtask_id,
+                decision_record_id=_link("decision_record_id"),
+                grant_id=_link("grant_id"),
+                correlation_id=_link("correlation_id"),
+                provider_enforcement=enforcement,
+                executor=ExecutorIdentity(
+                    executor_id=linkage.executor_id,
+                    executor_kind=linkage.executor_kind,
+                    harness=linkage.harness,
+                ),
+                tool=ToolIdentity(source_id=governed_source_id, name=tool_name),
+                outcome=outcome,
+                refusal_reason=refusal_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            linkage.sink(record)
+        except Exception:  # noqa: BLE001 — the audit path never masks execution
+            _log.exception("execution-record emission failed for %s", tool_name)
+
     def governed(state: RuntimeState, tool_name: str, final_args: Mapping[str, Any],
                  execute: Callable[[Mapping[str, Any]], str]) -> str:
         """Final-invocation-boundary gate (ADR 0009): authorize the EXACT final
@@ -96,6 +219,16 @@ def build_execution_graph(
         same idiom the static allow_* gates already use.
         """
         if tool_governor is None:
+            if governance is not None:
+                # Fail closed: a governance-linked run with NO governor must not
+                # silently degrade into ungoverned execution — that would be the
+                # enforcement gap the grant exists to close. Refuse, and record
+                # the refusal (never a success record without a redemption).
+                emit_execution_record(
+                    governance, state, tool_name, outcome="refused",
+                    refusal_reason="no governor bound for governance-linked run")
+                return (f"ERROR: {tool_name} requires a governance-grant redemption "
+                        "but no governor is bound; action refused.")
             return execute(dict(final_args))
         principal = dict(governed_principal or {
             "id": "agentconnect-runtime", "kind": "agent", "privacy_tier": "local",
@@ -107,6 +240,56 @@ def build_execution_graph(
         # round-trips and the actual call can desynchronize what was authorized from
         # what runs (TOCTOU mitigation M5, mirroring ToolConnect's governed_invoke).
         frozen_args = dict(final_args)
+        if governance is not None:
+            # R6 path: the signed Connect-Governance grant IS the authorization
+            # — redeem it at the point of effect, then execute, then record.
+            # No 1.1 authorize call happens on this path; a governance-linked
+            # run does not get a second, weaker gate substituted for the grant.
+            redeem_gov = getattr(tool_governor, "redeem_governance_grant", None)
+            if not callable(redeem_gov):
+                emit_execution_record(
+                    governance, state, tool_name, outcome="refused",
+                    refusal_reason="governor cannot redeem governance grants")
+                return (f"ERROR: {tool_name} requires a governance-grant redemption "
+                        "but the bound governor cannot redeem one; action refused.")
+            started = governance.clock()
+            try:
+                redemption = redeem_gov(
+                    governance.grant, principal, governed_source_id, tool_name,
+                    frozen_args, at=governance.at)
+            except Exception as exc:  # noqa: BLE001 — a raising governor is an outage
+                _log.warning("governor raised redeeming governance grant for %s: %s",
+                             tool_name, exc)
+                emit_execution_record(
+                    governance, state, tool_name, outcome="refused",
+                    refusal_reason=f"governor raised: {exc}",
+                    started_at=started, finished_at=governance.clock())
+                return (f"ERROR: {tool_name} governance redemption unavailable; "
+                        f"action refused ({exc}).")
+            # Identity-echo check, same doctrine as the 1.1 path: the echoed
+            # stored identity must name the tool about to run.
+            echoed_sid = str(getattr(redemption, "source_id", "") or "")
+            echoed_name = str(getattr(redemption, "name", "") or "")
+            identity_mismatch = (
+                (echoed_sid and echoed_sid != governed_source_id)
+                or (echoed_name and echoed_name != tool_name))
+            if not getattr(redemption, "redeemed", False) or identity_mismatch:
+                why = ("redeemed grant is for "
+                       f"{echoed_sid}:{echoed_name}, expected "
+                       f"{governed_source_id}:{tool_name}" if identity_mismatch
+                       else str(getattr(redemption, "reason", "") or "unknown"))
+                emit_execution_record(
+                    governance, state, tool_name, outcome="refused",
+                    redemption=redemption, refusal_reason=why,
+                    started_at=started, finished_at=governance.clock())
+                return f"ERROR: {tool_name} governance grant not redeemed ({why}); action refused."
+            obs = execute(frozen_args)
+            emit_execution_record(
+                governance, state, tool_name,
+                outcome="failed" if obs.startswith("ERROR:") else "succeeded",
+                redemption=redemption,
+                started_at=started, finished_at=governance.clock())
+            return obs
         try:
             decision = tool_governor.authorize(
                 principal, governed_source_id, tool_name, context, args=frozen_args)
