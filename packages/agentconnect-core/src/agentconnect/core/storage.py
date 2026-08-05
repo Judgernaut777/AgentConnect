@@ -822,7 +822,7 @@ class SqliteStorage:
     def insert_constraint(self, c_: Constraint) -> Constraint:
         with self.transaction() as c:
             c.execute(
-                "INSERT INTO constraints (id,task_id,text,created_by,created_at) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO constraints (id,task_id,text,created_by,created_at) VALUES (?,?,?,?,?)",
                 (c_.id, c_.task_id, c_.text, c_.created_by, c_.created_at),
             )
         return c_
@@ -964,8 +964,7 @@ class SqliteStorage:
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM artifacts WHERE id=?",
-                (artifact_id,)
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
             ).fetchone()
         if not row:
             return None
@@ -982,9 +981,9 @@ class SqliteStorage:
             ).fetchall()
         return [
             ArtifactSummary(
-                id=r["id"], task_id=r["task_id"], type=r["type"], path=r["path"],
-                summary=r["summary"], created_by=r["created_by"], created_at=r["created_at"],
-                size_bytes=r["size_bytes"], metadata=_u(r["metadata_json"], {}),
+                id=r["id"], task_id=r["task_id"], type=r["type"], summary=r["summary"],
+                size_bytes=r["size_bytes"], created_by=r["created_by"], created_at=r["created_at"],
+                metadata=_u(r["metadata_json"], {}),
             )
             for r in rows
         ]
@@ -1183,8 +1182,7 @@ class SqliteStorage:
     def get_run(self, run_id: str) -> Optional[WorkerRun]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM worker_runs WHERE id=?",
-                (run_id,),
+                "SELECT * FROM worker_runs WHERE id=?", (run_id,)
             ).fetchone()
         return self._run(row) if row else None
 
@@ -1303,8 +1301,7 @@ class SqliteStorage:
     def get_approval(self, approval_id: str) -> Optional[ApprovalRecord]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM approvals WHERE id=?",
-                (approval_id,)
+                "SELECT * FROM approvals WHERE id=?", (approval_id,)
             ).fetchone()
         return self._approval(row) if row else None
 
@@ -1500,8 +1497,7 @@ class SqliteStorage:
     def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM workspaces WHERE id=?",
-                (workspace_id,)
+                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
             ).fetchone()
         return self._workspace(row) if row else None
 
@@ -1568,8 +1564,7 @@ class SqliteStorage:
     def get_session(self, session_id: str) -> Optional[ManagerSession]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM manager_sessions WHERE id=?",
-                (session_id,)
+                "SELECT * FROM manager_sessions WHERE id=?", (session_id,)
             ).fetchone()
         return self._session(row) if row else None
 
@@ -1715,8 +1710,7 @@ class SqliteStorage:
         never be read back out — an attacker with the DB cannot impersonate."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM session_tokens WHERE token_hash=?",
-                (token_hash,)
+                "SELECT * FROM session_tokens WHERE token_hash=?", (token_hash,)
             ).fetchone()
         return self._token(row) if row else None
 
