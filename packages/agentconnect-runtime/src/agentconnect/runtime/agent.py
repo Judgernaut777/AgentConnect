@@ -24,6 +24,7 @@ from .workspace import Workspace
 
 if TYPE_CHECKING:
     from .memory import MemorySink
+    from .graph import GovernanceLinkage
     from agentconnect.core.toolconnect_client import ToolGovernor
 
 
@@ -110,6 +111,7 @@ class LangGraphAgentRuntime:
         tool_governor: "ToolGovernor | None" = None,
         governed_principal: Optional[Mapping[str, Any]] = None,
         governed_source_id: str = "agentconnect-runtime",
+        governance: "GovernanceLinkage | None" = None,
     ):
         self.model_source = model_source
         self.config = config or RuntimeConfig()
@@ -127,6 +129,10 @@ class LangGraphAgentRuntime:
         self._tool_governor = tool_governor
         self._governed_principal = governed_principal
         self._governed_source_id = governed_source_id
+        # R6 governance linkage (ADR-048): when bound, the act loop redeems the
+        # carried governance grant at the point of effect and emits Execution
+        # Records. Seam, not config, like the governor itself.
+        self._governance = governance
 
     def run(self, task: TaskSubmission, task_id: str = "task_local") -> WorkerResult:
         from .graph import build_execution_graph
@@ -169,6 +175,7 @@ class LangGraphAgentRuntime:
                 tool_governor=self._tool_governor,
                 governed_principal=self._governed_principal,
                 governed_source_id=self._governed_source_id,
+                governance=self._governance,
             )
             initial: RuntimeState = {
                 "task_id": task_id,
