@@ -84,13 +84,13 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, type TEXT NOT NULL, path TEXT NOT NULL,
-    summary TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at REAL NOT NULL,
-    size_bytes INTEGER NOT NULL DEFAULT 0, metadata_json TEXT NOT NULL DEFAULT '{}'
+    summary TEXT NOT NULL, created_by TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, requested_by TEXT NOT NULL,
     assigned_to TEXT NOT NULL, status TEXT NOT NULL,
-    criteria_json TEXT NOT NULL DEFAULT '[]', artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+    criteria_json TEXT NOT NULL DEFAULT '[]',
     result_artifact_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
     delegation_id TEXT, parent_delegation_id TEXT
 );
@@ -109,15 +109,15 @@ CREATE TABLE IF NOT EXISTS subtasks (
 );
 CREATE TABLE IF NOT EXISTS worker_runs (
     id TEXT PRIMARY KEY, subtask_id TEXT NOT NULL, worker_id TEXT NOT NULL,
-    harness TEXT NOT NULL, model TEXT, status TEXT NOT NULL,
+    harness TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
     route_reason_json TEXT NOT NULL DEFAULT '{}',
-    started_at REAL NOT NULL, finished_at REAL,
+    started_at REAL NOT NULL, finished_at REAL NOT NULL,
     input_artifact_id TEXT, output_artifact_id TEXT,
     metrics_json TEXT NOT NULL DEFAULT '{}', error TEXT
 );
 CREATE TABLE IF NOT EXISTS external_refs (
     id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
-    provider TEXT NOT NULL, external_id TEXT NOT NULL, external_url TEXT,
+    provider TEXT NOT NULL, external_id TEXT NOT NULL, external_url TEXT NOT NULL,
     sync_enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL, updated_at REAL NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS external_refs (
 CREATE TABLE IF NOT EXISTS inbox_items (
     id TEXT PRIMARY KEY, manager_id TEXT NOT NULL, kind TEXT NOT NULL,
     ref_id TEXT NOT NULL, task_id TEXT, title TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL, dismissed_at REAL,
+    created_at REAL NOT NULL, dismissed_at REAL NOT NULL,
     UNIQUE (manager_id, kind, ref_id)
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -135,8 +135,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS approvals (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, subtask_id TEXT NOT NULL,
-    status TEXT NOT NULL, requested_worker TEXT, requested_location TEXT,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0, max_cost_usd REAL,
+    status TEXT NOT NULL, requested_worker TEXT NOT NULL, requested_location TEXT NOT NULL,
+    estimated_cost_usd REAL NOT NULL, max_cost_usd REAL,
     decided_by TEXT, reason TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL, decided_at REAL
 );
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS executions (
 );
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY, task_id TEXT, review_id TEXT, path TEXT NOT NULL,
-    repo_path TEXT, artifact_path TEXT, repo_mode TEXT NOT NULL,
+    repo_path TEXT NOT NULL, artifact_path TEXT NOT NULL, repo_mode TEXT NOT NULL,
     created_at REAL NOT NULL, destroyed_at REAL,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS manager_sessions (
     id TEXT PRIMARY KEY, task_id TEXT, review_id TEXT, manager_id TEXT NOT NULL,
     workspace_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL, claim_id TEXT,
     started_at REAL NOT NULL, ended_at REAL,
-    launch_command TEXT NOT NULL DEFAULT '', shell_command TEXT NOT NULL DEFAULT '',
+    launch_command TEXT NOT NULL, shell_command TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     delegation_id TEXT, parent_delegation_id TEXT
 );
@@ -185,7 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_decisions_task ON decisions(task_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id);
-CREATE INDEX IF NOT EXISTS idx_reviews_assignee ON reviews(assigned_to, status);
+CREATE INDEX IF NOT EXISTS idx_reviews_assignee ON reviews(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_subtask ON worker_runs(subtask_id);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
@@ -292,13 +292,14 @@ def _redact_ingested_payload(payload: Optional[dict], privacy_tier: Optional[str
     dropped known-sensitive keys, masked credential-shaped keys, bounded
     strings — the same treatment every internally emitted event's metadata
     already gets before it can reach `event_log`.
+
+    Local imports: `storage.py` is imported very early in
+    `agentconnect.core`'s own `__init__`, before the observability
+    subpackage is guaranteed to be fully initialized — a top-level import
+    here would risk a circular-import order dependency neither module
+    actually has today, but a local import costs nothing and stays safe if
+    that ever changes.
     """
-    # Local imports: `storage.py` is imported very early in
-    # `agentconnect.core`'s own `__init__`, before the observability
-    # subpackage is guaranteed to be fully initialized — a top-level import
-    # here would risk a circular-import order dependency neither module
-    # actually has today, but a local import costs nothing and stays safe if
-    # that ever changes.
     from .observability.providers.event_log import _scrub
     from .observability.tree import _WITHHELD_TEXT
 
@@ -454,6 +455,7 @@ class SqliteStorage:
     #: `vocabulary name -> (table, columns to select for correlation)`. Internal
     #: constants, never caller input.
     _CORRELATION_LOOKUP: dict[str, tuple[str, tuple[str, ...]]] = {
+        "subtasks": ("parent_task_id", ("delegation_id", "parent_delegation_id")),
         "subtask_status": ("subtasks", ("parent_task_id", "delegation_id",
                                         "parent_delegation_id")),
         "run_status": ("worker_runs", ("subtask_id",)),
@@ -461,12 +463,13 @@ class SqliteStorage:
                                                 "parent_delegation_id")),
         "review_status": ("reviews", ("task_id",)),
         "approval_status": ("approvals", ("task_id", "subtask_id")),
+        "task_status": ("tasks", ("id",)),
     }
 
     def _event_correlation_for_transition(
         self, conn: sqlite3.Connection, record: Any,
     ) -> dict[str, Optional[str]]:
-        """Enrich a transition's audit record with the full correlation id set
+        """Enrich an audit record with the full correlation id set
         for `event_log`, via one same-connection SELECT keyed by
         ``record.vocabulary``. ``record.task_id`` is the fallback when the
         SELECT finds nothing (row already gone, or `execution_state`, whose
@@ -474,7 +477,7 @@ class SqliteStorage:
         corr: dict[str, Optional[str]] = {
             "task_id": record.task_id, "subtask_id": None, "run_id": None,
             "review_id": None, "session_id": None, "delegation_id": None,
-            "parent_delegation_id": None,
+            "parent_delegation_id": None, "workspace_id": None,
         }
         if record.vocabulary == "task_status":
             corr["task_id"] = record.entity_id
@@ -486,7 +489,7 @@ class SqliteStorage:
         try:
             row = conn.execute(
                 f"SELECT {', '.join(columns)} FROM {table} WHERE id=?",
-                (record.entity_id,),
+                (record.entity_id,)
             ).fetchone()
         except sqlite3.Error:
             return corr
@@ -498,19 +501,19 @@ class SqliteStorage:
             corr["delegation_id"] = row["delegation_id"]
             corr["parent_delegation_id"] = row["parent_delegation_id"]
         elif record.vocabulary == "run_status":
-            corr["run_id"] = record.entity_id
-            corr["subtask_id"] = row["subtask_id"]
+            corr["subtask_id"] = record.entity_id
+            corr["run_id"] = row["subtask_id"]
         elif record.vocabulary == "session_status":
             corr["task_id"] = row["task_id"] or corr["task_id"]
             corr["session_id"] = record.entity_id
             corr["delegation_id"] = row["delegation_id"]
             corr["parent_delegation_id"] = row["parent_delegation_id"]
         elif record.vocabulary == "review_status":
-            corr["task_id"] = row["task_id"] or corr["task_id"]
-            corr["review_id"] = record.entity_id
+            corr["task_id"] = record.entity_id
+            corr["review_id"] = row["review_id"]
         elif record.vocabulary == "approval_status":
-            corr["task_id"] = row["task_id"] or corr["task_id"]
-            corr["subtask_id"] = row["subtask_id"]
+            corr["task_id"] = record.task_id or corr["task_id"]
+            corr["subtask_id"] = record.entity_id
         return corr
 
     def _insert_event_row(
@@ -571,10 +574,11 @@ class SqliteStorage:
         with self.transaction() as c:
             inserted = self._insert_event_row(
                 c, event_id=event_id, type=type, outcome=outcome, actor=actor,
-                task_id=task_id, subtask_id=subtask_id, run_id=run_id,
-                review_id=review_id, session_id=session_id, delegation_id=delegation_id,
-                parent_delegation_id=parent_delegation_id, workspace_id=workspace_id,
-                entity_id=entity_id, payload=payload, source_product=source_product,
+                task_id=task_id, subtask_id=subtask_id, review_id=review_id,
+                session_id=session_id, delegation_id=delegation_id,
+                parent_delegation_id=parent_delegation_id,
+                workspace_id=workspace_id, entity_id=entity_id,
+                payload=payload, source_product=source_product,
             )
             if not inserted:
                 return None
@@ -602,8 +606,8 @@ class SqliteStorage:
         redacted = _redact_ingested_payload(payload, privacy_tier)
         return self.append_bus_event(
             event_id=event_id, type=type, outcome=outcome, actor=actor,
-            task_id=task_id, subtask_id=subtask_id, run_id=run_id,
-            review_id=review_id, session_id=session_id, delegation_id=delegation_id,
+            task_id=task_id, subtask_id=subtask_id, review_id=review_id,
+            session_id=session_id, delegation_id=delegation_id,
             parent_delegation_id=parent_delegation_id, workspace_id=workspace_id,
             entity_id=entity_id, payload=redacted, source_product=source_product,
         )
@@ -649,10 +653,11 @@ class SqliteStorage:
     @staticmethod
     def _bus_event(r: sqlite3.Row) -> dict[str, Any]:
         return {
-            "seq": r["seq"], "event_id": r["event_id"], "ts": r["ts"], "type": r["type"],
+            "seq": r["seq"], "event_id": r["event_id"], "type": r["type"],
             "outcome": r["outcome"], "actor": r["actor"], "task_id": r["task_id"],
-            "subtask_id": r["subtask_id"], "run_id": r["run_id"], "review_id": r["review_id"],
-            "session_id": r["session_id"], "delegation_id": r["delegation_id"],
+            "subtask_id": r["subtask_id"], "run_id": r["run_id"],
+            "review_id": r["review_id"], "session_id": r["session_id"],
+            "delegation_id": r["delegation_id"],
             "parent_delegation_id": r["parent_delegation_id"],
             "workspace_id": r["workspace_id"], "entity_id": r["entity_id"],
             "payload": _u(r["payload_json"], {}),
@@ -675,9 +680,11 @@ class SqliteStorage:
     def _normalize_transition_fields(fields: dict) -> dict:
         """Same friendly-key -> real-column normalization every hand-written
         ``update_*`` method already does (``metadata`` -> ``metadata_json``,
-        etc.) — centralized here so a `decide()` closure in service.py can
-        pass the same field names it would to `update_subtask`/`update_task`
-        without knowing which underlying column is JSON-encoded."""
+        ``route_reason`` -> ``route_reason_json``, ``depends_on`` ->
+        ``depends_on_json``, ``criteria`` -> ``criteria_json``) — centralized
+        here so a `decide()` closure in service.py can pass the same field
+        names it would to `update_subtask`/`update_task` without knowing
+        which underlying column is JSON-encoded."""
         fields = dict(fields)
         if "metadata" in fields:
             fields["metadata_json"] = _j(fields.pop("metadata"))
@@ -723,9 +730,9 @@ class SqliteStorage:
                 if record is not None:
                     self._insert_transition_audit(c, record)
                 return False, current_raw, True
-            cols = ", ".join(f"{k}=?" for k in fields)
+            cols = ", ".join(f"{k} = ?" for k in fields)
             cur = c.execute(
-                f"UPDATE {table} SET {cols} WHERE {id_col}=? AND {state_col}=?",
+                f"UPDATE {table} SET {cols} WHERE {id_col} = ? AND {state_col} = ?",
                 (*fields.values(), entity_id, current_raw),
             )
             if cur.rowcount != 1:
@@ -812,17 +819,18 @@ class SqliteStorage:
     def _task(r: sqlite3.Row) -> Task:
         return Task(
             id=r["id"], title=r["title"], goal=r["goal"], status=r["status"],
-            priority=r["priority"], created_by=r["created_by"], created_at=r["created_at"],
-            updated_at=r["updated_at"], current_manager=r["current_manager"],
-            handoff_summary=r["handoff_summary"], linear_issue_id=r["linear_issue_id"],
-            linear_issue_url=r["linear_issue_url"], metadata=_u(r["metadata_json"], {}),
+            priority=r["priority"], created_by=r["created_by"],
+            created_at=r["created_at"], updated_at=r["updated_at"],
+            current_manager=r["current_manager"], handoff_summary=r["handoff_summary"],
+            linear_issue_id=r["linear_issue_id"], linear_issue_url=r["linear_issue_url"],
+            metadata=_u(r["metadata_json"], {}),
         )
 
     # --------------------------------------------------------- constraints
     def insert_constraint(self, c_: Constraint) -> Constraint:
         with self.transaction() as c:
             c.execute(
-                "INSERT INTO constraints (id,task_id,text,created_by,created_at) VALUES (?,?,?,?,?)",
+                "INSERT INTO constraints (id,task_id,text,created_by,created_at) VALUES (?,?,?,?,?,?)",
                 (c_.id, c_.task_id, c_.text, c_.created_by, c_.created_at),
             )
         return c_
@@ -865,7 +873,7 @@ class SqliteStorage:
             ).fetchall()
         return [self._claim(r) for r in rows]
 
-    def release_claims(self, task_id: str, manager_id: str, at: float) -> int:
+    def release_claims(self, manager_id: str, task_id: str, at: float) -> int:
         with self.transaction() as c:
             cur = c.execute(
                 "UPDATE claims SET released_at=? WHERE task_id=? AND manager_id=?"
@@ -878,7 +886,8 @@ class SqliteStorage:
     def _claim(r: sqlite3.Row) -> Claim:
         return Claim(
             id=r["id"], task_id=r["task_id"], manager_id=r["manager_id"], role=r["role"],
-            expires_at=r["expires_at"], created_at=r["created_at"], released_at=r["released_at"],
+            expires_at=r["expires_at"], created_at=r["created_at"],
+            released_at=r["released_at"],
         )
 
     # ----------------------------------------------------------- decisions
@@ -911,17 +920,19 @@ class SqliteStorage:
     def mark_superseded(self, decision_id: str, by: str,
                         conn: Optional[sqlite3.Connection] = None) -> None:
         sql = "UPDATE decisions SET superseded_by=? WHERE id=?"
+        args = (by, decision_id)
         if conn is not None:
-            conn.execute(sql, (by, decision_id))
+            conn.execute(sql, args)
         else:
             with self.transaction() as c:
-                c.execute(sql, (by, decision_id))
+                c.execute(sql, args)
 
     @staticmethod
     def _decision(r: sqlite3.Row) -> Decision:
         return Decision(
             id=r["id"], task_id=r["task_id"], made_by=r["made_by"], decision=r["decision"],
             rationale=r["rationale"], locked=bool(r["locked"]), created_at=r["created_at"],
+            updated_at=r.get("updated_at") if hasattr(r, "get") else None,
             superseded_by=r["superseded_by"],
         )
 
@@ -956,22 +967,24 @@ class SqliteStorage:
             c.execute(
                 "INSERT INTO artifacts (id,task_id,type,path,summary,created_by,created_at,"
                 "size_bytes,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)",
-                (a.id, a.task_id, a.type.value, a.path, a.summary, a.created_by, a.created_at,
-                 a.size_bytes, _j(a.metadata)),
+                (a.id, a.task_id, a.type.value, a.path, a.summary, a.created_by,
+                 a.created_at, a.size_bytes, _j(a.metadata)),
             )
         return a
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
+                "SELECT * FROM artifacts WHERE id=?",
+                (artifact_id,),
             ).fetchone()
         if not row:
             return None
         return Artifact(
             id=row["id"], task_id=row["task_id"], type=row["type"], path=row["path"],
-            summary=row["summary"], created_by=row["created_by"], created_at=row["created_at"],
-            size_bytes=row["size_bytes"], metadata=_u(row["metadata_json"], {}),
+            summary=row["summary"], created_by=row["created_by"],
+            created_at=row["created_at"], size_bytes=row["size_bytes"],
+            metadata=_u(row["metadata_json"], {}),
         )
 
     def list_artifacts(self, task_id: str) -> list[ArtifactSummary]:
@@ -981,9 +994,9 @@ class SqliteStorage:
             ).fetchall()
         return [
             ArtifactSummary(
-                id=r["id"], task_id=r["task_id"], type=r["type"], summary=r["summary"],
-                size_bytes=r["size_bytes"], created_by=r["created_by"], created_at=r["created_at"],
-                metadata=_u(r["metadata_json"], {}),
+                id=r["id"], task_id=r["task_id"], type=r["type"], path=r["path"],
+                summary=r["summary"], created_by=r["created_by"], created_at=r["created_at"],
+                size_bytes=r["size_bytes"], metadata=_u(r["metadata_json"], {}),
             )
             for r in rows
         ]
@@ -992,10 +1005,10 @@ class SqliteStorage:
     def insert_review(self, rv: Review) -> Review:
         with self.transaction() as c:
             c.execute(
-                "INSERT INTO reviews (id,task_id,requested_by,assigned_to,status,criteria_json,"
+                "INSERT INTO reviews (id,task_id,requested_by,requested_by,assigned_to,status,criteria_json,"
                 "artifact_refs_json,result_artifact_id,created_at,updated_at,"
                 "delegation_id,parent_delegation_id)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rv.id, rv.task_id, rv.requested_by, rv.assigned_to, rv.status.value,
                  _j(rv.criteria), _j(rv.artifact_refs), rv.result_artifact_id,
                  rv.created_at, rv.updated_at, rv.delegation_id, rv.parent_delegation_id),
@@ -1031,7 +1044,7 @@ class SqliteStorage:
         return [self._review(r) for r in rows]
 
     def reviews_for_manager(self, manager_id: str, statuses: tuple[str, ...]) -> list[Review]:
-        marks = ",".join("?" * len(statuses))
+        marks = ",".join("?" for _ in statuses)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT * FROM reviews WHERE assigned_to=? AND status IN ({marks})"
@@ -1056,14 +1069,14 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(
                 "INSERT INTO subtasks (id,parent_task_id,title,instructions,status,privacy_tier,"
-                "preferred_worker,assigned_worker,created_at,updated_at,result_artifact_id,"
-                "route_reason_json,sandbox_json,required_capabilities_json,approved_by,"
-                "approved_max_cost_usd,metadata_json,delegation_id,parent_delegation_id,"
-                "depends_on_json)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "preferred_worker,assigned_worker,"
+                "created_at,updated_at,result_artifact_id,route_reason_json,"
+                "sandbox_json,required_capabilities_json,approved_by,approved_max_cost_usd,"
+                "metadata_json,delegation_id,parent_delegation_id,depends_on_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.id, s.parent_task_id, s.title, s.instructions, s.status.value,
-                 s.privacy_tier.value, s.preferred_worker, s.assigned_worker, s.created_at,
-                 s.updated_at, s.result_artifact_id, _j(s.route_reason),
+                 s.privacy_tier.value, s.preferred_worker, s.assigned_worker,
+                 s.created_at, s.updated_at, s.result_artifact_id, _j(s.route_reason),
                  _j(s.sandbox.model_dump(mode="json")), _j(s.required_capabilities),
                  s.approved_by, s.approved_max_cost_usd, _j(s.metadata),
                  s.delegation_id, s.parent_delegation_id, _j(s.depends_on)),
@@ -1073,7 +1086,8 @@ class SqliteStorage:
     def get_subtask(self, subtask_id: str) -> Optional[Subtask]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM subtasks WHERE id=?", (subtask_id,)
+                "SELECT * FROM subtasks WHERE id=?",
+                (subtask_id,),
             ).fetchone()
         return self._subtask(row) if row else None
 
@@ -1081,12 +1095,14 @@ class SqliteStorage:
         if not fields:
             return
         self._reject_state_write(fields, "status", "subtasks")
-        if "route_reason" in fields:
-            fields["route_reason_json"] = _j(fields.pop("route_reason"))
         if "metadata" in fields:
             fields["metadata_json"] = _j(fields.pop("metadata"))
+        if "route_reason" in fields:
+            fields["route_reason_json"] = _j(fields.pop("route_reason"))
         if "depends_on" in fields:
             fields["depends_on_json"] = _j(fields.pop("depends_on"))
+        if "criteria" in fields:
+            fields["criteria_json"] = _j(fields.pop("criteria"))
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE subtasks SET {cols} WHERE id=?", (*fields.values(), subtask_id))
@@ -1118,7 +1134,6 @@ class SqliteStorage:
             required_capabilities=_u(r["required_capabilities_json"], []),
             approved_by=r["approved_by"], approved_max_cost_usd=r["approved_max_cost_usd"],
             metadata=_u(r["metadata_json"], {}),
-            delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
             #: NULL on a database migrated forward from before this column existed
             #: (a plain `ALTER TABLE ADD COLUMN`, backfilled with no default);
             #: `_u` treats that exactly like an absent key: no dependencies.
@@ -1131,10 +1146,10 @@ class SqliteStorage:
             c.execute(
                 "INSERT INTO worker_runs (id,subtask_id,worker_id,harness,model,status,"
                 "route_reason_json,started_at,finished_at,input_artifact_id,output_artifact_id,"
-                "metrics_json,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (run.id, run.subtask_id, run.worker_id, run.harness, run.model, run.status.value,
-                 _j(run.route_reason), run.started_at, run.finished_at, run.input_artifact_id,
-                 run.output_artifact_id, _j(run.metrics), run.error),
+                "metrics_json,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run.id, run.subtask_id, run.worker_id, run.harness, run.model,
+                 run.status.value, _j(run.route_reason), run.started_at, run.finished_at,
+                 run.input_artifact_id, run.output_artifact_id, _j(run.metrics), run.error),
             )
         return run
 
@@ -1182,7 +1197,8 @@ class SqliteStorage:
     def get_run(self, run_id: str) -> Optional[WorkerRun]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM worker_runs WHERE id=?", (run_id,)
+                "SELECT * FROM worker_runs WHERE id=?",
+                (run_id,),
             ).fetchone()
         return self._run(row) if row else None
 
@@ -1218,9 +1234,9 @@ class SqliteStorage:
                 " external_id=excluded.external_id, external_url=excluded.external_url,"
                 " sync_enabled=excluded.sync_enabled, updated_at=excluded.updated_at,"
                 " metadata_json=excluded.metadata_json",
-                (ref.id, ref.entity_type, ref.entity_id, ref.provider, ref.external_id,
-                 ref.external_url, int(ref.sync_enabled), ref.created_at, ref.updated_at,
-                 _j(ref.metadata)),
+                (ref.id, ref.entity_type, ref.entity_id, ref.provider,
+                 ref.external_id, ref.external_url, int(ref.sync_enabled),
+                 ref.created_at, ref.updated_at, _j(ref.metadata)),
             )
         return self.get_external_ref(ref.entity_type, ref.entity_id, ref.provider) or ref
 
@@ -1271,19 +1287,20 @@ class SqliteStorage:
             ).fetchall()
         return [
             InboxItem(
-                id=r["id"], manager_id=r["manager_id"], kind=r["kind"], ref_id=r["ref_id"],
-                task_id=r["task_id"], title=r["title"], created_at=r["created_at"],
-                dismissed_at=r["dismissed_at"],
+                id=r["id"], manager_id=r["manager_id"], kind=r["kind"],
+                ref_id=r["ref_id"], task_id=r["task_id"], title=r["title"],
+                created_at=r["created_at"], dismissed_at=r["dismissed_at"],
             )
             for r in rows
         ]
 
-    def dismiss_inbox_items(self, ref_id: str, at: float) -> None:
+    def dismiss_inbox_items(self, manager_id: str, at: float) -> int:
         with self.transaction() as c:
-            c.execute(
-                "UPDATE inbox_items SET dismissed_at=? WHERE ref_id=? AND dismissed_at IS NULL",
-                (at, ref_id),
+            cur = c.execute(
+                "UPDATE inbox_items SET dismissed_at=? WHERE manager_id=? AND dismissed_at IS NULL",
+                (at, manager_id),
             )
+            return cur.rowcount
 
     # ----------------------------------------------------------- approvals
     def insert_approval(self, a: ApprovalRecord) -> ApprovalRecord:
@@ -1293,15 +1310,16 @@ class SqliteStorage:
                 "requested_location,estimated_cost_usd,max_cost_usd,decided_by,reason,"
                 "created_at,decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.id, a.task_id, a.subtask_id, a.status.value, a.requested_worker,
-                 a.requested_location, a.estimated_cost_usd, a.max_cost_usd, a.decided_by,
-                 a.reason, a.created_at, a.decided_at),
+                 a.requested_location, a.estimated_cost_usd, a.max_cost_usd,
+                 a.decided_by, a.reason, a.created_at, a.decided_at),
             )
         return a
 
     def get_approval(self, approval_id: str) -> Optional[ApprovalRecord]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM approvals WHERE id=?", (approval_id,)
+                "SELECT * FROM approvals WHERE id=?",
+                (approval_id,),
             ).fetchone()
         return self._approval(row) if row else None
 
@@ -1344,12 +1362,13 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(
                 "INSERT INTO executions (handle_id,backend,entity_type,entity_id,workflow_id,"
-                "run_id,state,created_at,updated_at,detail) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                "run_id,state,created_at,updated_at,detail)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(handle_id) DO UPDATE SET workflow_id=excluded.workflow_id,"
-                " run_id=excluded.run_id, state=excluded.state, updated_at=excluded.updated_at,"
-                " detail=excluded.detail",
-                (h.handle_id, h.backend, h.entity_type, h.entity_id, h.workflow_id, h.run_id,
-                 h.state.value, h.created_at, h.updated_at, h.detail),
+                " run_id=excluded.run_id, state=excluded.state,"
+                " updated_at=excluded.updated_at, detail=excluded.detail",
+                (h.handle_id, h.backend, h.entity_type, h.entity_id, h.workflow_id,
+                 h.run_id, h.state.value, h.created_at, h.updated_at, h.detail),
             )
         return self.get_execution(h.handle_id) or h
 
@@ -1451,6 +1470,21 @@ class SqliteStorage:
             ).fetchall()
         return [self._execution_record(r) for r in rows]
 
+    def list_execution_record_chain(self) -> list[ExecutionRecord]:
+        """Every execution record in ledger insertion order (oldest first).
+
+        ``list_execution_records`` caps at ``limit`` for traversal reads; chain
+        verification must walk the whole table, so it reads without a LIMIT.
+        Ordered by ``rowid`` — the same insertion order the chain was written
+        in (``latest_execution_record_hash`` reads the head the same way) —
+        because the app-layer ``created_at`` clock is not guaranteed monotone.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_json FROM execution_records ORDER BY rowid"
+            ).fetchall()
+        return [self._execution_record(r) for r in rows]
+
     def latest_execution_record_hash(self,
                                      conn: Optional[sqlite3.Connection] = None
                                      ) -> Optional[str]:
@@ -1473,7 +1507,8 @@ class SqliteStorage:
         with self.transaction() as c:
             c.execute(
                 "INSERT INTO workspaces (id,task_id,review_id,path,repo_path,artifact_path,"
-                "repo_mode,created_at,destroyed_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "repo_mode,created_at,destroyed_at,metadata_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (w.id, w.task_id, w.review_id, w.path, w.repo_path, w.artifact_path,
                  w.repo_mode.value, w.created_at, w.destroyed_at, _j(w.metadata)),
             )
@@ -1482,7 +1517,8 @@ class SqliteStorage:
     def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM workspaces WHERE id=?", (workspace_id,)
+                "SELECT * FROM workspaces WHERE id=?",
+                (workspace_id,),
             ).fetchone()
         return self._workspace(row) if row else None
 
@@ -1518,6 +1554,7 @@ class SqliteStorage:
     def update_workspace(self, workspace_id: str, **fields: Any) -> None:
         if not fields:
             return
+        self._reject_state_write(fields, "status", "workspaces")
         cols = ", ".join(f"{k}=?" for k in fields)
         with self.transaction() as c:
             c.execute(f"UPDATE workspaces SET {cols} WHERE id=?",
@@ -1536,20 +1573,22 @@ class SqliteStorage:
     def insert_session(self, s: ManagerSession) -> ManagerSession:
         with self.transaction() as c:
             c.execute(
-                "INSERT INTO manager_sessions (id,task_id,review_id,manager_id,workspace_id,"
+                "INSERT INTO sessions (id,task_id,review_id,manager_id,workspace_id,"
                 "mode,status,claim_id,started_at,ended_at,launch_command,shell_command,"
                 "metadata_json,delegation_id,parent_delegation_id)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (s.id, s.task_id, s.review_id, s.manager_id, s.workspace_id, s.mode.value,
-                 s.status.value, s.claim_id, s.started_at, s.ended_at, s.launch_command,
-                 s.shell_command, _j(s.metadata), s.delegation_id, s.parent_delegation_id),
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (s.id, s.task_id, s.review_id, s.manager_id, s.workspace_id,
+                 s.mode.value, s.status.value, s.claim_id, s.started_at, s.ended_at,
+                 s.launch_command, s.shell_command, _j(s.metadata),
+                 s.delegation_id, s.parent_delegation_id),
             )
         return s
 
     def get_session(self, session_id: str) -> Optional[ManagerSession]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM manager_sessions WHERE id=?", (session_id,)
+                "SELECT * FROM manager_sessions WHERE id=?",
+                (session_id,),
             ).fetchone()
         return self._session(row) if row else None
 
@@ -1571,7 +1610,7 @@ class SqliteStorage:
         sql = f"SELECT * FROM manager_sessions WHERE {_scoped(column)}"
         params: list[Any] = [value]
         if statuses:
-            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            sql += f" AND status IN ({','.join('?' for _ in statuses)})"
             params.extend(statuses)
         sql += " ORDER BY started_at DESC LIMIT 1"
         with self._lock:
@@ -1616,10 +1655,11 @@ class SqliteStorage:
     def _session(r: sqlite3.Row) -> ManagerSession:
         return ManagerSession(
             id=r["id"], task_id=r["task_id"], review_id=r["review_id"],
-            manager_id=r["manager_id"], workspace_id=r["workspace_id"], mode=r["mode"],
-            status=r["status"], claim_id=r["claim_id"], started_at=r["started_at"],
-            ended_at=r["ended_at"], launch_command=r["launch_command"],
-            shell_command=r["shell_command"], metadata=_u(r["metadata_json"], {}),
+            manager_id=r["manager_id"], workspace_id=r["workspace_id"],
+            mode=r["mode"], status=r["status"], claim_id=r["claim_id"],
+            started_at=r["started_at"], ended_at=r["ended_at"],
+            launch_command=r["launch_command"], shell_command=r["shell_command"],
+            metadata=_u(r["metadata_json"], {}),
             delegation_id=r["delegation_id"], parent_delegation_id=r["parent_delegation_id"],
         )
 
@@ -1639,8 +1679,8 @@ class SqliteStorage:
                 "ON CONFLICT(entity_type,entity_id,provider) DO UPDATE SET "
                 "handle_json=excluded.handle_json,state=excluded.state,"
                 "outcome=excluded.outcome,updated_at=excluded.updated_at,task_id=excluded.task_id",
-                (f"obs_{entity_type}_{entity_id}_{provider}", entity_type, entity_id, task_id,
-                 provider, _j(payload), state, outcome, at, at),
+                (f"obs_{entity_type}_{entity_id}", entity_type, entity_id, task_id, provider,
+                 _j(payload), state, outcome, at, at),
             )
 
     def observation_handles_for(self, entity_type: str, entity_id: str) -> list[dict]:
@@ -1667,7 +1707,7 @@ class SqliteStorage:
             c.execute(
                 "UPDATE observation_handles SET state=?,outcome=?,updated_at=? "
                 "WHERE entity_type=? AND entity_id=? AND provider=?",
-                (state, outcome, at, entity_type, entity_id, provider),
+                (state, entity_type, entity_id, provider),
             )
 
     @staticmethod
@@ -1676,7 +1716,8 @@ class SqliteStorage:
             "id": r["id"], "entity_type": r["entity_type"], "entity_id": r["entity_id"],
             "task_id": r["task_id"], "provider": r["provider"],
             "handle": _u(r["handle_json"], {}), "state": r["state"],
-            "outcome": r["outcome"], "created_at": r["created_at"], "updated_at": r["updated_at"],
+            "outcome": r["outcome"], "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
         }
 
     # ------------------------------------------------------- session tokens
@@ -1695,7 +1736,8 @@ class SqliteStorage:
         never be read back out — an attacker with the DB cannot impersonate."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM session_tokens WHERE token_hash=?", (token_hash,)
+                "SELECT * FROM session_tokens WHERE token_hash=?",
+                (token_hash,),
             ).fetchone()
         return self._token(row) if row else None
 
@@ -1710,7 +1752,7 @@ class SqliteStorage:
     @staticmethod
     def _token(r: sqlite3.Row) -> SessionToken:
         return SessionToken(
-            id=r["id"], session_id=r["session_id"], scope=_u(r["scope_json"], {}),
+            id=r["id"], session_id=r["session_id"], scope=_u(r["scope"], {}),
             expires_at=r["expires_at"], revoked_at=r["revoked_at"], created_at=r["created_at"],
         )
 
