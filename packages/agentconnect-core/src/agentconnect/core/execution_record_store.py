@@ -17,6 +17,7 @@ the sink seam keeps the runtime free of any storage dependency.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .errors import NotFound, PolicyViolation
@@ -26,6 +27,22 @@ from .execution_records import (
     with_prev_hash,
 )
 from .storage import SqliteStorage
+
+
+@dataclass(frozen=True)
+class ChainVerification:
+    """Result of a read-side walk of the ledger's hash chain.
+
+    ``ok`` is False at the first break; ``records_checked`` counts the records
+    that verified before the break (the whole chain when ``ok``), and
+    ``first_break_id`` / ``first_break_reason`` name the record where the walk
+    failed (None when ``ok``).
+    """
+
+    ok: bool
+    records_checked: int
+    first_break_id: Optional[str] = None
+    first_break_reason: Optional[str] = None
 
 
 class ExecutionRecordLedger:
@@ -66,3 +83,38 @@ class ExecutionRecordLedger:
         ``work_request_id`` (keyword) — given any one id in the chain, the
         records naming all the others come back."""
         return self._storage.list_execution_records(task_id, **filters)
+
+    def verify_chain(self) -> ChainVerification:
+        """Re-verify the whole ledger on read: every record's seal and every
+        ``prev_hash`` link, in insertion order.
+
+        The write path verifies only the incoming record's own seal; this is
+        the read-side complement for audit. The first record must carry no
+        ``prev_hash``; each later one must name the previous record's
+        ``record_hash``. The walk stops at the first break and reports it.
+
+        Known limit of the current schema: unlike ToolConnect's audit table,
+        this ledger keeps no durable high-water mark of the chain head, so a
+        truncation that removes records off the *tail* leaves every surviving
+        record internally consistent and is not detectable here. Removing or
+        rewriting any record before the tail breaks the next record's
+        ``prev_hash`` link or its own seal and IS detected.
+        """
+        prev_hash: Optional[str] = None
+        records_checked = 0
+        for record in self._storage.list_execution_record_chain():
+            if (record.prev_hash or None) != prev_hash:
+                reason = (
+                    "prev_hash mismatch"
+                    if records_checked
+                    else "first record carries a prev_hash"
+                )
+                return ChainVerification(
+                    False, records_checked, record.execution_record_id, reason)
+            if not verify_execution_record(record):
+                return ChainVerification(
+                    False, records_checked, record.execution_record_id,
+                    "record seal does not verify")
+            prev_hash = record.record_hash
+            records_checked += 1
+        return ChainVerification(True, records_checked)
