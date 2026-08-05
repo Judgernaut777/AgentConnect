@@ -28,6 +28,7 @@ from typing import Any, Iterator, Optional
 from . import ids
 from ..common.transitions import DecideFn
 from .execution import ExecutionHandle
+from .execution_records import ExecutionRecord
 from .models import (
     ApprovalRecord,
     Artifact,
@@ -207,6 +208,18 @@ CREATE TABLE IF NOT EXISTS event_log (
 CREATE INDEX IF NOT EXISTS idx_eventlog_task ON event_log(task_id, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_type ON event_log(type, seq);
 CREATE INDEX IF NOT EXISTS idx_eventlog_subtask ON event_log(subtask_id, seq);
+CREATE TABLE IF NOT EXISTS execution_records (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, subtask_id TEXT,
+    work_request_id TEXT NOT NULL, decision_record_id TEXT NOT NULL,
+    grant_id TEXT NOT NULL, correlation_id TEXT NOT NULL,
+    outcome TEXT NOT NULL, record_json TEXT NOT NULL,
+    record_hash TEXT NOT NULL, prev_hash TEXT, created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execrec_task ON execution_records(task_id);
+CREATE INDEX IF NOT EXISTS idx_execrec_grant ON execution_records(grant_id);
+CREATE INDEX IF NOT EXISTS idx_execrec_correlation ON execution_records(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_execrec_decision ON execution_records(decision_record_id);
+CREATE INDEX IF NOT EXISTS idx_execrec_wr ON execution_records(work_request_id);
 """
 # NOTE: the idx_eventlog_source index is deliberately NOT in _SCHEMA. On a database
 # created before source_product existed, `CREATE TABLE IF NOT EXISTS event_log` is a
@@ -1376,6 +1389,85 @@ class SqliteStorage:
             detail=r["detail"],
         )
 
+    # -------------------------------------------------- execution records
+    # R6 Execution Records (ADR-037 layer-3 evidence). Append-only: there is no
+    # update path — like decisions/attempts, a record is written once and only
+    # ever read. `record_json` is the full canonical record (the hashable
+    # projection plus the seal); the lifted columns exist so the chain
+    # work-request → decision → grant → redemption → execution is traversable
+    # in both directions by id without parsing JSON.
+    def insert_execution_record(self, r: ExecutionRecord, created_at: float,
+                                conn: Optional[sqlite3.Connection] = None) -> ExecutionRecord:
+        sql = ("INSERT INTO execution_records (id,task_id,subtask_id,work_request_id,"
+               "decision_record_id,grant_id,correlation_id,outcome,record_json,"
+               "record_hash,prev_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        args = (r.execution_record_id, r.task_id, r.subtask_id, r.work_request_id,
+                r.decision_record_id, r.grant_id, r.correlation_id, r.outcome,
+                _j(r.model_dump(mode="json")), r.record_hash, r.prev_hash, created_at)
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with self.transaction() as c:
+                c.execute(sql, args)
+        return r
+
+    def get_execution_record(self, execution_record_id: str) -> Optional[ExecutionRecord]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT record_json FROM execution_records WHERE id=?",
+                (execution_record_id,),
+            ).fetchone()
+        return self._execution_record(row) if row else None
+
+    def get_execution_record_by_grant(self, grant_id: str) -> list[ExecutionRecord]:
+        return self.list_execution_records(grant_id=grant_id)
+
+    def list_execution_records(
+        self, task_id: Optional[str] = None, *,
+        grant_id: Optional[str] = None,
+        decision_record_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        work_request_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[ExecutionRecord]:
+        """Newest-last records matching every supplied linkage id (AND semantics).
+        This is the bidirectional-traversal read: any one id in the chain finds
+        the record that names all the others."""
+        clauses, args = [], []
+        for column, value in (
+            ("task_id", task_id), ("grant_id", grant_id),
+            ("decision_record_id", decision_record_id),
+            ("correlation_id", correlation_id), ("work_request_id", work_request_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                args.append(value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT record_json FROM execution_records{where}"
+                " ORDER BY created_at, rowid LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return [self._execution_record(r) for r in rows]
+
+    def latest_execution_record_hash(self,
+                                     conn: Optional[sqlite3.Connection] = None
+                                     ) -> Optional[str]:
+        """The current head of the ledger's execution-record hash chain (None on
+        an empty ledger). Pass the writer's transaction connection so the chain
+        cannot fork under concurrency (same discipline as insert_decision)."""
+        c = conn or self._conn
+        with self._lock:
+            row = c.execute(
+                "SELECT record_hash FROM execution_records ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        return str(row["record_hash"]) if row else None
+
+    @staticmethod
+    def _execution_record(r: sqlite3.Row) -> ExecutionRecord:
+        return ExecutionRecord.model_validate(_u(r["record_json"], {}))
+
     # ---------------------------------------------------------- workspaces
     def insert_workspace(self, w: Workspace) -> Workspace:
         with self.transaction() as c:
@@ -1613,7 +1705,7 @@ class SqliteStorage:
                 "UPDATE session_tokens SET revoked_at=? WHERE session_id=? AND revoked_at IS NULL",
                 (at, session_id),
             )
-        return cur.rowcount
+            return cur.rowcount
 
     @staticmethod
     def _token(r: sqlite3.Row) -> SessionToken:
