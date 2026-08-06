@@ -1451,6 +1451,21 @@ class SqliteStorage:
             ).fetchall()
         return [self._execution_record(r) for r in rows]
 
+    def list_execution_record_chain(self) -> list[ExecutionRecord]:
+        """Every execution record in ledger insertion order (oldest first).
+
+        ``list_execution_records`` caps at ``limit`` for traversal reads; chain
+        verification must walk the whole table, so it reads without a LIMIT.
+        Ordered by ``rowid`` — the same insertion order the chain was written
+        in (``latest_execution_record_hash`` reads the head the same way) —
+        because the app-layer ``created_at`` clock is not guaranteed monotone.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_json FROM execution_records ORDER BY rowid"
+            ).fetchall()
+        return [self._execution_record(r) for r in rows]
+
     def latest_execution_record_hash(self,
                                      conn: Optional[sqlite3.Connection] = None
                                      ) -> Optional[str]:
