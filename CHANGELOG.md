@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — 2026-08-25 — The control model becomes a Work-plane artifact
+
+The fine-tuned orchestration controller (`qwen3-4b-control-v12`) is rehomed from
+the Knowledge plane to the Work plane and renamed `connect-control-model`, and
+AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
+
+### Added
+
+* **`docs/adr/0010-control-model-plane-ownership.md`** — the control model is a
+  Work-plane artifact owned by AgentConnect, advisory only, consumed out-of-band
+  (never inline in `/route/decide`, whose deterministic answer must not wait
+  ~5 s on a model), and never an input to a governed Decision Record. Completes
+  BrainConnect ADR 0008's delegation table rather than overruling it: six of the
+  model's seven modes are capabilities that ADR already sends to AgentConnect.
+* **`agentconnect.core.control_projection`** — the single, pure conversion
+  between the control model's vocabulary and AgentConnect's three
+  (`PrivacyClass`, `PrivacyTier`, `ProviderPrivacyTier`). A projection never
+  widens permission: an inexact mapping goes to the *strictest* compatible
+  target, and one that cannot be made faithfully returns
+  `Projection(faithful=False)` rather than guessing — the structured-refusal
+  posture ComputeConnect's placement engine already uses.
+  `route_agreement()` scores shadow-mode agreement and reports
+  `Agreement.unrepresentable` for a `private_rented` selection, which the control
+  vocabulary cannot name at all, instead of charging the model with a miss.
+
+### Notes
+
+* BrainConnect is unchanged in substance — the `brainconnect` CLI still makes
+  zero model calls, and `brainconnect-librarian` remains the only model-using
+  part of that product. `docs/KNOWLEDGE_PLANE.md` there gained a boundary note
+  saying the control model was never part of it.
+* Renaming the GitHub repository itself is an out-of-band settings operation and
+  is not part of this change.
+
 ## Unreleased — 2026-08-05 — R6: Execution Records close the ADR-048 vertical slice
 
 AgentConnect now emits a durable, hash-sealed **Execution Record** whenever a
