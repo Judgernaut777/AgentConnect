@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased — 2026-08-25 — The control model becomes a Work-plane artifact
+
+The fine-tuned orchestration controller (`qwen3-4b-control-v12`) is rehomed from
+the Knowledge plane to the Work plane and renamed `connect-control-model`, and
+AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
+
+### Added
+
+* **`docs/adr/0010-control-model-plane-ownership.md`** — the control model is a
+  Work-plane artifact owned by AgentConnect, advisory only, consumed out-of-band
+  (never inline in `/route/decide`, whose deterministic answer must not wait
+  ~5 s on a model), and never an input to a governed Decision Record. Completes
+  BrainConnect ADR 0008's delegation table rather than overruling it: six of the
+  model's seven modes are capabilities that ADR already sends to AgentConnect.
+* **`agentconnect.core.control_projection`** — the single, pure conversion
+  between the control model's vocabulary and AgentConnect's three
+  (`PrivacyClass`, `PrivacyTier`, `ProviderPrivacyTier`). A projection never
+  widens permission: an inexact mapping goes to the *strictest* compatible
+  target, and one that cannot be made faithfully returns
+  `Projection(faithful=False)` rather than guessing — the structured-refusal
+  posture ComputeConnect's placement engine already uses.
+  `route_agreement()` scores shadow-mode agreement and reports
+  `Agreement.unrepresentable` for a `private_rented` selection, which the control
+  vocabulary cannot name at all, instead of charging the model with a miss.
+
+* **`agentconnect.core.control_shadow`** — shadow-mode evaluation, the consumer
+  ADR 0010 §4 calls for. It tails the ecosystem event bus for placement events,
+  asks the control model what it would have routed, and records the quadruple
+  `(normalized_state, model_decision, router_decision, outcome)` with an
+  agreement verdict. Four properties are structural rather than conventional: no
+  module under `packages/` may name it except shadow mode's own (a test enforces
+  the out-of-band rule); the normalized state is bounded by `SHADOW_STATE_KEYS`, so no prompt or
+  transcript can ride along to a model; every failure — unreachable server,
+  malformed JSON after its one repair attempt — is a recorded `model_error`
+  rather than an exception into a caller; and the sink is deliberately not the
+  ledger, so control-model output cannot reach a governed Decision Record.
+  `summarize()` reports agreement over *comparable* records only —
+  `unrepresentable` and `not_a_provider_route` are excluded from the denominator
+  rather than counted as misses. See [docs/CONTROL_SHADOW.md](docs/CONTROL_SHADOW.md).
+
+* **`agentconnect.core.control_shadow_resolver`** — the ledger-backed
+  `RoutingFactsResolver` that makes a live shadow run possible. It reads the
+  routing decision the router itself persisted (`Subtask.route_reason`), not the
+  bus payload, per EVENT_BUS.md §0's rule that the bus is never authoritative;
+  a test pins that by feeding it a payload that lies. Every failure is a skip —
+  no subtask id, a reaped subtask, no recorded route, a route that never reached
+  a worker, an unparseable `route_reason`. It fills only fields the ledger
+  genuinely holds and never reads `subtask.instructions`.
+
+### Fixed
+
+* **`compute.placed` reported `location: "local"` for every route**, cloud and
+  rented included. The emit read `explanation.selected_location`, a field that
+  did not exist on `RouteExplanation`, then fell back to `approval_location`
+  (only ever set for a *blocked* candidate, never on the selected path) and
+  finally to a literal `"local"`. `RouteExplanation.selected_location` now
+  exists and is set from the selected worker's `caps.location`, so the event —
+  and the persisted route — name where the work actually went. Found while
+  building the resolver: it would have scored every cloud route as a
+  disagreement and silently understated the model. Regression:
+  `tests/test_backplane_routing.py::test_compute_placed_reports_where_the_work_actually_went`.
+
+### Notes
+
+* **Only one of this repository's two routers is on the bus.** `subtask.routed`
+  and `compute.placed` come from Engine A's *worker* router (`core/routing.py`,
+  vocabulary `WorkerLocation`); the *provider* router's `RoutingDecision` — the
+  decision shadow mode would most like to compare against — is not observable
+  today, since the Engine B bridge carries only `state.changed` ticket rows.
+  `WORKER_LOCATION_TO_PROVIDER_TIER` bridges what is observable, and
+  `cloud → external` is safe for scoring because every `cloud_*` class admits
+  both cost tiers, so the missing cost signal cancels instead of manufacturing a
+  disagreement.
+* BrainConnect is unchanged in substance — the `brainconnect` CLI still makes
+  zero model calls, and `brainconnect-librarian` remains the only model-using
+  part of that product. `docs/KNOWLEDGE_PLANE.md` there gained a boundary note
+  saying the control model was never part of it.
+* Renaming the GitHub repository itself is an out-of-band settings operation and
+  is not part of this change.
+
 ## Unreleased — 2026-08-05 — R6: Execution Records close the ADR-048 vertical slice
 
 AgentConnect now emits a durable, hash-sealed **Execution Record** whenever a
