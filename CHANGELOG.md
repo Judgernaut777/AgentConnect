@@ -25,8 +25,36 @@ AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
   `Agreement.unrepresentable` for a `private_rented` selection, which the control
   vocabulary cannot name at all, instead of charging the model with a miss.
 
+* **`agentconnect.core.control_shadow`** — shadow-mode evaluation, the consumer
+  ADR 0010 §4 calls for. It tails the ecosystem event bus for placement events,
+  asks the control model what it would have routed, and records the quadruple
+  `(normalized_state, model_decision, router_decision, outcome)` with an
+  agreement verdict. Four properties are structural rather than conventional: no
+  module under `packages/` may even mention it (a test enforces the out-of-band
+  rule); the normalized state is bounded by `SHADOW_STATE_KEYS`, so no prompt or
+  transcript can ride along to a model; every failure — unreachable server,
+  malformed JSON after its one repair attempt — is a recorded `model_error`
+  rather than an exception into a caller; and the sink is deliberately not the
+  ledger, so control-model output cannot reach a governed Decision Record.
+  `summarize()` reports agreement over *comparable* records only —
+  `unrepresentable` and `not_a_provider_route` are excluded from the denominator
+  rather than counted as misses. See [docs/CONTROL_SHADOW.md](docs/CONTROL_SHADOW.md).
+
 ### Notes
 
+* **Only one of this repository's two routers is on the bus.** `subtask.routed`
+  and `compute.placed` come from Engine A's *worker* router (`core/routing.py`,
+  vocabulary `WorkerLocation`); the *provider* router's `RoutingDecision` — the
+  decision shadow mode would most like to compare against — is not observable
+  today, since the Engine B bridge carries only `state.changed` ticket rows.
+  `WORKER_LOCATION_TO_PROVIDER_TIER` bridges what is observable, and
+  `cloud → external` is safe for scoring because every `cloud_*` class admits
+  both cost tiers, so the missing cost signal cancels instead of manufacturing a
+  disagreement.
+* `RoutingFactsResolver` ships as a Protocol with no implementation: resolving an
+  event needs the ledger and the provider registry, and coupling the shadow
+  module to either would defeat the point. `docs/CONTROL_SHADOW.md` shows the
+  shape.
 * BrainConnect is unchanged in substance — the `brainconnect` CLI still makes
   zero model calls, and `brainconnect-librarian` remains the only model-using
   part of that product. `docs/KNOWLEDGE_PLANE.md` there gained a boundary note
