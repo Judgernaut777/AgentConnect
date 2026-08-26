@@ -602,3 +602,44 @@ def test_registry_route_is_pure_and_does_not_touch_the_ledger():
     first = route(subtask, registry)
     second = route(subtask, registry)
     assert first.model_dump() == second.model_dump()
+
+
+def test_compute_placed_reports_where_the_work_actually_went(tmp_path):
+    """`compute.placed` must name the SELECTED worker's location.
+
+    Regression: the emit read `explanation.selected_location`, which did not
+    exist on the model, then fell back to `approval_location` (only ever set for
+    a *blocked* candidate, never on the selected path) and finally to the literal
+    "local". Every route — cloud and rented included — was therefore reported as
+    local, and any consumer scoring placements off this event was reading a
+    constant.
+    """
+    svc = make_service(tmp_path, [cloud_worker()], policy=RoutePolicy(max_cost_usd=100.0))
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g", created_by="me"))
+    sub = svc.submit_subtask(task.id, SubtaskRequest(
+        title="s", instructions="summarize the changelog",
+        privacy_tier=PrivacyTier.public, required_capabilities=["generate"],
+    ))
+    svc.approve_subtask(sub.id, approved_by="me", max_cost_usd=50.0)
+
+    placed = [e for e in svc.storage.list_bus_events(since=0, limit=500)
+              if e["type"] == "compute.placed"]
+    assert placed, "a routed subtask must emit compute.placed"
+    assert placed[-1]["payload"]["location"] == "cloud", (
+        "a cloud worker's placement reported as "
+        f"{placed[-1]['payload']['location']!r}"
+    )
+    assert svc.explain_route(sub.id).selected_location == "cloud"
+
+
+def test_a_local_route_still_reports_local(tmp_path):
+    svc = make_service(tmp_path, [local_model_worker()])
+    task = svc.create_task(CreateTaskRequest(title="t", goal="g", created_by="me"))
+    sub = svc.submit_subtask(task.id, SubtaskRequest(
+        title="s", instructions="inspect the tree",
+        privacy_tier=PrivacyTier.repo_sensitive, required_capabilities=["inspect"],
+    ))
+    placed = [e for e in svc.storage.list_bus_events(since=0, limit=500)
+              if e["type"] == "compute.placed"]
+    assert placed[-1]["payload"]["location"] == "local"
+    assert svc.explain_route(sub.id).selected_location == "local"

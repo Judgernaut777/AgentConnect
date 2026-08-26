@@ -30,8 +30,8 @@ AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
   asks the control model what it would have routed, and records the quadruple
   `(normalized_state, model_decision, router_decision, outcome)` with an
   agreement verdict. Four properties are structural rather than conventional: no
-  module under `packages/` may even mention it (a test enforces the out-of-band
-  rule); the normalized state is bounded by `SHADOW_STATE_KEYS`, so no prompt or
+  module under `packages/` may name it except shadow mode's own (a test enforces
+  the out-of-band rule); the normalized state is bounded by `SHADOW_STATE_KEYS`, so no prompt or
   transcript can ride along to a model; every failure — unreachable server,
   malformed JSON after its one repair attempt — is a recorded `model_error`
   rather than an exception into a caller; and the sink is deliberately not the
@@ -39,6 +39,28 @@ AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
   `summarize()` reports agreement over *comparable* records only —
   `unrepresentable` and `not_a_provider_route` are excluded from the denominator
   rather than counted as misses. See [docs/CONTROL_SHADOW.md](docs/CONTROL_SHADOW.md).
+
+* **`agentconnect.core.control_shadow_resolver`** — the ledger-backed
+  `RoutingFactsResolver` that makes a live shadow run possible. It reads the
+  routing decision the router itself persisted (`Subtask.route_reason`), not the
+  bus payload, per EVENT_BUS.md §0's rule that the bus is never authoritative;
+  a test pins that by feeding it a payload that lies. Every failure is a skip —
+  no subtask id, a reaped subtask, no recorded route, a route that never reached
+  a worker, an unparseable `route_reason`. It fills only fields the ledger
+  genuinely holds and never reads `subtask.instructions`.
+
+### Fixed
+
+* **`compute.placed` reported `location: "local"` for every route**, cloud and
+  rented included. The emit read `explanation.selected_location`, a field that
+  did not exist on `RouteExplanation`, then fell back to `approval_location`
+  (only ever set for a *blocked* candidate, never on the selected path) and
+  finally to a literal `"local"`. `RouteExplanation.selected_location` now
+  exists and is set from the selected worker's `caps.location`, so the event —
+  and the persisted route — name where the work actually went. Found while
+  building the resolver: it would have scored every cloud route as a
+  disagreement and silently understated the model. Regression:
+  `tests/test_backplane_routing.py::test_compute_placed_reports_where_the_work_actually_went`.
 
 ### Notes
 
@@ -51,10 +73,6 @@ AgentConnect gains the vocabulary projection its shadow-mode evaluation needs.
   `cloud → external` is safe for scoring because every `cloud_*` class admits
   both cost tiers, so the missing cost signal cancels instead of manufacturing a
   disagreement.
-* `RoutingFactsResolver` ships as a Protocol with no implementation: resolving an
-  event needs the ledger and the provider registry, and coupling the shadow
-  module to either would defeat the point. `docs/CONTROL_SHADOW.md` shows the
-  shape.
 * BrainConnect is unchanged in substance — the `brainconnect` CLI still makes
   zero model calls, and `brainconnect-librarian` remains the only model-using
   part of that product. `docs/KNOWLEDGE_PLANE.md` there gained a boundary note

@@ -97,6 +97,13 @@ class RouteExplanation(BaseModel):
     #: A Linear approval names a route class (`/agentconnect approve cloud`), and
     #: this is what that name is matched against.
     approval_location: Optional[str] = None
+    #: Where the SELECTED worker actually runs ("local" | "cloud" | "rented").
+    #: Distinct from `approval_location`, which describes a candidate that was
+    #: *blocked* — on the selected path that field is never set, so anything
+    #: reading it to learn where the work went reads None. `compute.placed`
+    #: reports this; without it that event defaulted every route to "local",
+    #: including cloud and rented ones.
+    selected_location: Optional[str] = None
 
 
 class WorkerRegistry:
@@ -280,6 +287,7 @@ def route(
         explanation.selected_worker = caps.worker_id
         explanation.selected_harness = caps.harness
         explanation.selected_model = caps.model
+        explanation.selected_location = caps.location.value
         explanation.worker_type = caps.harness
         explanation.hard_gates = list(HARD_GATES)
         explanation.score_terms = terms

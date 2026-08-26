@@ -121,17 +121,37 @@ def shadow_input(tier="local_only", privacy=ControlPrivacy.local_only):
 # --------------------------------------------------------------------------- #
 # Nothing in the routing path may reach this module
 # --------------------------------------------------------------------------- #
-def test_no_routing_module_imports_shadow_mode():
+#: Modules that ARE shadow mode, and so may name it. Everything else under
+#: `packages/` reaching `control_shadow` would be the live path importing a
+#: ~5 s model call, which ADR 0010 §4 forbids. Adding a name here is a
+#: deliberate, reviewable act — the guard is on the live path, not on shadow
+#: mode growing companions.
+SHADOW_MODE_MODULES = frozenset(
+    {"control_shadow.py", "control_shadow_resolver.py"}
+)
+
+
+def test_no_live_path_module_imports_shadow_mode():
     """ADR 0010 §4: out-of-band, never inline. A ~5 s model call must never end
     up in front of a deterministic answer, so the import itself is forbidden."""
     root = Path(__file__).resolve().parent.parent / "packages"
     offenders = []
     for path in root.rglob("*.py"):
-        if path.name in {"control_shadow.py", "test_control_shadow.py"}:
+        if path.name in SHADOW_MODE_MODULES:
             continue
         if "control_shadow" in path.read_text(encoding="utf-8"):
             offenders.append(str(path.relative_to(root)))
     assert offenders == [], f"shadow mode reached from the live path: {offenders}"
+
+
+def test_the_guard_would_catch_a_live_path_import():
+    """The guard is only worth having if it can fail. Prove the scan reaches
+    real files by running it for a module the live path legitimately does use."""
+    root = Path(__file__).resolve().parent.parent / "packages"
+    scanned = list(root.rglob("*.py"))
+    assert len(scanned) > 100, "the scan found almost nothing — wrong root?"
+    users = [p.name for p in scanned if "control_projection" in p.read_text(encoding="utf-8")]
+    assert "control_projection.py" in users and "control_shadow.py" in users
 
 
 def test_sampling_is_off_and_output_is_capped():

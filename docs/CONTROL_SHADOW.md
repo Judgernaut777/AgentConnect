@@ -38,10 +38,11 @@ unreachable or its reply failed the schema twice; `model_error` says which.
 from agentconnect.core.control_shadow import (
     HttpControlModelClient, MemoryShadowSink, PLACED_EVENT_TYPE, ShadowConsumer, summarize,
 )
+from agentconnect.core.control_shadow_resolver import LedgerRoutingFactsResolver
 
 consumer = ShadowConsumer(
     events=storage,          # anything with list_bus_events(since=, limit=, types=)
-    resolver=my_resolver,    # bus event -> ShadowInput (see below)
+    resolver=LedgerRoutingFactsResolver(storage),   # see below
     client=HttpControlModelClient(
         base_url="http://127.0.0.1:8099", model="qwen3-4b-control-v12",
         system_prompt=SYSTEM_PROMPT,        # from the model repo's gen_dataset.py
@@ -60,28 +61,50 @@ stop string — the model card's "may fail to stop under OOD/adversarial" makes
 those load-bearing, not tuning knobs.
 
 **Run it out-of-band** — a timer, a CLI invocation, a batch job. Never from a
-request path. A test asserts that no module under `packages/` so much as
-mentions `control_shadow`, so an inline call fails CI rather than review.
+request path. A test asserts that no module under `packages/` names
+`control_shadow` except shadow mode's own, so an inline call fails CI rather
+than review.
 
-## The resolver is yours to write
+## The resolver
 
-`RoutingFactsResolver` is a Protocol with no shipped implementation, and that is
-a real gap, not an oversight: resolving an event needs the ledger and the
-provider registry, and putting either inside `agentconnect-core`'s shadow module
-would couple it to both. Write one where those already live:
+`LedgerRoutingFactsResolver` (`agentconnect.core.control_shadow_resolver`) turns
+a placement event into a `ShadowInput` by reading the ledger:
 
 ```python
-class MyResolver:
-    def resolve(self, event):
-        subtask = ledger.get_subtask(event["subtask_id"])
-        if subtask is None:
-            return None                      # skipped, counted, cursor still advances
-        return ShadowInput(
-            state=NormalizedState.from_routing_context(ctx_for(subtask)),
-            router=RouterFacts.from_worker_location(event["payload"].get("location")),
-            task_id=event["task_id"], subtask_id=event["subtask_id"],
-        )
+from agentconnect.core.control_shadow_resolver import LedgerRoutingFactsResolver
+
+resolver = LedgerRoutingFactsResolver(svc.storage, policy_version="v1")
 ```
+
+It lives in its own module because `control_shadow` deliberately holds no
+ledger — that is what keeps the evaluator a pure function whose tests never open
+a database.
+
+**It reads the routing decision, not the bus payload.** A `compute.placed`
+payload does name the placement class, and trusting it would be one line
+shorter. The ledger is read instead because `Subtask.route_reason` is the
+persisted `RouteExplanation` the router itself wrote, and EVENT_BUS.md §0 is
+explicit that the bus is "never authoritative for anything."
+
+That is not academic. Until the fix shipped alongside this module,
+`compute.placed` reported `location: "local"` for **every** route, cloud and
+rented included — the emit read `explanation.selected_location`, a field that
+did not exist on the model, and fell through to a literal default. A resolver
+trusting that payload would have scored every cloud route as a disagreement and
+quietly understated the model. A test now pins the payload against a lie.
+
+Every failure is a skip, never an exception: no subtask id, a reaped subtask, a
+subtask with no recorded route, a route that never reached a worker, or a
+`route_reason` that will not parse. The consumer counts skips so the gap stays
+visible.
+
+**What it does not invent.** A `Subtask` carries no token estimates, no
+`allow_external`, and no redaction verdict, so those keep `NormalizedState`'s
+defaults rather than being derived from adjacent values — a fabricated input
+would make a shadow record compare two decisions that never saw the same state.
+`allow_paid` is filled because it is a fact: a recorded `approved_max_cost_usd`
+means a human approved spend. `subtask.instructions` — the only free text on the
+record — is never read at all; `SHADOW_STATE_KEYS` is the backstop, not the plan.
 
 ## Which router you are actually shadowing
 
@@ -149,6 +172,10 @@ wearing a number. `ShadowDecision.should_escalate` reads the flag only.
   wedged evaluator is worse than a hole in an evaluation dataset. Skips are
   counted so the hole is visible. A *bus read* failure is the one case that
   holds the cursor — nothing was seen, so nothing may be skipped past.
+- **No inline reach.** No module under `packages/` may name `control_shadow`
+  except shadow mode's own (`SHADOW_MODE_MODULES` in the test). Adding a name
+  there is deliberate and reviewable; an accidental import from the live path
+  fails CI.
 
 ## Where this goes next
 
